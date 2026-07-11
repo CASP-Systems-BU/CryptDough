@@ -1,0 +1,86 @@
+#include "cdough.h"
+#include "profiling/stopwatch.h"
+
+using namespace cdough::debug;
+using namespace cdough::service;
+using namespace COMPILED_MPC_PROTOCOL_NAMESPACE;
+
+#define REPEAT(n, expr)           \
+    for (int i = 0; i < n; i++) { \
+        expr;                     \
+    }
+
+#define NUM_REPETITIONS 1000
+
+int main(int argc, char** argv) {
+    EngineRef engine = cdough_init(argc, argv);
+    auto pID = engine.getPartyID();
+
+    if (pID != 0) {
+        return 0;
+    }
+
+    auto test_size = engine.getArg<size_t>("test-size", "r", 1 << 20);
+
+    cdough::Vector<int> v(test_size);
+    engine.populateLocalRandom(v);
+    cdough::Vector<int> f(test_size);
+    engine.populateLocalRandom(f);
+    f = (f % 3) == 0;
+
+    single_cout(NUM_REPETITIONS << " repetitions each");
+
+    stopwatch::timepoint("Start");
+
+    REPEAT(NUM_REPETITIONS, v.simple_subset_reference(0, 1, test_size));
+    stopwatch::timepoint("Simple Subset Reference - Full");
+
+    REPEAT(NUM_REPETITIONS, v.simple_subset_reference(0, 1, test_size / 2));
+    stopwatch::timepoint("SSR - Half");
+
+    REPEAT(NUM_REPETITIONS, v.simple_subset_reference(0, 1, test_size / 2)
+                                .simple_subset_reference(test_size / 5, 1, test_size / 3));
+    stopwatch::timepoint("SSR - Composed");
+
+    REPEAT(NUM_REPETITIONS, v.simple_subset_reference(0, 1, 99));
+    stopwatch::timepoint("Simple Subset Reference - Small");
+
+    REPEAT(NUM_REPETITIONS, v.slice(0, test_size));
+    stopwatch::timepoint("Slice - Full");
+
+    REPEAT(NUM_REPETITIONS, v.slice(0, test_size / 2));
+    stopwatch::timepoint("Slice - Half");
+
+    REPEAT(NUM_REPETITIONS, v.slice(0, test_size / 2).slice(test_size / 5, test_size / 3));
+    stopwatch::timepoint("Slice - Composed");
+
+    REPEAT(NUM_REPETITIONS, v.slice(0, 100));
+    stopwatch::timepoint("Slice - Small");
+
+    REPEAT(NUM_REPETITIONS, v.alternating_subset_reference(1, 0));
+    stopwatch::timepoint("Alternating Subset Reference");
+
+    REPEAT(NUM_REPETITIONS, v.reversed_alternating_subset_reference(1, 0));
+    stopwatch::timepoint("Reversed Alternating Subset Reference");
+
+    REPEAT(NUM_REPETITIONS, v.repeated_subset_reference(1));
+    stopwatch::timepoint("Repeating Subset Reference");
+
+    REPEAT(NUM_REPETITIONS, v.cyclic_subset_reference(1));
+    stopwatch::timepoint("Cyclic Subset Reference");
+
+    REPEAT(NUM_REPETITIONS, v.directed_subset_reference(-1));
+    stopwatch::timepoint("Directed Subset Reference");
+
+    REPEAT(NUM_REPETITIONS, v.included_reference(f));
+    stopwatch::timepoint("Included Reference - Many");
+
+    f.zero();
+
+    REPEAT(NUM_REPETITIONS, v.included_reference(f));
+    stopwatch::timepoint("Included Reference - None");
+
+    stopwatch::done();
+
+    return 0;
+}

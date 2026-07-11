@@ -1,0 +1,201 @@
+#pragma once
+
+#include "backend/common/setting.h"
+#include "backend/nocopy_communicator/startmpc/startmpc.h"
+#include "core/communication/communicator.h"
+#include "core/communication/communicator_factory.h"
+#include "no_copy_communicator.h"
+
+// TODO: refactor this so that the communicator does not know
+// about the runtime
+
+namespace cdough {
+namespace {
+#if defined(MPC_USE_NO_COPY_COMMUNICATOR)
+    /**
+     * @brief Function executed by each `nocopy` send thread. Continuously get
+     * entries off the ring buffer and send them out.
+     *
+     * @param rank party ID of this node.
+     * @param communicator_index_list a list mapping worker threads to
+     * communication threads
+     * @param host_count number of nodes in the computation
+     * @param b `shared_ptr` to a synchronization barrier, used internally for
+     * synchronizing all communication threads with the main thread.
+     */
+    template <typename Engine>
+    void send_communication_thread(int rank, std::vector<int> communicator_index_list,
+                                   int host_count, std::shared_ptr<std::barrier<>> b,
+                                   Engine& engine) {
+        // Wait for all threads to start before continuing
+        b->arrive_and_wait();
+
+        // Fetch pointers to the communicators
+        std::vector<cdough::NoCopyCommunicator*> communicator_list;
+        for (int i = 0; i < communicator_index_list.size(); i++) {
+            while (engine.workers.size() <= communicator_index_list[i]) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(SOCKET_COMMUNICATOR_WAIT_MS));
+            }
+            communicator_list.push_back(static_cast<cdough::NoCopyCommunicator*>(
+                engine.workers[communicator_index_list[i]].getCommunicator()));
+        }
+
+        // Terminate when service::runTime exits
+        while (!engine.terminated()) {
+            for (auto* communicator : communicator_list) {
+                for (int j = 0; j < host_count; j++) {
+                    if (j == rank) continue;
+
+                    auto& partyInfo = communicator->get_party(j);
+                    if (!partyInfo.sendRing.isRingEmpty()) {
+                        NoCopyRingEntry* entry = partyInfo.sendRing.currentEntry();
+                        size_t r =
+                            send_wrapper(partyInfo.sockfd, entry->buffer, entry->buffer_size);
+                        assert(r == entry->buffer_size);
+                        partyInfo.sendRing.pop(entry);
+                    }
+
+                    if (engine.terminated()) return;
+                }
+                if (engine.terminated()) return;
+            }
+        }
+    }
+
+    /**
+     * @brief Create the mapping of send threads to workers, and start
+     * communication threads
+     *
+     * @param rank party ID of this node
+     * @param threads_num number of total threads
+     * @param host_count number of nodes in the computation
+     */
+    template <typename Engine>
+    void setup_send_threads(int rank, int threads_num, int host_count, Engine& engine) {
+        int num_communication_threads;
+        if (NOCOPY_COMMUNICATOR_THREADS <= 0) {
+            num_communication_threads = threads_num;
+        } else {
+            num_communication_threads = std::min(threads_num, NOCOPY_COMMUNICATOR_THREADS);
+        }
+
+        // Barrier for all threads (worker + main) to synchronize just after
+        // thread creation. This may help prevent race conditions with threads
+        // trying to access their PartyInfo maps _before_ (or while) they are
+        // being instantiated.
+        //
+        // This was introduced while debugging the socket map race condition,
+        // described below, but is unrelated. However, it's probably best to keep
+        // this in so that all threads are synchronized.
+        auto b = std::make_shared<std::barrier<>>(num_communication_threads + 1);
+
+        if (rank == 0)
+            std::cout << "NoCopyComm | Communication Threads: " << num_communication_threads
+                      << std::endl;
+
+        std::vector<std::vector<int>> communicator_index_list(num_communication_threads);
+
+        // Round robin assignment
+        for (int i = 0; i < threads_num; i++) {
+            communicator_index_list[i % num_communication_threads].push_back(i);
+        }
+
+        // Send thread for each cdough thread
+        for (int i = 0; i < num_communication_threads; i++) {
+            engine.emplace_socket_thread(send_communication_thread<Engine>, rank,
+                                         communicator_index_list[i], host_count, b,
+                                         std::ref(engine));
+        }
+        // Main thread waits for all send threads to start
+        b->arrive_and_wait();
+    }
+
+    // TODO: Move this to the runtime, along with thread destruction
+    template <typename Engine>
+    void setup_communication_threads(int rank, int threads_num, int host_count, Engine& engine) {
+        setup_send_threads(rank, threads_num, host_count, engine);
+    }
+
+#endif
+}  // namespace
+
+/**
+ * @brief Factor for the `nocopy` communicator to interface with the
+ * `CommunicatorFactory` API.
+ *
+ */
+template <typename Engine>
+class NoCopyCommunicatorFactory : public CommunicatorFactory<NoCopyCommunicatorFactory<Engine>> {
+   public:
+    NoCopyCommunicatorFactory(Engine& engine, CommFactoryArgs args)
+        : threadsNum_(args.numThreads),
+          host_prefix(args.host_prefix),
+          engine(engine),
+          setting_(args.setting) {
+        this->latency = args.latency;
+        this->bandwidth = args.bandwidth;
+        socketMaps_.resize(threadsNum_);
+
+#if defined(MPC_USE_NO_COPY_COMMUNICATOR)
+        std::tie(partyId, numParties) = startmpc_init(threadsNum_, socketMaps_);
+#endif
+    }
+
+    std::unique_ptr<Communicator> create() {
+        static int instanceCount = 0;
+
+        // Wrap around if more communicators than threads are created 
+        instanceCount = instanceCount % threadsNum_;
+
+        // Create a new communicator instance
+        auto communicator = std::make_unique<NoCopyCommunicator>(
+            partyId, socketMaps_[instanceCount], numParties, host_prefix, this->latency,
+            this->bandwidth, setting_);
+
+        // Increment the instance count for the next communicator
+        instanceCount++;
+
+        return communicator;
+    }
+
+    void start() {
+#if defined(MPC_USE_NO_COPY_COMMUNICATOR)
+        setup_communication_threads(partyId, threadsNum_, numParties, engine);
+#endif
+    }
+
+    int getPartyId() const { return partyId; }
+
+    int getNumParties() const { return numParties; }
+
+    cdough::service::Setting getSetting() const { return setting_; }
+
+    void blockingReady() {
+        // No additional setup needed for NoCopyCommunicator
+    }
+
+   private:
+    int partyId;
+    int numParties;
+
+    const int threadsNum_;
+
+    const std::string host_prefix;
+
+    Engine& engine;
+
+    const cdough::service::Setting setting_;
+
+    /**
+     * @brief Vector of socket maps for each cdough thread. Each element of the
+     * outer vector is assigned to a thread. The inner vector maps from party ID
+     * to socket file descriptor:
+     *
+     * socket_maps[Thread #][Party ID] -> Socket file descriptor
+     *
+     * NOTE: this used to be a vector<map<int, int>>, but this led to a
+     * concurrent write and thus an infrequent race condition.
+     */
+    std::vector<std::vector<int>> socketMaps_;
+};
+}  // namespace cdough

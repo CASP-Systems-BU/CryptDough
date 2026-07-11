@@ -1,0 +1,663 @@
+#pragma once
+
+#include "core/protocols/interface/protocol.h"
+#include "debug/cdough_debug.h"
+
+using namespace cdough::debug;
+
+namespace cdough {
+/**
+ * @brief Implements the secure primitives for the 3-party semi-honest protocol by Araki et al.
+ * that uses replicated secret sharing.
+ *
+ * @tparam Data Plaintext data type.
+ * @tparam Share Replicated share type.
+ * @tparam Vector Data container type.
+ * @tparam EVector Share container type.
+ */
+template <typename Data, typename Share, typename Vector, typename EVector>
+class Replicated_3PC : public Protocol<Data, Share, Vector, EVector> {
+   public:
+    // Configuration Parameters
+    static constexpr int parties_num = 3;
+
+    /**
+     * @brief Constructor for the semi-honest replicated 3-party protocol by Araki et al.
+     *
+     * @param _partyID The (globally) unique id of the party that calls this constructor.
+     * @param _communicator A pointer to the communicator.
+     * @param _randomnessManager A pointer to the randomness manager.
+     */
+    Replicated_3PC(PartyID _partyID, int thread_id, Communicator* _communicator,
+                   random::RandomnessManager* _randomnessManager)
+        : Protocol<Data, Share, Vector, EVector>(_communicator, _randomnessManager, _partyID, 3,
+                                                 2) {}
+
+    /**
+     * @brief Secure arithmetic multiplication using replicated secret sharing.
+     *
+     * @param x First input vector.
+     * @param y Second input vector.
+     * @param z Output vector.
+     */
+    void multiply_a(const EVector& x, const EVector& y, EVector& z) {
+        // Number of elements
+        long long size = x.size();
+        // Generate 'size' random shares of zero
+        Vector local(size);
+        this->randomnessManager->zeroSharingGenerator->getNextArithmetic(local);
+        // Local computation
+
+        // TODO: same as and, we need a way to figure out this size (or an upper bound)
+        local += x(0) * y(0);
+        local += x(0) * y(1);
+        local += x(1) * y(0);
+
+        // Communication round
+        Vector remote(size);
+        this->communicator->exchangeShares(local, remote, 2, 1);
+        // Return output shared vector
+        z(0) = local;
+        z(1) = remote;
+
+        this->handle_precision(x, y, z);
+        this->truncate(z);
+    }
+
+    /**
+     * @brief Truncate the input vector by its precision field.
+     *
+     * This uses the protocol by ABY3 (Mohassel and Rindal, 2018).
+     * https://eprint.iacr.org/2018/403.pdf
+     *
+     * The ABY3 protocol reduces the three-party case to the two-party SecureML protocol.
+     *
+     * @param x Input vector.
+     */
+    void truncate(EVector& x) {
+        int precision = x.getPrecision();
+        if (precision == 0) {
+            return;
+        }
+
+        // parties 0 and 2 truncate share 0
+        // parties 1 and 2 compute a random Vector r and set share 2 to r
+        // party 1 computes share 1 as (x_1 + x_2) / 2**d - r and sends to party 0
+        if (this->partyID == 0) {
+            // truncate share 0
+            x(0) = x(0).bit_arithmetic_right_shift(precision);
+
+            // receive share 1 from party 1
+            this->communicator->receiveShares(x(1), 1);
+        }
+        if (this->partyID == 1) {
+            // generate r
+            Vector r(x.size());
+            this->randomnessManager->commonPRGManager->get(+1)->getNext(r);
+
+            // compute share 1
+            x(0) = (x(0) + x(1)).bit_arithmetic_right_shift(precision);
+            x(0) -= r;
+            this->communicator->sendShares(x(0), -1);
+
+            // set share 2 to r
+            x(1) = r;
+        }
+        if (this->partyID == 2) {
+            // truncate share 0
+            x(1) = x(1).bit_arithmetic_right_shift(precision);
+
+            // generate r in place and set share 2 to r
+            this->randomnessManager->commonPRGManager->get(-1)->getNext(x(0));
+        }
+    }
+
+    /**
+     * @brief Division by constant with share redistribution.
+     *
+     * Algorithm:
+     * 1. Start with 3 secret shares (x1, x2, x3), but division requires 2 shares.
+     * 2. Merge first 2 shares to get x1' = x1 + x2.
+     * 3. Use shares (x1', x3) for division on secret shares.
+     * 4. End up with (x1/c, x3/c) which are only two shares, but we need 3 shares.
+     * 5. Redistribute shares (y1, y2) to be (y1 - r, r, y2) where r is random.
+     * 6. Logic for calculating result and error is identical to 2PC.
+     *
+     * @param x Input vector.
+     * @param c Constant divisor.
+     * @return Pair of vectors (quotient and error correction).
+     */
+    std::pair<EVector, EVector> div_const_a(const EVector& x, const Data& c) {
+        auto size = x.size();
+        EVector res(size), err(size);
+
+        if (this->partyID == 0) {
+            // For shares redistribution
+            Vector r(size);
+            this->randomnessManager->commonPRGManager->get(+1)->getNext(r);
+
+            // Naive division on (x1 + x2)
+            auto x_sum = x(0) + x(1);
+            res(0) = (x_sum) / c - r;
+
+#ifdef USE_DIVISION_CORRECTION
+            auto x_sum_neg = x_sum < 0;
+            res(0) -= x_sum_neg;
+
+            this->randomnessManager->commonPRGManager->get(+1)->getNext(r);
+            err(0) = (x_sum) % c + x_sum_neg * c - r;
+#endif
+        } else if (this->partyID == 2) {
+            // Naive division on (x3)
+            res(0) = x(0) / c;
+
+#ifdef USE_DIVISION_CORRECTION
+            auto x_sum_neg = x(0) < 0;
+            res(0) -= x_sum_neg;
+            err(0) = x(0) % c + x_sum_neg * c - c;
+#endif
+        } else {
+            // These are the same random numbers generated by party 0
+            this->randomnessManager->commonPRGManager->get(-1)->getNext(res(0));
+#ifdef USE_DIVISION_CORRECTION
+            this->randomnessManager->commonPRGManager->get(-1)->getNext(err(0));
+#endif
+        }
+
+        this->communicator->exchangeShares(res(0), res(1), 2, 1);
+#ifdef USE_DIVISION_CORRECTION
+        this->communicator->exchangeShares(err(0), err(1), 2, 1);
+#endif
+
+        return {res, err};
+    }
+
+    /**
+     * @brief Secure dot product using replicated secret sharing.
+     *
+     * @param x First input vector.
+     * @param y Second input vector.
+     * @param z Output vector containing dot products.
+     * @param aggSize Aggregation size.
+     */
+    void dot_product_a(const EVector& x, const EVector& y, EVector& z, size_t aggSize) {
+        // Number of elements
+        const size_t size = x.size();
+        const size_t newSize = size / aggSize;
+
+        // Generate 'newSize' random shares of zero
+        Vector r(newSize);
+        this->randomnessManager->zeroSharingGenerator->getNextArithmetic(r);
+
+        // Local computation and aggregation
+        auto local = x(0).dot_product(y(0), aggSize) + x(0).dot_product(y(1), aggSize) +
+                     x(1).dot_product(y(0), aggSize) + r;
+
+        // Communication round
+        Vector remote(newSize);
+        this->communicator->exchangeShares(local, remote, 2, 1);
+
+        // Return output shared vector
+        z(0) = local;
+        z(1) = remote;
+
+        this->handle_precision(x, y, z);
+        this->truncate(z);
+    }
+
+    void matrix_right_multiply_with_column_matrix_vectorized_a(const EVector& x, const EVector& y,
+                                                               EVector& z, const size_t lhs_rows,
+                                                               const size_t lhs_cols,
+                                                               const size_t rhs_rows,
+                                                               const size_t rhs_cols) {
+        // Number of elements
+        const size_t size = x.size();
+        const size_t newSize = z.size();
+
+        // Generate 'newSize' random shares of zero
+        Vector r(newSize);
+        this->randomnessManager->zeroSharingGenerator->getNextArithmetic(r);
+
+        auto local = x(0).matrixRightMultiplyWithColumnMatrixVectorized(y(0), lhs_rows, lhs_cols,
+                                                                        rhs_rows, rhs_cols) +
+                     x(0).matrixRightMultiplyWithColumnMatrixVectorized(y(1), lhs_rows, lhs_cols,
+                                                                        rhs_rows, rhs_cols) +
+                     x(1).matrixRightMultiplyWithColumnMatrixVectorized(y(0), lhs_rows, lhs_cols,
+                                                                        rhs_rows, rhs_cols) +
+                     r;
+
+        // Communication round
+        Vector remote(newSize);
+        this->communicator->exchangeShares(local, remote, 2, 1);
+
+        // Return output shared vector
+        z(0) = local;
+        z(1) = remote;
+
+        this->handle_precision(x, y, z);
+        this->truncate(z);
+    }
+
+    void conv_2d_vectorized_a(const EVector& x, const EVector& y, EVector& z,
+                              const size_t instancesCount, const size_t inputHeight,
+                              const size_t inputWidth, const size_t filterHeight,
+                              const size_t filterWidth, const size_t strideHeight,
+                              const size_t strideWidth, const size_t paddingHeight,
+                              const size_t paddingWidth) {
+        // Number of elements
+        const size_t size = x.size();
+        const size_t newSize = z.size();
+
+        // Generate 'newSize' random shares of zero
+        Vector r(newSize);
+        this->randomnessManager->zeroSharingGenerator->getNextArithmetic(r);
+
+        auto local = x(0).conv2DVectorized(y(0), instancesCount, inputHeight, inputWidth,
+                                           filterHeight, filterWidth, strideHeight, strideWidth,
+                                           paddingHeight, paddingWidth) +
+                     x(0).conv2DVectorized(y(1), instancesCount, inputHeight, inputWidth,
+                                           filterHeight, filterWidth, strideHeight, strideWidth,
+                                           paddingHeight, paddingWidth) +
+                     x(1).conv2DVectorized(y(0), instancesCount, inputHeight, inputWidth,
+                                           filterHeight, filterWidth, strideHeight, strideWidth,
+                                           paddingHeight, paddingWidth) +
+                     r;
+
+        // Communication round
+        Vector remote(newSize);
+        this->communicator->exchangeShares(local, remote, 2, 1);
+
+        // Return output shared vector
+        z(0) = local;
+        z(1) = remote;
+
+        this->handle_precision(x, y, z);
+        this->truncate(z);
+    }
+
+    /**
+     * @brief Secure bitwise AND using replicated secret sharing.
+     *
+     * @param x First input vector.
+     * @param y Second input vector.
+     * @param z Output vector.
+     */
+    void and_b(const EVector& x, const EVector& y, EVector& z) {
+        // Number of elements
+        long long size = x.size();
+        // Generate 'size' random shares of zero
+        Vector local(size);
+        this->randomnessManager->zeroSharingGenerator->getNextBinary(local);
+        // Local computation
+
+        // only access these once
+        local ^= x(0) & y(0);
+        local ^= x(0) & y(1);
+        local ^= x(1) & y(0);
+
+        // Communication round
+        Vector remote(size);
+        this->communicator->exchangeShares(local, remote, 2, 1);
+
+        // Return output shared vector
+        // These need to be copies, due to access patterns!
+        z(0) = local;
+        z(1) = remote;
+
+        this->handle_precision(x, y, z);
+    }
+
+    /**
+     * @brief Boolean complement operation.
+     *
+     * @param x Input vector.
+     * @param y Output vector.
+     */
+    void not_b(const EVector& x, EVector& y) { y = ~x; }
+
+    /**
+     * @brief Boolean NOT operation (LSB only).
+     *
+     * @param x Input vector.
+     * @param y Output vector.
+     */
+    void not_b_1(const EVector& x, EVector& y) { y = !(x & 1); }
+
+    /**
+     * @brief Convert boolean-shared bit to arithmetic sharing.
+     *
+     * Converts a boolean-shared bit (LSB only) to arithmetic sharing using
+     * replicated secret sharing protocol.
+     *
+     * Should only be used for the least significant bit.
+     *
+     * @param x Input boolean shared vector.
+     * @param y Output arithmetic shared vector.
+     */
+    void b2a_bit(const EVector& x, EVector& y) {
+        // make secret sharings of s0 and s1
+        // Reuse s0(1) to store the LSB-masked version of x
+        EVector s0(x.size());
+        EVector s1(x.size());
+
+        s0 = x;
+        s0.setPrecision(0);
+        s0.mask(1);
+
+        // only P0 XORs its two shares. Store in s0(1)
+        if (this->partyID == 0) {
+            s0(1) ^= s0(0);
+        }
+
+        this->randomnessManager->zeroSharingGenerator->getNextArithmetic(s0(0));
+        this->randomnessManager->zeroSharingGenerator->getNextArithmetic(s1(0));
+        if (this->partyID == 0) {
+            s0(0) += s0(1);
+        } else if (this->partyID == 1) {
+            // P1 only considers its second share
+            s1(0) += s0(1);
+        }
+
+        this->communicator->exchangeShares(s0(0), s0(1), 2, 1);
+        this->communicator->exchangeShares(s1(0), s1(1), 2, 1);
+
+        // Re-using s0 and s1 to avoid extra vector allocations
+        s0 -= s1;
+        // y = s0^2
+        multiply_a(s0, s0, y);
+    }
+
+    /**
+     * @brief Redistribute boolean shares.
+     *
+     * @param x Input vector.
+     * @return Pair of redistributed shared vectors.
+     */
+    std::pair<EVector, EVector> redistribute_shares_b(const EVector& x) {
+        // shares are stored as: 
+        // x0 x1
+        // x1 x2
+        // x2 x0
+        if(this->partyID == 0) {
+            // Party 0: will secret share x0 + x1
+            // It will use a common PRG to generate x1(vec1) and x2(vec1)
+            Vector vec1 = x(0) + x(1);
+            Vector vec1_x1(x.size()), vec1_x2(x.size());
+            this->randomnessManager->commonPRGManager->get(+1)->getNext(vec1_x1);
+            this->randomnessManager->commonPRGManager->get({0, +1, +2})->getNext(vec1_x2);
+            vec1 ^= vec1_x1;
+            vec1 ^= vec1_x2;
+            EVector redistributed1 {vec1, vec1_x1};
+            
+            Vector vec2_x0(x.size()), vec2_x1(x.size());
+            this->randomnessManager->commonPRGManager->get(-1)->getNext(vec2_x0);
+            this->randomnessManager->commonPRGManager->get({0, +1, +2})->getNext(vec2_x1);
+            EVector redistributed2 {vec2_x0, vec2_x1};
+            
+            this->communicator->sendShares(vec1, +2);
+            return {redistributed1, redistributed2};
+        } else if (this->partyID == 1) {
+            Vector vec1_x1(x.size()), vec1_x2(x.size());
+            this->randomnessManager->commonPRGManager->get(-1)->getNext(vec1_x1);
+            this->randomnessManager->commonPRGManager->get({0, +1, +2})->getNext(vec1_x2);
+            EVector redistributed1 {vec1_x1, vec1_x2};
+
+            Vector vec2_x1(x.size()), vec2_x2(x.size());
+            this->randomnessManager->commonPRGManager->get({0, +1, +2})->getNext(vec2_x1);
+            EVector redistributed2 {vec2_x1, vec2_x2};
+            
+            this->communicator->receiveShares(vec2_x2, +1);
+            return {redistributed1, redistributed2};
+        } else {
+            Vector vec1_x2(x.size()), vec1_x0(x.size());
+            this->randomnessManager->commonPRGManager->get({0, +1, +2})->getNext(vec1_x2);
+            EVector redistributed1 {vec1_x2, vec1_x0};
+
+            // Party 2: will secret share x2, which is its x0.
+            Vector vec2_x0(x.size()), vec2_x1(x.size());
+            this->randomnessManager->commonPRGManager->get(+1)->getNext(vec2_x0);
+            this->randomnessManager->commonPRGManager->get({0, +1, +2})->getNext(vec2_x1);
+            auto vec2_x2 = x(0) ^ vec2_x0;
+            vec2_x2 ^= vec2_x1;
+            EVector redistributed2 {vec2_x2, vec2_x0};
+
+            this->communicator->exchangeShares(vec2_x2, vec1_x0, +2, +1);
+            return {redistributed1, redistributed2};
+        }
+    }
+
+    /**
+     * @brief Reconstruct plaintext from arithmetic shares.
+     *
+     * @param shares Input shares from all three parties.
+     * @return Reconstructed plaintext value.
+     */
+    Data reconstruct_from_a(const std::vector<Share>& shares) {
+        return shares[0][0] + shares[1][0] + shares[2][0];
+    }
+
+    /**
+     * @brief Reconstruct plaintext vector from arithmetic shares.
+     *
+     * @param shares Input shared vectors from all three parties.
+     * @return Reconstructed plaintext vector.
+     */
+    Vector reconstruct_from_a(const std::vector<EVector>& shares) {
+        return shares[0](0) + shares[1](0) + shares[2](0);
+    }
+
+    /**
+     * @brief Reconstruct plaintext from boolean shares.
+     *
+     * @param shares Input shares from all three parties.
+     * @return Reconstructed plaintext value.
+     */
+    Data reconstruct_from_b(const std::vector<Share>& shares) {
+        return shares[0][0] ^ shares[1][0] ^ shares[2][0];
+    }
+
+    /**
+     * @brief Reconstruct plaintext vector from boolean shares.
+     *
+     * @param shares Input shared vectors from all three parties.
+     * @return Reconstructed plaintext vector.
+     */
+    Vector reconstruct_from_b(const std::vector<EVector>& shares) {
+        return shares[0](0) ^ shares[1](0) ^ shares[2](0);
+    }
+
+    /**
+     * @brief Open arithmetic shares to reveal plaintext.
+     *
+     * @param shares Input shared vector.
+     * @return Opened plaintext vector.
+     */
+    Vector unchecked_open_a(const EVector& shares) {
+        // Parties open their local shares to other parties
+        size_t size = shares.size();
+        Vector shares_3(size);
+        this->communicator->exchangeShares(shares(1), shares_3, 2, 1);
+        return shares(0) + shares(1) + shares_3;
+    }
+
+    /**
+     * @brief Open boolean shares to reveal plaintext.
+     *
+     * @param shares Input shared vector.
+     * @return Opened plaintext vector.
+     */
+    Vector unchecked_open_b(const EVector& shares) {
+        // Parties open their local shares to other parties
+        size_t size = shares.size();
+        Vector shares_3(size);
+        this->communicator->exchangeShares(shares(1), shares_3, 2, 1);
+        return shares(0) ^ shares(1) ^ shares_3;
+    }
+
+    /**
+     * @brief Generate replicated arithmetic shares for a single value.
+     *
+     * @param data Input plaintext value.
+     * @return Vector of replicated arithmetic shares for all parties.
+     */
+    std::vector<Share> get_share_a(const Data& data) {
+        Data share_1, share_2;
+        this->randomnessManager->localPRG->getNext(share_1);
+        this->randomnessManager->localPRG->getNext(share_2);
+        Data share_3 = data - share_1 - share_2;
+        // Return vector of replicated arithmetic shares
+        return {{share_1, share_2}, {share_2, share_3}, {share_3, share_1}};
+    }
+
+    /**
+     * @brief Generate replicated arithmetic shares for a vector.
+     *
+     * @param data Input plaintext vector.
+     * @return Vector of replicated arithmetic shared vectors for all parties.
+     */
+    std::vector<EVector> get_shares_a(const Vector& data) {
+        Vector share_1(data.size()), share_2(data.size());
+        this->randomnessManager->localPRG->getNext(share_1);
+        this->randomnessManager->localPRG->getNext(share_2);
+        auto share_3 = data - share_1 - share_2;
+        // Return vector of replicated a-shared vectors
+        return {std::vector<Vector>({share_1, share_2}), std::vector<Vector>({share_2, share_3}),
+                std::vector<Vector>({share_3, share_1})};
+    }
+
+    /**
+     * @brief Generate replicated boolean shares for a single value.
+     *
+     * @param data Input plaintext value.
+     * @return Vector of replicated boolean shares for all parties.
+     */
+    std::vector<Share> get_share_b(const Data& data) {
+        Data share_1, share_2;
+        this->randomnessManager->localPRG->getNext(share_1);
+        this->randomnessManager->localPRG->getNext(share_2);
+        Data share_3 = data ^ share_1 ^ share_2;
+        // Return vector of replicated boolean shares
+        return {{share_1, share_2}, {share_2, share_3}, {share_3, share_1}};
+    }
+
+    /**
+     * @brief Generate replicated boolean shares for a vector.
+     *
+     * @param data Input plaintext vector.
+     * @return Vector of replicated boolean shared vectors for all parties.
+     */
+    std::vector<EVector> get_shares_b(const Vector& data) {
+        Vector share_1(data.size()), share_2(data.size());
+        this->randomnessManager->localPRG->getNext(share_1);
+        this->randomnessManager->localPRG->getNext(share_2);
+        auto share_3 = data ^ share_1 ^ share_2;
+        // Return vector of replicated b-shared vectors
+        return {std::vector<Vector>({share_1, share_2}), std::vector<Vector>({share_2, share_3}),
+                std::vector<Vector>({share_3, share_1})};
+    }
+
+    /**
+     * @brief Secret share a boolean vector using replicated sharing.
+     *
+     * @param data Input plaintext vector.
+     * @param data_party Party that owns the data.
+     * @return This party's replicated boolean shared vector.
+     */
+    EVector secret_share_b_internal(const Vector& data, const PartyID& data_party = 0) {
+        auto size = data.size();
+        if (this->partyID == data_party) {
+            // Generate shares
+            auto boolean_shares = get_shares_b(data);
+            // Send first shared vector to the successor
+            this->communicator->sendShares(boolean_shares[1](0), 1);
+            this->communicator->sendShares(boolean_shares[1](1), 1);
+            // Send second shared vector to the predecessor
+            this->communicator->sendShares(boolean_shares[2](0), 2);
+            this->communicator->sendShares(boolean_shares[2](1), 2);
+            return boolean_shares[0];
+        } else {
+            EVector s(size);
+            // Receive shared vector from the predecessor
+            this->communicator->receiveShares(s(0), data_party - this->partyID);
+            this->communicator->receiveShares(s(1), data_party - this->partyID);
+            return s;
+        }
+    }
+
+    /**
+     * @brief Secret share an arithmetic vector using replicated sharing.
+     *
+     * @param data Input plaintext vector.
+     * @param data_party Party that owns the data.
+     * @return This party's replicated arithmetic shared vector.
+     */
+    EVector secret_share_a_internal(const Vector& data, const PartyID& data_party = 0) {
+        auto size = data.size();
+        if (this->partyID == data_party) {
+            // Generate shares
+            auto arithmetic_shares = get_shares_a(data);
+            // Send first shared vector to the successor
+            this->communicator->sendShares(arithmetic_shares[1](0), 1);
+            this->communicator->sendShares(arithmetic_shares[1](1), 1);
+            // Send second shared vector to the predecessor
+            this->communicator->sendShares(arithmetic_shares[2](0), 2);
+            this->communicator->sendShares(arithmetic_shares[2](1), 2);
+            return arithmetic_shares[0];
+        } else {
+            EVector s(size);
+            // Receive second shared vector from the predecessor
+            this->communicator->receiveShares(s(0), data_party - this->partyID);
+            this->communicator->receiveShares(s(1), data_party - this->partyID);
+            return s;
+        }
+    }
+
+    /**
+     * @brief Create public shares from plaintext data using replicated sharing.
+     *
+     * @param x Input plaintext vector.
+     * @param who_knows set of parties who know the value. empty set `{}` represents everyone.
+     * @return Public replicated shared vector.
+     */
+    EVector public_share(const Vector& x, const std::set<PartyID>& who_knows) {
+        auto me = this->partyID;
+        auto size = x.size();
+
+        // Figure out where the share should go
+        int k;
+        if (who_knows.empty() || who_knows == std::set<PartyID>({0, 2})) {
+            // Both P0 and P2 know; put data in share 0
+            k = 0;
+        } else if (who_knows == std::set<PartyID>({0, 1})) {
+            // P0 & P1 -> share 1
+            k = 1;
+        } else if (who_knows == std::set<PartyID>({1, 2})) {
+            // P1 & P2 -> share 2
+            k = 2;
+        } else {
+            throw std::logic_error("Cannot handle public share group " +
+                                   debug::container2str(who_knows));
+        }
+
+        // Party me holds global shares (x_me, x_{me+1 mod 3}).
+        // clang-format off
+        return {
+             me % 3      == k ? x : Vector(size),
+            (me + 1) % 3 == k ? x : Vector(size)
+        };
+        // clang-format on
+    }
+};
+
+/**
+ * @brief Factory type alias for Replicated_3PC protocol.
+ *
+ * @tparam Share Share type template.
+ * @tparam Vector Vector type template.
+ * @tparam EVector Encoding vector type template.
+ */
+template <template <typename> class Share, template <typename> class Vector,
+          template <typename> class EVector>
+using Replicated_3PC_Factory = DefaultProtocolFactory<Replicated_3PC, Share, Vector, EVector>;
+
+}  // namespace cdough
