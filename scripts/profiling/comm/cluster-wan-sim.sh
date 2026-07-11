@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+cd $(dirname $0)
+
+CONTROL=$1
+
+shift
+
+NODES=$*
+
+me=$(hostname --short)
+
+for n in $NODES
+do
+    echo $me
+    ./wan-sim.py $CONTROL -H $n
+
+    # assume nodeX access node0 with same interface as it does nodeY
+    scp ./wan-sim.py $n:~/
+    ssh $n ./wan-sim.py $CONTROL -H $me
+done
