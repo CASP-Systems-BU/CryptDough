@@ -2,6 +2,8 @@
 
 CryptDough, aka CDough, is a Multi-Party Computation (MPC) framework built for secure mixed workload applications including Machine Learning inference, Relational queries, and timeseries analytics. Users can implement their target computation using declarative protocol-agnostic API. The framework is built for ease of use for non-MPC experts while enabling extensibility for cryptographers interested in implementing more MPC protocols or operators.
 
+You can find the [complete documentation here](https://casp-systems-bu.github.io/CryptDough/).
+
 ## Table of Contents
 
 - [Dependencies](#dependencies)
