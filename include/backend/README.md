@@ -2,7 +2,7 @@ The `backend/` directory bridges cdough’s core MPC logic with runtime services
 
 Sub-directories & files:
 
-- `common/` – General-purpose runtime, task, and benchmark helpers.
-- `null_communicator/` – Null service setup
-- `nocopy_communicator/` – TCP-based service setup
-- `service.h` – Umbrella header for all service components. 
+- `common/` – General-purpose runtime, task, and networking helpers.
+- `null_communicator/` – Null (single-process) service setup.
+- `nocopy_communicator/` – TCP-based (no-copy) service setup.
+- `service.h` – Umbrella header for all service components.

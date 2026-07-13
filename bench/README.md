@@ -7,3 +7,6 @@ Sub-directories:
     - `secretflow/` - comparisons with SecretFlow
     - `other/` - all other queries from competitors
 - `micro/` – Small micro-benchmarks targeting specific primitives.
+- `models/` – Secure machine-learning model benchmarks (e.g. AlexNet).
+- `multi-workload/` – Multi-workload / streaming scenarios.
+- `tva/` – Time-series (TVA) workload benchmarks.

@@ -1,4 +1,4 @@
-The `socket/` directory contains helpers for the TCP-based service stack used by cdough when built with `-DCOMM=SOCKET`.
+The `nocopy_communicator/` directory contains helpers for the TCP-based (no-copy) service stack used by cdough when built with the no-copy communicator.
 
 Contents:
 
