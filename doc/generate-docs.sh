@@ -6,4 +6,4 @@ pip install -r requirements.txt
 
 cd doc
 doxygen
-sphinx-build -b html -Dbreathe_projects.CryptoDough=xml . ./sphinx
+sphinx-build -b html . ./sphinx

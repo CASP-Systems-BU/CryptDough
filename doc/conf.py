@@ -9,7 +9,7 @@ import subprocess
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = 'cdough'
-copyright = '2025, BU CASP Lab'
+copyright = '2026, BU CASP Lab'
 author = 'BU CASP Lab'
 
 # -- General configuration ---------------------------------------------------
@@ -20,6 +20,7 @@ extensions = [ "breathe", "myst_parser" ]
 templates_path = ['_templates']
 exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 
+breathe_projects = {"cdough": "xml"}
 breathe_default_project = "cdough"
 
 source_suffix = ['.rst', '.md']
