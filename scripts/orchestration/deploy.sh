@@ -42,7 +42,7 @@ for W in "$@"; do
     ssh-copy-id -o StrictHostKeyChecking=no -i ~/.ssh/*.pub $W
     
     # Run in the background
-    (scp -r $REPO_NAME/ $W:~/; ssh $W mkdir -p $REPO_NAME/build; ssh $W $REPO_NAME/scripts/_setup_required.sh) &
+    (scp -r $REPO_NAME/ $W:~/; ssh $W mkdir -p $REPO_NAME/build; ssh $W $REPO_NAME/scripts/setup/_setup_required.sh) &
     SSH_PIDS+=($!)
 done
 
@@ -58,7 +58,7 @@ sudo apt update
 sudo apt upgrade -y
 
 # setup on the host
-../scripts/setup.sh
+../scripts/setup/setup.sh
 
 echo 'Testing MPI execution of `test_primitives`...'
 cmake .. -DPROTOCOL=$NUM_NODES &&
