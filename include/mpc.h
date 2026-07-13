@@ -32,7 +32,6 @@
 #include "core/random/correlation/gilboa_ole.h"
 #include "core/random/correlation/libsecjoin.h"
 #include "core/random/correlation/registry.h"
-#include "core/random/correlation/shprg.h"
 #include "core/random/correlation/silent_ot.h"
 #include "core/random/correlation/zero_ole.h"
 #endif

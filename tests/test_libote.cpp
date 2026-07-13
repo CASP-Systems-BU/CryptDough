@@ -500,71 +500,6 @@ void test_softspoken(u64 n, Engine& engine) {
     }
 }
 
-#if defined(USE_SECURE_JOIN)
-template <typename Engine>
-void test_dpf_local_keygen(int test_size, Engine& engine) {
-    auto pID = engine.getPartyID();
-
-    int domain = 32;
-
-    cdough::random::DPF<int64_t> dpf(pID, 0, engine.comm0());
-
-    // test distributed key generation
-    cdough::Vector<int64_t> input(test_size);
-    for (int i = 0; i < test_size; i++) {
-        input[i] = i;
-    }
-
-    // party 0 generates the keys and distributes them
-    if (pID == 0) {
-        auto [key0, key1] = dpf.keyGenNonInteractive(input, domain);
-        dpf.distributeKeys(std::make_optional(std::array<oc::RegularDpfKey, 2>{key0, key1}));
-    } else {
-        dpf.distributeKeys();
-    }
-
-    auto sparse_results = dpf.expand();
-    auto full_results = dpf.expandFullMatrix();
-
-    // test DPF correlation
-    dpf.assertCorrelated(sparse_results);
-    dpf.assertCorrelated(full_results);
-
-    single_cout("DPF with Local Keygen...OK");
-}
-
-template <typename Engine>
-void test_dpf_dkg(int test_size, Engine& engine) {
-    auto pID = engine.getPartyID();
-
-    int domain = 32;
-
-    cdough::random::DPF<int64_t> dpf(pID, 0, engine.comm0());
-
-    // test distributed key generation
-    cdough::Vector<int64_t> input(test_size);
-    for (int i = 0; i < test_size; i++) {
-        // input needs to be a secret sharing
-        if (pID == 0) {
-            input[i] = i;
-        } else {
-            input[i] = 0;
-        }
-    }
-
-    dpf.keyGen(input, domain);
-
-    auto sparse_results = dpf.expand();
-    auto full_results = dpf.expandFullMatrix();
-
-    // test DPF correlation
-    dpf.assertCorrelated(sparse_results);
-    dpf.assertCorrelated(full_results);
-
-    single_cout("DPF with Distributed Keygen...OK");
-}
-#endif
-
 int main(int argc, char** argv) {
     EngineRef engine = cdough_init(argc, argv);
 
@@ -600,11 +535,6 @@ int main(int argc, char** argv) {
     test_silent_ot_chosen<int32_t>(test_size, engine);
 
     test_softspoken(test_size, engine);
-
-#if defined(USE_SECURE_JOIN)
-    test_dpf_local_keygen(test_size, engine);
-    test_dpf_dkg(test_size, engine);
-#endif
 }
 #else  // MPC_PROTOCOL_BEAVER_TWO
 

@@ -73,68 +73,6 @@ void test_permutation_correlations(int test_size_, Engine& engine) {
 #endif
 }
 
-template <typename InT, typename OutT>
-void test_shprg(EngineRef& engine) {
-#ifdef MPC_PROTOCOL_BEAVER_TWO
-    // short seed length for testing
-    int seed_length = 1024;
-    // output length is 2x the seed length
-    int n = seed_length * 2;
-
-    // a function to test the almost homomorphism of two inputs
-    auto test_almost_homomorphism = [](const std::vector<OutT>& input1,
-                                       const std::vector<OutT>& input2) {
-        int n = input1.size();
-        for (int i = 0; i < n; i++) {
-            auto diff = input1[i] - input2[i];
-            assert((diff == -1) || (diff == 0) || (diff == 1));
-        }
-    };
-
-    auto shprg = SeedHomomorphicPRG<InT, OutT>(engine, seed_length, seed_length * 2);
-
-    // sample two full domain seeds
-    auto seed1 = shprg.sample_seed(engine);
-    auto seed2 = shprg.sample_seed(engine);
-    auto seed_sum = shprg.add_seeds(seed1, seed2);
-
-    // expand the seeds
-    auto expanded1 = shprg.expand(seed1);
-    auto expanded2 = shprg.expand(seed2);
-    auto expanded_sum = shprg.expand(seed_sum);
-    auto results_sum = shprg.add_results(expanded1, expanded2);
-
-    test_almost_homomorphism(expanded_sum, results_sum);
-
-    // sample two binary seeds
-    auto binary_seed1 = shprg.sample_binary_seed(engine);
-    auto binary_seed2 = shprg.sample_binary_seed(engine);
-    // make sure the sum of seeds is still binary
-    for (int i = 0; i < seed_length / 2; i++) {
-        binary_seed2[i] = 0;
-    }
-    for (int i = seed_length / 2; i < seed_length; i++) {
-        binary_seed1[i] = 0;
-    }
-    auto binary_seed_sum = shprg.add_seeds(binary_seed1, binary_seed2);
-
-    // expand the binary seeds
-    auto expanded_binary1 = shprg.expand_binary_seed(binary_seed1);
-    auto expanded_binary2 = shprg.expand_binary_seed(binary_seed2);
-    auto expanded_binary_sum = shprg.expand_binary_seed(binary_seed_sum);
-    auto results_binary_sum = shprg.add_results(expanded_binary1, expanded_binary2);
-
-    test_almost_homomorphism(expanded_binary_sum, results_binary_sum);
-
-    // check that compressed seed expansion is the same as uncompressed seed expansion
-    auto compressed_seed = shprg.compress_binary_seed(binary_seed1);
-    auto expanded_compressed = shprg.expand_compressed_binary_seed(compressed_seed);
-    for (int i = 0; i < n; i++) {
-        assert(expanded_compressed[i] == expanded_binary1[i]);
-    }
-#endif
-}
-
 template <typename T, typename Engine>
 void TestDummyAuthTriplesGenerator(const size_t testSize, Engine& engine) {
     // Party Information
@@ -218,10 +156,6 @@ int main(int argc, char** argv) {
     // so we only have a 128-bit generator object to run assertCorrelated
     test_permutation_correlations<__int128_t>(1000, engine);
     single_cout("Permutation Correlations... OK");
-
-    test_shprg<int64_t, int32_t>(engine);
-    test_shprg<__int128_t, int64_t>(engine);
-    single_cout("SHPRG... OK");
 #endif
 
     ///////////////////////////////////////////
