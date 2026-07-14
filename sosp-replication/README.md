@@ -93,6 +93,7 @@ After running all experiments, you can proceed to the [plotting section](#plotti
 
 #### Fig 5: Multi-workload Query 
 (Human time: 2 minutes, runtime: 3 hours)
+
 This experiment supports claim #1 and runs in BM-LAN and BM-WAN. In this experiment, we run our multi-workload query using the 4 protocols {2PC, 3PC, 4PC, SPDZ2k} in both LAN and WAN setups.
 
 From `node0`, run the following command and the results will be logged in `./sosp-replication/data/logs/fig5`.
@@ -102,6 +103,7 @@ $ ./sosp-replication/experiments/figure-5/fig5.sh
 
 #### Fig 6 Comparison with ORQ
 (Human time: 2 minutes, runtime: 5 hours)
+
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare against ORQ performance using 8 queries for both the 2PC and 3PC protocols.
 
 For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/fig6-cdough`.
@@ -116,6 +118,7 @@ $ ./sosp-replication/experiments/figure-6/fig6-orq.sh
 
 #### Fig 7 Comparison with TVA
 (Human time: 2 minutes, runtime: 5 hours)
+
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare against TVA performance using 3 queries for both 3PC and 4PC protocols.
 
 For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/fig7-cdough`.
@@ -130,6 +133,7 @@ $ ./sosp-replication/experiments/figure-7/fig7-tva.sh
 
 #### Fig 8 Scalability
 (Human time: 2 minutes, runtime: 12 hours)
+
 This experiment supports claim #2 and runs in BM-LAN. In this experiment we show scalability for [Comparison - RCA/PPA - Conv2d - Sorting] using the 3PC protocol.
 
 Run the following command and the results will be logged in `./sosp-replication/data/logs/fig8-cdough`.
@@ -139,6 +143,7 @@ $ ./sosp-replication/experiments/figure-8/fig8-cdough.sh
 
 #### Table 2 comparison with Pigeon (3PC)
 (Human time: 2 minutes, runtime: 1 hour)
+
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare against Pigeon ML inference for the 3PC protocol. Both systems use model parallelism, where multiple processes perform inference at the same time. We use the slowest process latency in both systems to determine the end-to-end latency.
 
 For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/table2-cdough`.
@@ -153,6 +158,7 @@ $ ./sosp-replication/experiments/table-2/table2-pigeon.sh
 
 #### Table 3 comparison with Piranha (2PC)
 (Human time: 2 minutes, runtime: 1 hour)
+
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN for CryptDough, but in AWS-LAN and AWS-WAN for Piranha since it requires a GPU. In this experiment, we compare against Piranha using the 2PC protocol.
 
 For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/table3-cdough`.
@@ -167,6 +173,7 @@ $ ./sosp-replication/experiments/table-3/table3-piranha.sh
 
 #### Table 4 comparison with MP-SPDZ (SPDZ2k)
 (Human time: 2 minutes, runtime: 1 hour)
+
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare CryptDough against MP-SPDZ.
 
 For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/table4-cdough`.
