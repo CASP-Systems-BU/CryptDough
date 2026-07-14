@@ -1,0 +1,13 @@
+Threads,Network,Query,Ours
+1,LAN,bitonic,3170.68
+2,LAN,bitonic,1739.09
+4,LAN,bitonic,1166.9
+8,LAN,bitonic,867.741
+16,LAN,bitonic,775.395
+32,LAN,bitonic,778.136
+1,LAN,quicksort,1482.91
+2,LAN,quicksort,886.877
+4,LAN,quicksort,491.159
+8,LAN,quicksort,369.395
+16,LAN,quicksort,283.692
+32,LAN,quicksort,278.497

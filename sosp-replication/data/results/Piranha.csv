@@ -1,0 +1,6 @@
+,2PC,,,,,
+,LAN,,,WAN,,
+Query,Piranha,US,SpeedUp,Piranha,US,SpeedUp
+AlexNet + CIFAR-10,0.568,0.461,1.2,3.584,9.2,0.4
+VGG16 + CIFAR-10,31.6,14.162,2.2,80.184,56.2,1.4
+VGG16 + ImageNet,47.33,30.0597,1.6,164.413,92.3,1.8
