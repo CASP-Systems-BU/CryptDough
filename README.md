@@ -47,7 +47,7 @@ mkdir build; cd build && ../scripts/setup/setup.sh
 ### Other operating systems
 For non-Ubuntu systems (Mac, other \*nix), you will need to install these packages yourself:
 ```
-git cmake pkg-config build-essential manpages-dev gfortran wget libsqlite3-0 libsqlite3-dev libsodium23 libsodium-dev libopenmpi3 libopenmpi-dev openmpi-bin openmpi-common python3 python3-pip libtool autoconf automake
+git cmake pkg-config build-essential manpages-dev gfortran wget libsqlite3-0 libsqlite3-dev libsodium23 libsodium-dev libopenmpi3 libopenmpi-dev openmpi-bin openmpi-common libopenblas-dev libblas-dev python3 python3-pip libtool autoconf automake
 ```
 
 Note that: OpenMPI used for one of the communicator interface implementation. The other one called "nocopy" does not use it.
