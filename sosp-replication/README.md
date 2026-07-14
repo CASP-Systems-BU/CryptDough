@@ -38,7 +38,7 @@ We compare against 5 prior state-of-the-art systems.
 2. [`ORQ`](https://dl.acm.org/doi/10.1145/3731569.3764833) in [commit](https://github.com/CASP-Systems-BU/orq/tree/2d7946a95f6d1d49e020789b70a6cfbdc1198a46): A specialized MPC system for relational queries.
 3. [`Pigeon`](https://petsymposium.org/popets/2025/popets-2025-0090.pdf) in [commit](https://github.com/chart21/hpmpc/tree/3d714566858739b430267c366dc9313ece0e0394): A specialized MPC system in machine learning that utilizes both CPU and GPU for local computation.
 4. [`Piranha`](https://www.usenix.org/conference/usenixsecurity22/presentation/watson) in [commit](https://github.com/ucbrise/piranha/tree/dfbcb59d4e24ab69eb3606b49a102e602fdbee87): A specialized MPC system in machine learning utilizing GPU for local computation.
-5. [`MP-SPDZ`](https://eprint.iacr.org/2020/521): A general-purpose MPC framework.
+5. [`MP-SPDZ`](https://eprint.iacr.org/2020/521) in [commit](https://github.com/data61/MP-SPDZ/tree/ae3fb09d905f1d7280dc3e4b4aca3154b0cab89b): A general-purpose MPC framework.
 
 
 All our experiments run on Ubuntu Linux 24.04.4 LTS and use 4 different settings, {BM-LAN, BM-WAN, AWS-LAN, AWS-WAN}, according to the following tags.
