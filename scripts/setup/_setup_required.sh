@@ -9,8 +9,8 @@ sudo apt install -y git cmake pkg-config build-essential manpages-dev gfortran \
         libopenblas-dev libblas-dev \
         python3 python3-pip libtool autoconf automake
 
-STARTMPC_PATH="$(realpath "$(dirname "$0")/../include/backend/nocopy_communicator/startmpc/startmpc")"
-mkdir ~/bin
+STARTMPC_PATH="$(realpath "$(dirname "$0")/../../include/backend/nocopy_communicator/startmpc/startmpc")"
+mkdir -p ~/bin
 sudo ln -sf $STARTMPC_PATH ~/bin/
 
 # to disable, change `always` to `madvise`

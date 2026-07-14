@@ -6,6 +6,8 @@ You can find the [complete documentation here](https://casp-systems-bu.github.io
 
 This work is to appear in SOSP2026 under title CryptDough: A unified analytics engine for secure multiparty computation.
 
+To access the CryptDough Artifact Evaluation Guide for SOSP 2026, please go to [`sosp-replication`](./sosp-replication/README.md)
+
 NOTICE: This is an academic proof-of-concept prototype, delivered as is without guarantees and is not meant for production use. Please, reach out to authors for more details.
 
 ## Table of Contents
