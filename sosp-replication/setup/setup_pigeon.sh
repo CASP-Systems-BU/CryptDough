@@ -27,7 +27,15 @@ fi
 HOSTS=("$1" "$2" "$3" "$4")
 
 REPO_URL="https://github.com/chart21/hpmpc"
-REPO_DIR="hpmpc"
+REPO_COMMIT="3d714566858739b430267c366dc9313ece0e0394"
+
+# Resolve the install location from this script's own location so it never depends
+# on the caller's working directory. The script lives in sosp-replication/setup/,
+# so the baselines dir is one level up. Pigeon is installed into baselines/hpmpc,
+# and this absolute path is passed to every remote node.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASELINES_DIR="$(cd "${SCRIPT_DIR}/../baselines" && pwd)"
+INSTALL_DIR="${BASELINES_DIR}/hpmpc"
 
 # IPs the parties advertise to each other over the wire. A host may be given as
 # "user@IP" for SSH; strip any "user@" prefix so run.sh gets the bare address.
@@ -54,11 +62,14 @@ sudo apt-get update && \
     sudo update-alternatives --install /usr/bin/cc cc /usr/bin/gcc 100 && \
     sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++ 100
 
-echo "[party ${pid}] Cloning ${REPO_URL} (with submodules)..."
-if [[ ! -d "${REPO_DIR}/.git" ]]; then
-    git clone "${REPO_URL}" "${REPO_DIR}"
+echo "[party ${pid}] Cloning ${REPO_URL} into ${INSTALL_DIR} (with submodules)..."
+mkdir -p "$(dirname "${INSTALL_DIR}")"
+if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
+    git clone "${REPO_URL}" "${INSTALL_DIR}"
 fi
-cd "${REPO_DIR}"
+cd "${INSTALL_DIR}"
+git fetch --all --tags
+git checkout ${REPO_COMMIT}
 git submodule update --init --recursive
 
 echo "[party ${pid}] Building (FUNCTION_IDENTIFIER=54 PROTOCOL=12)..."
@@ -99,7 +110,7 @@ remote_run_script() {
     local pid="$1"
     cat <<REMOTE
 set -uo pipefail
-cd "${REPO_DIR}"
+cd "${INSTALL_DIR}"
 pkill -9 -f run-P 2>/dev/null || true   # clear any stale party from a prior run (frees ports)
 echo "[party ${pid}] Running: make -j PARTY=${pid} FUNCTION_IDENTIFIER=54 PROTOCOL=12 && scripts/run.sh -p ${pid} -n 4 -a ${IP0} -b ${IP1} -c ${IP2} -d ${IP3}"
 make -j PARTY=${pid} FUNCTION_IDENTIFIER=54 PROTOCOL=12 && \

@@ -59,3 +59,4 @@ scripts/orchestration/aws/secrets.sh
 
 /deleted
 /tests/data/employees/output
+./sosp-replication/baselines
