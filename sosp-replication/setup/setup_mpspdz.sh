@@ -61,6 +61,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASELINES_DIR="$(cd "${SCRIPT_DIR}/../baselines" && pwd)"
 INSTALL_DIR="${BASELINES_DIR}/mpspdz"
 
+# Directory where compile-run.py stages each party's files and runs the VMs.
+# It MUST differ from INSTALL_DIR: the control instance (compile-run.py) runs in
+# INSTALL_DIR and creates its own .transfer.lock there, so if a party's
+# destination were also INSTALL_DIR, MP-SPDZ refuses to run ("You cannot use the
+# same directory for several instances"). A subdirectory keeps everything under
+# the install tree while staying separate from the control directory.
+RUN_DIR="${INSTALL_DIR}/cluster-run"
+
 # MP-SPDZ's README lists these apt dependencies:
 #   automake build-essential clang cmake git libboost-dev
 #   libboost-filesystem-dev libboost-iostreams-dev libboost-thread-dev
@@ -90,9 +98,14 @@ LOG_FILE="~/install_mpspdz.log"
 echo "==> ${NPROC} node(s) supplied; installing MP-SPDZ and building the MASCOT VM."
 echo "==> Each node writes its output to ${LOG_FILE} on its own host."
 
-# Install missing deps + clone + make setup + build the VM on every node, in parallel.
+# Install missing deps (interactive, sudo) first, then clone + make setup +
+# build the VM on every node in parallel.
 
-remote_build_script() {
+# Dependency installation needs sudo, which requires a password on most nodes.
+# When ssh runs a command non-interactively (no TTY) sudo cannot prompt, so this
+# phase runs on its own with a forced pseudo-terminal (ssh -tt) and is executed
+# sequentially per node so each password prompt reaches your terminal cleanly.
+remote_deps_script() {
     cat <<REMOTE
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -100,6 +113,13 @@ export DEBIAN_FRONTEND=noninteractive
 echo "[mpspdz] Installing MP-SPDZ build dependencies not already provided by CryptDough..."
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends ${MISSING_DEPS[*]}
+REMOTE
+}
+
+remote_build_script() {
+    cat <<REMOTE
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 echo "[mpspdz] Cloning ${REPO_URL} into ${INSTALL_DIR}..."
 mkdir -p "$(dirname "${INSTALL_DIR}")"
@@ -120,7 +140,25 @@ echo "[mpspdz] Build complete."
 REMOTE
 }
 
-echo "==> Phase 1/2: installing + cloning + building on ${NPROC} node(s) in parallel..."
+echo "==> Phase 0/2: installing build dependencies on ${NPROC} node(s) (sudo; you may be prompted for a password per node)..."
+# The script is sent as a base64 argument (not via stdin) so the interactive
+# terminal stays connected to sudo. If it were piped through stdin, sudo could
+# neither read the password nor disable echo, so the password would be shown.
+for i in "${!NODES[@]}"; do
+    echo "    - node $i -> ${NODES[$i]}"
+    deps_b64="$(remote_deps_script | base64 | tr -d '\n')"
+    # -tt forces a pseudo-terminal so sudo can prompt for and read the password
+    # with echo disabled; bash reads the decoded script from the pipe, leaving
+    # the terminal free for the password.
+    if ! ssh -tt "${NODES[$i]}" "echo ${deps_b64} | base64 -d | bash"; then
+        echo "!! Dependency installation FAILED on node ${i} (${NODES[$i]})." >&2
+        exit 1
+    fi
+    echo "    node ${i} dependencies OK"
+done
+echo "==> Dependencies installed on all ${NPROC} node(s)."
+
+echo "==> Phase 1/2: cloning + building on ${NPROC} node(s) in parallel..."
 build_pids=()
 for i in "${!NODES[@]}"; do
     echo "    - node $i -> ${NODES[$i]}"
@@ -147,10 +185,12 @@ echo "==> All ${NPROC} node(s) built successfully."
 
 # Run MP-SPDZ's simple tutorial example across the cluster from node0.
 #
-# HOSTS lists every node with the absolute install path. MP-SPDZ's HOSTS format
-# is "<host><path>": a single "/" after the host is home-relative, while "//"
-# is root-relative (absolute). INSTALL_DIR already starts with "/", so
-# "${node}/${INSTALL_DIR}" yields "<node>//<abs-path>", i.e. an absolute path.
+# HOSTS lists every node with the absolute staging path (RUN_DIR). MP-SPDZ's
+# HOSTS format is "<host><path>": a single "/" after the host is home-relative,
+# while "//" is root-relative (absolute). RUN_DIR already starts with "/", so
+# "${node}/${RUN_DIR}" yields "<node>//<abs-path>", i.e. an absolute path. RUN_DIR
+# is deliberately distinct from INSTALL_DIR (where the control instance runs) to
+# avoid MP-SPDZ's "same directory for several instances" transfer-lock error.
 
 remote_run_script() {
     cat <<REMOTE
@@ -160,8 +200,11 @@ cd "${INSTALL_DIR}"
 echo "[mpspdz] Writing HOSTS file for ${NPROC} parties..."
 : > HOSTS
 $(for node in "${NODES[@]}"; do
-    printf 'echo "%s/%s" >> HOSTS\n' "${node#*@}" "${INSTALL_DIR}"
+    printf 'echo "%s/%s" >> HOSTS\n' "${node#*@}" "${RUN_DIR}"
 done)
+
+echo "[mpspdz] Removing any stale transfer locks from previous runs..."
+rm -f "${INSTALL_DIR}/.transfer.lock" "${RUN_DIR}/.transfer.lock"
 
 echo "[mpspdz] Providing tutorial inputs for parties 0 and 1..."
 mkdir -p Player-Data

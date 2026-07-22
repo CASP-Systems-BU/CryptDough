@@ -38,29 +38,64 @@ BASELINES_DIR="$(cd "${SCRIPT_DIR}/../baselines" && pwd)"
 INSTALL_DIR="${BASELINES_DIR}/hpmpc"
 
 # IPs the parties advertise to each other over the wire. A host may be given as
-# "user@IP" for SSH; strip any "user@" prefix so run.sh gets the bare address.
-IP0="${HOSTS[0]#*@}"; IP1="${HOSTS[1]#*@}"; IP2="${HOSTS[2]#*@}"; IP3="${HOSTS[3]#*@}"
+# "user@host" for SSH, and the host part may be a hostname or SSH alias rather
+# than a bare IP. hpmpc's Connect() (core/networking/socket.hpp) resolves peers
+# with inet_aton(), which accepts ONLY dotted-decimal IPv4 addresses and rejects
+# hostnames. Passing a hostname makes the connecting parties throw
+# "Invalid address" in the live phase and abort. So strip any "user@" prefix and
+# resolve every host to its dotted-decimal IP before handing it to run.sh.
+resolve_ip() {
+    local host="${1#*@}" # strip any "user@" prefix
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s' "$host" # already a dotted-decimal IPv4 address
+        return 0
+    fi
+    local ip
+    ip="$(python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$host" 2>/dev/null)" || true
+    if [[ -z "$ip" ]]; then
+        echo "!! Could not resolve host '$host' to an IPv4 address." >&2
+        echo "   hpmpc requires dotted-decimal IPs for the party-to-party connection." >&2
+        exit 1
+    fi
+    printf '%s' "$ip"
+}
+IP0="$(resolve_ip "${HOSTS[0]}")"; IP1="$(resolve_ip "${HOSTS[1]}")"
+IP2="$(resolve_ip "${HOSTS[2]}")"; IP3="$(resolve_ip "${HOSTS[3]}")"
+echo "==> Wire IPs: P0=${IP0} P1=${IP1} P2=${IP2} P3=${IP3}"
 
-LOG_FILE="~/install_pigeon.log"
-echo "==> Each party writes its output to ${LOG_FILE} on its own host."
+# The nodes may share a home directory over NFS, so each party writes to its own
+# uniquely named log file (~/install_pigeon-P<party>.log). A single shared name
+# would be clobbered by the other parties' concurrent redirects, garbling the
+# logs and breaking the per-party completion check below.
+LOG_FILE_TEMPLATE="~/install_pigeon-P<party>.log"
+echo "==> Each party writes its output to ${LOG_FILE_TEMPLATE} on its own host."
 
-# Install dependencies, clone, and build — in parallel on all nodes.
+# Install dependencies (interactive, sudo) first, then clone + build on every
+# node in parallel.
+
+# Dependency installation needs sudo, which requires a password on most nodes.
+# When ssh runs a command non-interactively (no TTY) sudo cannot prompt, so this
+# phase runs on its own with a forced pseudo-terminal (ssh -tt) and is executed
+# sequentially per node so each password prompt reaches your terminal cleanly.
+remote_deps_script() {
+    cat <<REMOTE
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+echo "[pigeon] Installing system dependencies..."
+sudo apt-get update && \
+    sudo apt-get install -y \
+    git vim \
+    libssl-dev libeigen3-dev build-essential iproute2 iperf \
+    python3 \
+    jq bc
+REMOTE
+}
 
 remote_build_script() {
     local pid="$1"
     cat <<REMOTE
 set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-
-echo "[party ${pid}] Installing system dependencies..."
-sudo apt-get update && \
-    sudo apt-get install -y --no-install-recommends gcc-12 g++-12 \
-    libeigen3-dev libssl-dev git vim ca-certificates python3 jq bc \
-    build-essential iproute2 iperf && \
-    sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 \
-    100 --slave /usr/bin/g++ g++ /usr/bin/g++-12 && \
-    sudo update-alternatives --install /usr/bin/cc cc /usr/bin/gcc 100 && \
-    sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++ 100
 
 echo "[party ${pid}] Cloning ${REPO_URL} into ${INSTALL_DIR} (with submodules)..."
 mkdir -p "$(dirname "${INSTALL_DIR}")"
@@ -79,11 +114,29 @@ echo "[party ${pid}] Build complete."
 REMOTE
 }
 
-echo "==> Phase 1/2: installing + building on all 4 nodes in parallel..."
+echo "==> Phase 0/2: installing system dependencies on all 4 nodes (sudo; you may be prompted for a password per node)..."
+# The script is sent as a base64 argument (not via stdin) so the interactive
+# terminal stays connected to sudo. If it were piped through stdin, sudo could
+# neither read the password nor disable echo, so the password would be shown.
+deps_b64="$(remote_deps_script | base64 | tr -d '\n')"
+for i in 0 1 2 3; do
+    echo "    - party $i -> ${HOSTS[$i]}"
+    # -tt forces a pseudo-terminal so sudo can prompt for and read the password
+    # with echo disabled; bash reads the decoded script from the pipe, leaving
+    # the terminal free for the password.
+    if ! ssh -tt "${HOSTS[$i]}" "echo ${deps_b64} | base64 -d | bash"; then
+        echo "!! Dependency installation FAILED on party ${i} (${HOSTS[$i]})." >&2
+        exit 1
+    fi
+    echo "    party ${i} dependencies OK"
+done
+echo "==> Dependencies installed on all 4 nodes."
+
+echo "==> Phase 1/2: cloning + building on all 4 nodes in parallel..."
 build_pids=()
 for i in 0 1 2 3; do
     echo "    - party $i -> ${HOSTS[$i]}"
-    ssh "${HOSTS[$i]}" "bash -s > ${LOG_FILE} 2>&1" \
+    ssh "${HOSTS[$i]}" "bash -s > ~/install_pigeon-P${i}.log 2>&1" \
         <<<"$(remote_build_script "$i")" &
     build_pids+=("$!")
 done
@@ -91,7 +144,7 @@ done
 build_failed=0
 for i in 0 1 2 3; do
     if ! wait "${build_pids[$i]}"; then
-        echo "!! Build FAILED on party ${i} (${HOSTS[$i]}). See ${LOG_FILE} on that host." >&2
+        echo "!! Build FAILED on party ${i} (${HOSTS[$i]}). See ~/install_pigeon-P${i}.log on that host." >&2
         build_failed=1
     else
         echo "    party ${i} build OK"
@@ -121,23 +174,27 @@ REMOTE
 echo "==> Phase 2/2: launching connectivity test on all 4 nodes simultaneously..."
 run_pids=()
 for i in 0 1 2 3; do
-    ssh "${HOSTS[$i]}" "bash -s >> ${LOG_FILE} 2>&1" \
+    ssh "${HOSTS[$i]}" "bash -s >> ~/install_pigeon-P${i}.log 2>&1" \
         <<<"$(remote_run_script "$i")" &
     run_pids+=("$!")
 done
 
-# The binary's teardown abort makes the exit code unreliable, so wait for each
-# run to finish and then confirm the protocol actually ran by checking the log.
+# Wait for each run to finish, then confirm correctness from the logs. A correct
+# run prints "Passed N out of N tests." on every party and exits cleanly; the
+# per-party log is the source of truth.
 for i in 0 1 2 3; do
     wait "${run_pids[$i]}" || true
 done
 
 run_failed=0
 for i in 0 1 2 3; do
-    if ssh "${HOSTS[$i]}" "grep -q 'P${i}, ONLINE' ${LOG_FILE}"; then
-        echo "    party ${i} ran and exchanged data OK"
+    # Success = "Passed N out of N tests." with both counts equal (all tests
+    # passed). The backreference \1 requires the second number to match the
+    # first. Anything else (crash, mismatch, or missing line) is a failure.
+    if ssh "${HOSTS[$i]}" "grep -q 'Passed \([0-9][0-9]*\) out of \1 tests' ~/install_pigeon-P${i}.log"; then
+        echo "    party ${i} passed all correctness tests"
     else
-        echo "!! party ${i} (${HOSTS[$i]}) did NOT complete the protocol. See ${LOG_FILE} on that host." >&2
+        echo "!! party ${i} (${HOSTS[$i]}) did NOT pass all tests. See ~/install_pigeon-P${i}.log on that host." >&2
         run_failed=1
     fi
 done
@@ -145,10 +202,10 @@ done
 echo
 echo "======================================================================"
 if [[ "$run_failed" -ne 0 ]]; then
-    echo "Pigeon installed, but the 4-party test did not complete on every node."
-    echo "Inspect ${LOG_FILE} on each host."
+    echo "Pigeon installed, but the 4-party test did not pass on every node."
+    echo "Inspect ~/install_pigeon-P<party>.log on each host."
     exit 1
 fi
-echo "SUCCESS: Pigeon installed; all 4 parties ran the test and exchanged data."
-echo "Per-node output: ${LOG_FILE} on each host."
+echo "SUCCESS: Pigeon installed; all 4 parties passed the correctness test."
+echo "Per-node output: ~/install_pigeon-P<party>.log on each host."
 echo "======================================================================"

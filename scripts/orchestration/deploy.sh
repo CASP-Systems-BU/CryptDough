@@ -61,12 +61,5 @@ sudo apt upgrade -y
 ../scripts/setup/setup.sh
 
 echo 'Testing MPI execution of `test_primitives`...'
-cmake .. -DPROTOCOL=$NUM_NODES &&
-make -j $(nproc) test_primitives
-
-for W in "$@"; do
-    scp test_primitives $W:$REPO_NAME/build
-done
-
-mpirun --host $ALL_NODES -np $NUM_NODES test_primitives &&
+../scripts/run_experiment.py -c mpi -p $NUM_NODES test_primitives
 echo 'Installation complete.'
