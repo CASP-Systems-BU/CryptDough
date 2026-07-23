@@ -7,6 +7,9 @@
 #include "gilboa_ole.h"
 #include "ole_generator.h"
 
+#include <NTL/ZZ_p.h>
+#include <NTL/ZZ_pX.h>
+
 /**
  * @brief Statistical security parameter \f$\lambda\f$, with failure probability \f$2^-\lambda\f$
  *

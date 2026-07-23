@@ -109,6 +109,7 @@ class ExperimentConfig:
     triples_type: str
     division_correction: bool
     sort_proto: str
+    build_only: bool
     cmake_args: List[str]
     exp_args: List[str]
     node_prefix: str
@@ -278,6 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="quicksort",
         help="Default sorting protocol; default: quicksort",
     )
+    parser.add_argument(
+        "--build-only",
+        dest="build_only",
+        action="store_true",
+        help="Build (and scp when applicable) then exit without running the experiment.",
+    )
     return parser
 
 def _run_cmd(cmd: List[str]) -> str:
@@ -426,6 +433,7 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
         triples_type=triples_type,
         division_correction=division_correction,
         sort_proto=sort_proto,
+        build_only=args.build_only,
         cmake_args=args.cmake_args or [],
         exp_args=args.exp_args or [],
         node_prefix=args.node_prefix,
@@ -874,8 +882,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         # Build and prepare experiment environment
         perform_experiment_setup(cfg)
-        # Run experiments
-        run_experiments(cfg)
+        # Run experiments unless build-only was requested
+        if cfg.build_only:
+            print("Build-only mode: setup complete, skipping experiment run.", flush=True)
+        else:
+            run_experiments(cfg)
         return 0
     finally:
         # Always disable WAN simulation if we enabled it
