@@ -1,11 +1,13 @@
 #!/bin/bash
 
 script_dir=$(dirname "$0")
-run_script="$script_dir/../../../scripts/run_experiment.py"
-log_dir="$script_dir/../../data/logs/fig6/cdough"
-
+log_dir="$script_dir/../../data/logs/fig6/orq"
 mkdir -p "$log_dir"
 
+baseline_dir="$script_dir/../../baselines/orq/build"
+run_script="$baseline_dir/scripts/run_experiment.sh"
+
+cd "$baseline_dir"
 
 # LAN Experiments with 2PC
 $run_script -p 2 -f 1 -c nocopy -n 4 -s lan -t 4 -b -12  aspirin >> "$log_dir/lan-2pc-aspirin.log"
