@@ -107,6 +107,8 @@ class ExperimentConfig:
     exp_repetitions: int
     opt_level: int
     triples_type: str
+    division_correction: bool
+    sort_proto: str
     cmake_args: List[str]
     exp_args: List[str]
     node_prefix: str
@@ -256,6 +258,26 @@ def build_parser() -> argparse.ArgumentParser:
         default="zero",
         help="Type of Beaver triples for 2PC (ZERO/DUMMY/REAL); default: zero",
     )
+    parser.add_argument(
+        "--no-division-correction",
+        dest="disable_division_correction",
+        action="store_true",
+        help="Disable division correction; default: enabled",
+    )
+    parser.add_argument(
+        "--sort",
+        dest="sort_proto",
+        choices=[
+            "network",
+            "quicksort",
+            "radixsort",
+            "bitonicmerge",
+            "bitonicsort",
+        ],
+        type=str.lower,
+        default="quicksort",
+        help="Default sorting protocol; default: quicksort",
+    )
     return parser
 
 def _run_cmd(cmd: List[str]) -> str:
@@ -379,6 +401,11 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
     # Normalize triples type to uppercase
     triples_type = args.triples_type.upper()
 
+    # Division correction is enabled unless explicitly disabled.
+    division_correction = not args.disable_division_correction
+    # Sorting protocol name in the C++ enum form (uppercase).
+    sort_proto = args.sort_proto.upper()
+
     return ExperimentConfig(
         exp_protocol=args.exp_protocol,
         exp_setting=args.exp_setting,
@@ -397,6 +424,8 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
         exp_repetitions=args.exp_repetitions,
         opt_level=args.opt_level,
         triples_type=triples_type,
+        division_correction=division_correction,
+        sort_proto=sort_proto,
         cmake_args=args.cmake_args or [],
         exp_args=args.exp_args or [],
         node_prefix=args.node_prefix,
@@ -450,6 +479,12 @@ def perform_experiment_setup(cfg: ExperimentConfig) -> None:
         extra_cmake_args = extra_cmake_args + [f"-DCOMM_THREADS={cfg.num_comm_threads}"]
     # Add triples type to cmake args
     extra_cmake_args = extra_cmake_args + [f"-DTRIPLES={cfg.triples_type}"]
+    # Toggle division correction (enabled by default in CMake/header).
+    extra_cmake_args = extra_cmake_args + [
+        f"-DDIVISION_CORRECTION={'ON' if cfg.division_correction else 'OFF'}"
+    ]
+    # Select the default sorting protocol.
+    extra_cmake_args = extra_cmake_args + [f"-DSORT_PROTO={cfg.sort_proto}"]
     cmake_args_flat = _flatten_args(extra_cmake_args)
 
     # Run cmake

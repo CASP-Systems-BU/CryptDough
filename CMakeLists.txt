@@ -78,6 +78,23 @@ endif()
 set(DEFAULT_BITWIDTH 32 CACHE STRING "Set default bitwidth")
 add_definitions(-DDEFAULT_BITWIDTH=${DEFAULT_BITWIDTH})
 
+# Option: enable/disable division correction (see include/debug/cdough_debug.h).
+# Enabled by default; when disabled, define NO_DIVISION_CORRECTION so the header
+# skips defining USE_DIVISION_CORRECTION.
+option(DIVISION_CORRECTION "Use division correction" ON)
+if(NOT DIVISION_CORRECTION)
+    add_compile_definitions(NO_DIVISION_CORRECTION)
+endif()
+
+# Option: choose the default sorting protocol (see include/core/operators/sorting.h).
+# Passed through as CONFIG_DEFAULT_SORT_PROTO; defaults to QUICKSORT.
+set(SORT_PROTO "QUICKSORT" CACHE STRING "Default sorting protocol")
+set(VALID_SORT_PROTOS "NETWORK" "QUICKSORT" "RADIXSORT" "BITONICMERGE" "BITONICSORT")
+if(NOT SORT_PROTO IN_LIST VALID_SORT_PROTOS)
+    message(FATAL_ERROR "Invalid value for SORT_PROTO: ${SORT_PROTO}. Choose one of: ${VALID_SORT_PROTOS}.")
+endif()
+add_compile_definitions(CONFIG_DEFAULT_SORT_PROTO=${SORT_PROTO})
+
 # Set a flag if we're running inside the CI
 if(DEFINED ENV{GITHUB_ACTIONS})
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DGITHUB_ACTIONS")

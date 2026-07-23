@@ -11,8 +11,14 @@ namespace cdough {
  */
 typedef enum { NETWORK, QUICKSORT, RADIXSORT, BITONICMERGE, BITONICSORT } SortingProtocol;
 
-// To change the default sort protocol, change Quicksort to something else
-constexpr SortingProtocol DEFAULT_SORT_PROTO = CONFIDENTIAL_1PC ? NETWORK : QUICKSORT;
+// The default sort protocol can be set at compile time via CONFIG_DEFAULT_SORT_PROTO
+// (e.g. `-DSORT_PROTO=RADIXSORT` through CMake). It must name a SortingProtocol enum
+// member. When unset, it falls back to QUICKSORT.
+#ifndef CONFIG_DEFAULT_SORT_PROTO
+#define CONFIG_DEFAULT_SORT_PROTO QUICKSORT
+#endif
+constexpr SortingProtocol DEFAULT_SORT_PROTO =
+    CONFIDENTIAL_1PC ? NETWORK : CONFIG_DEFAULT_SORT_PROTO;
 
 namespace operators {
 

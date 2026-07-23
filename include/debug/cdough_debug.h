@@ -78,7 +78,11 @@
 // If defined, do not use the automatic adder circuit selector, and always use PPA.
 // (To force RCA, do not pass any network parameters. The default is RCA.)
 // #define FORCE_PARALLEL_PREFIX_ADDER 1
+// Division correction is on by default. Define NO_DIVISION_CORRECTION at compile
+// time (e.g. `-DDIVISION_CORRECTION=OFF` via CMake) to disable it.
+#ifndef NO_DIVISION_CORRECTION
 #define USE_DIVISION_CORRECTION 1
+#endif
 // #define RECYCLE_THREAD_MEMORY 1
 #define DEBUG_VECTOR_SAME_AS 1
 
