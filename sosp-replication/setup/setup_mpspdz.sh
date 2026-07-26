@@ -24,6 +24,12 @@
 #      by the Table 4 experiment (built AFTER the overlay so it picks up the
 #      replaced sources; MASCOT is built before the overlay so the tutorial
 #      self-test below runs against pristine sources).
+#   7. Creates a Python virtual environment (.env) inside the MP-SPDZ tree and
+#      installs the ML dependencies the AlexNet inference program imports when
+#      compile.py builds it: numpy, plus CPU-only torch and torchvision (the CPU
+#      wheels avoid the large CUDA download; the program only trains/evaluates in
+#      cleartext to emit the secure graph). table4-mpspdz.sh runs compile.py with
+#      this venv's interpreter (.env/bin/python).
 #
 # Once every node has built, it runs MP-SPDZ's simple tutorial example ACROSS
 # the cluster from node0 using MP-SPDZ's own remote runner:
@@ -104,6 +110,7 @@ RUN_DIR="${INSTALL_DIR}/cluster-run"
 # the tutorial across the cluster with MP-SPDZ's remote runner:
 #   - python3-fabric:  compile-run.py -H uses Fabric/SSH to upload and launch.
 #   - libstdc++-11-dev: provide the GNU C++ standard library for clang.
+#   - python3-venv:    create the .env virtualenv for the compiler's ML deps.
 MISSING_DEPS=(
     clang
     libboost-dev
@@ -115,6 +122,7 @@ MISSING_DEPS=(
     libssl-dev
     python3-fabric
     libstdc++-11-dev
+    python3-venv
 )
 
 NPROC="${#NODES[@]}"
@@ -169,6 +177,14 @@ cp -f "${FILES_DIR}/torch_cifar_alex_infer_single.mpc"  "${INSTALL_DIR}/Programs
 
 echo "[mpspdz] Building the SPDZ2k virtual machine ('make -j spdz2k-party.x')..."
 make -j spdz2k-party.x
+
+echo "[mpspdz] Creating the .env virtualenv and installing the compiler's ML dependencies..."
+if [[ ! -d "${INSTALL_DIR}/.env" ]]; then
+    python3 -m venv "${INSTALL_DIR}/.env"
+fi
+"${INSTALL_DIR}/.env/bin/pip" install --upgrade pip
+"${INSTALL_DIR}/.env/bin/pip" install numpy
+"${INSTALL_DIR}/.env/bin/pip" install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 echo "[mpspdz] Build complete."
 REMOTE
