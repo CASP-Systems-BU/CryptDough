@@ -45,7 +45,7 @@ fi
 NODES=("$@")
 
 REPO_URL="https://github.com/CASP-Systems-BU/tva"
-REPO_COMMIT="e777cbadd28ce5da7d98c657aca64275bac164ac"
+REPO_COMMIT="36b558bbf1dcd5da57e343bb734ff965ce6dcaed"
 
 # Resolve the install location from this script's own location so it never
 # depends on the caller's working directory. The script lives in

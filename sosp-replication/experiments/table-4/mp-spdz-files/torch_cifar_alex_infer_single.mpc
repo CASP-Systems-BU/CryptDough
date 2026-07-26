@@ -1,0 +1,88 @@
+# Inference-only CryptGPU AlexNet on CIFAR-10 (matches Piranha/Pigeon)
+# Usage: ./compile.py -R 64 torch_cifar_alex_infer <batch_size> <n_threads>
+# To be copied to Programs/Source/torch_cifar_alex_infer_single.mpc
+
+program.options_from_args()
+program.use_edabit(True)
+# program.use_trunc_pr = True
+# program.use_split(3)
+
+from Compiler import ml
+
+try:
+    ml.set_n_threads(int(program.args[2]))
+except:
+    pass
+
+import torchvision
+import torch
+import numpy
+
+get_data = lambda train, transform=None: torchvision.datasets.CIFAR10(
+    root='/tmp', train=train, download=True, transform=transform)
+
+ds = get_data(False)
+
+# normalize to [-1,1] before input
+batch_size = int(program.args[1])
+test_samples = sfix.input_tensor_via(0, ds.data[:batch_size] / 255 * 2 - 1)
+test_labels = sint.input_tensor_via(0, numpy.array(ds.targets[:batch_size]), one_hot=True)
+
+import torch.nn as nn
+
+# CryptGPU AlexNet - matches Piranha/Pigeon architecture exactly
+net = nn.Sequential(
+    nn.Conv2d(3, 96, kernel_size=11, stride=4, padding=9),
+    nn.ReLU(),
+    nn.AvgPool2d(kernel_size=3, stride=2),
+    nn.Conv2d(96, 256, kernel_size=5, stride=1, padding=1),
+    nn.ReLU(),
+    nn.AvgPool2d(kernel_size=2, stride=1),
+    nn.Conv2d(256, 384, kernel_size=3, stride=1, padding=1),
+    nn.ReLU(),
+    nn.Conv2d(384, 384, kernel_size=3, stride=1, padding=1),
+    nn.ReLU(),
+    nn.Conv2d(384, 256, kernel_size=3, stride=1, padding=1),
+    nn.ReLU(),
+    nn.Flatten(),
+    nn.Linear(256, 256),
+    nn.ReLU(),
+    nn.Linear(256, 256),
+    nn.ReLU(),
+    nn.Linear(256, 10),
+)
+
+# train in cleartext PyTorch
+transform = torchvision.transforms.Compose(
+    [torchvision.transforms.ToTensor(), lambda x: 2 * x - 1])
+ds = get_data(train=True, transform=transform)
+opt = torch.optim.Adam(net.parameters(), amsgrad=True)
+criterion = nn.CrossEntropyLoss()
+
+for i, data in enumerate(torch.utils.data.DataLoader(ds, batch_size=128)):
+    inputs, labels = data
+    opt.zero_grad()
+    outputs = net(inputs)
+    loss = criterion(outputs, labels)
+    loss.backward()
+    opt.step()
+
+with torch.no_grad():
+    ds = get_data(False, transform)
+    total = correct_classified = 0
+    for data in torch.utils.data.DataLoader(ds, batch_size=128):
+        inputs, labels = data
+        outputs = net(inputs)
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct_classified += (predicted == labels).sum().item()
+    test_acc = (100 * correct_classified / total)
+    print('Cleartext test accuracy: %.2f %%' % test_acc)
+
+# secure inference
+layers = ml.layers_from_torch(net, test_samples.shape, batch_size, input_via=0)
+
+mpc_opt = ml.Optimizer(layers)
+
+n_correct, loss = mpc_opt.reveal_correctness(test_samples, test_labels, batch_size, running=True)
+print_ln('Secure accuracy: %s/%s', n_correct, len(test_samples))

@@ -2,7 +2,7 @@
 
 script_dir=$(dirname "$0")
 run_script="$script_dir/../../../scripts/run_experiment.py"
-log_dir="$script_dir/../../data/logs/fig7/fig7-cdough"
+log_dir="$script_dir/../../data/logs/fig7/cdough"
 
 mkdir -p "$log_dir"
 

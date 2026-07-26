@@ -1,12 +1,27 @@
 #!/bin/bash
 
 script_dir=$(dirname "$0")
-log_dir="$script_dir/../../data/logs/fig7/tva"
-mkdir -p "$log_dir"
 
 baseline_dir="$script_dir/../../baselines/tva/build"
 build_dir=$(cd "$baseline_dir" && pwd)
-run_command="mpirun --host node0,node1,node2,node3 --mca btl_tcp_if_include 192.168.100.0/24"
+cd "$build_dir"
+
+log_dir="$script_dir/../../../../../data/logs/fig7/tva"
+mkdir -p "$log_dir"
+
+# Discover the cluster network interface/subnet so MPI binds to the correct NIC.
+# Mirrors scripts/run_experiment.py: resolve node1's address, find the interface
+# used to reach it, then read that interface's subnet in CIDR form.
+cluster_iface=$(ip route get "$(dig +short node1 | tail -n 1)" | grep -Po '((?<=dev )\S*)')
+cluster_subnet=$(ip -o -f inet addr show "$cluster_iface" | awk '{print $4}')
+
+# Use exactly as many hosts as the protocol requires. mpirun spawns an orted
+# daemon on every host in --host (even those without a rank), so listing node3
+# for a 3PC run would needlessly involve it and stall if it is unreachable.
+# This mirrors TVA's reference scripts (3 hosts for -np 3, 4 hosts for -np 4).
+run_command_base="mpirun --mca btl_tcp_if_include ${cluster_subnet}"
+run_command_3pc="${run_command_base} --host node0,node1,node2"
+run_command_4pc="${run_command_base} --host node0,node1,node2,node3"
 
 # build_tva <np>: (Re)build the TVA energy/medical/cloud binaries for the given
 # protocol on all participating parties. np=3 builds the 3PC semi-honest
@@ -45,32 +60,30 @@ build_tva() {
     echo "==> TVA ${np}PC build complete on all nodes."
 }
 
-cd "$build_dir"
-
 
 build_tva 3
 # LAN experiments with 3PC
-$run_command -np 3 energy 16 1 4096 4194304 >> "$log_dir/lan-3pc-energy.log"
-$run_command -np 3 medical 16 1 4096 4194304 >> "$log_dir/lan-3pc-medical.log"
-$run_command -np 3 cloud 16 1 4096 4194304 >> "$log_dir/lan-3pc-cloud.log"
+$run_command_3pc -np 3 ./energy 16 1 4096 4194304 >> "$log_dir/lan-3pc-energy.log"
+$run_command_3pc -np 3 ./medical 16 1 4096 4194304 >> "$log_dir/lan-3pc-medical.log"
+$run_command_3pc -np 3 ./cloud 16 1 4096 4194304 >> "$log_dir/lan-3pc-cloud.log"
 
 
 build_tva 4
 # LAN experiments with 4PC
-$run_command -np 4 energy 16 1 4096 4194304 >> "$log_dir/lan-4pc-energy.log"
-$run_command -np 4 medical 16 1 4096 4194304 >> "$log_dir/lan-4pc-medical.log"
-$run_command -np 4 cloud 16 1 4096 4194304 >> "$log_dir/lan-4pc-cloud.log"
+$run_command_4pc -np 4 ./energy 16 1 4096 4194304 >> "$log_dir/lan-4pc-energy.log"
+$run_command_4pc -np 4 ./medical 16 1 4096 4194304 >> "$log_dir/lan-4pc-medical.log"
+$run_command_4pc -np 4 ./cloud 16 1 4096 4194304 >> "$log_dir/lan-4pc-cloud.log"
 
 # TODO: turn on WAN
 
 build_tva 3
 # WAN experiments with 3PC
-$run_command -np 3 energy 16 1 65536 4194304 >> "$log_dir/wan-3pc-energy.log"
-$run_command -np 3 medical 16 1 65536 4194304 >> "$log_dir/wan-3pc-medical.log"
-$run_command -np 3 cloud 16 1 65536 4194304 >> "$log_dir/wan-3pc-cloud.log"
+$run_command_3pc -np 3 ./energy 16 1 65536 4194304 >> "$log_dir/wan-3pc-energy.log"
+$run_command_3pc -np 3 ./medical 16 1 65536 4194304 >> "$log_dir/wan-3pc-medical.log"
+$run_command_3pc -np 3 ./cloud 16 1 65536 4194304 >> "$log_dir/wan-3pc-cloud.log"
 
 build_tva 4
 # WAN experiments with 4PC
-$run_command -np 4 energy 16 1 65536 4194304 >> "$log_dir/wan-4pc-energy.log"
-$run_command -np 4 medical 16 1 65536 4194304 >> "$log_dir/wan-4pc-medical.log"
-$run_command -np 4 cloud 16 1 65536 4194304 >> "$log_dir/wan-4pc-cloud.log"
+$run_command_4pc -np 4 ./energy 16 1 65536 4194304 >> "$log_dir/wan-4pc-energy.log"
+$run_command_4pc -np 4 ./medical 16 1 65536 4194304 >> "$log_dir/wan-4pc-medical.log"
+$run_command_4pc -np 4 ./cloud 16 1 65536 4194304 >> "$log_dir/wan-4pc-cloud.log"

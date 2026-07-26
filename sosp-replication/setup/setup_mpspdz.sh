@@ -14,6 +14,16 @@
 #      (libOTe, SimpleOT, and Boost locally where needed).
 #   4. Builds the MASCOT virtual machine (`make -j mascot-party.x`), the VM used
 #      by the README's simple tutorial example.
+#   5. Overlays the CryptDough-provided MP-SPDZ files from
+#      sosp-replication/experiments/table-4/mp-spdz-files: three SPDZ2k source
+#      replacements (Protocols/Beaver.hpp, Processor/Data_Files.h,
+#      Protocols/MatrixFile.h) that zero the triples for the online-only Table 4
+#      comparison, plus the AlexNet inference program
+#      (Programs/Source/torch_cifar_alex_infer_single.mpc).
+#   6. Builds the SPDZ2k virtual machine (`make -j spdz2k-party.x`), the VM used
+#      by the Table 4 experiment (built AFTER the overlay so it picks up the
+#      replaced sources; MASCOT is built before the overlay so the tutorial
+#      self-test below runs against pristine sources).
 #
 # Once every node has built, it runs MP-SPDZ's simple tutorial example ACROSS
 # the cluster from node0 using MP-SPDZ's own remote runner:
@@ -60,6 +70,21 @@ REPO_COMMIT="ae3fb09d905f1d7280dc3e4b4aca3154b0cab89b"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASELINES_DIR="$(cd "${SCRIPT_DIR}/../baselines" && pwd)"
 INSTALL_DIR="${BASELINES_DIR}/mpspdz"
+
+# CryptDough-provided MP-SPDZ overlay files: three SPDZ2k source replacements
+# that zero the triples for the online-only Table 4 comparison, plus the AlexNet
+# inference program. Each file's header states its destination inside the
+# MP-SPDZ tree. They live in the CryptDough repo, which is deployed to the same
+# absolute path on every node, so this absolute path is valid on each node.
+FILES_DIR="$(cd "${SCRIPT_DIR}/../experiments/table-4/mp-spdz-files" && pwd)"
+
+# Fail fast (on node0) if any overlay file is missing, before touching any node.
+for overlay_file in Beaver.hpp Data_Files.h MatrixFile.h torch_cifar_alex_infer_single.mpc; do
+    if [[ ! -f "${FILES_DIR}/${overlay_file}" ]]; then
+        echo "!! Missing MP-SPDZ overlay file: ${FILES_DIR}/${overlay_file}" >&2
+        exit 1
+    fi
+done
 
 # Directory where compile-run.py stages each party's files and runs the VMs.
 # It MUST differ from INSTALL_DIR: the control instance (compile-run.py) runs in
@@ -135,6 +160,15 @@ make setup
 
 echo "[mpspdz] Building the MASCOT virtual machine ('make -j mascot-party.x')..."
 make -j mascot-party.x
+
+echo "[mpspdz] Overlaying CryptDough SPDZ2k source files and the AlexNet inference program..."
+cp -f "${FILES_DIR}/Beaver.hpp"                          "${INSTALL_DIR}/Protocols/Beaver.hpp"
+cp -f "${FILES_DIR}/Data_Files.h"                        "${INSTALL_DIR}/Processor/Data_Files.h"
+cp -f "${FILES_DIR}/MatrixFile.h"                        "${INSTALL_DIR}/Protocols/MatrixFile.h"
+cp -f "${FILES_DIR}/torch_cifar_alex_infer_single.mpc"  "${INSTALL_DIR}/Programs/Source/torch_cifar_alex_infer_single.mpc"
+
+echo "[mpspdz] Building the SPDZ2k virtual machine ('make -j spdz2k-party.x')..."
+make -j spdz2k-party.x
 
 echo "[mpspdz] Build complete."
 REMOTE

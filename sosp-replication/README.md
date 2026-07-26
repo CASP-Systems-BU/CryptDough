@@ -34,7 +34,7 @@ We provide a few examples to showcase our supported analytics:
 The experimental section in the paper supports two claims: (i) we can implement a multi-workload query and easily switch between the different supported protocols, and (ii) our approach is not at a disadvantage against specialized MPC systems and, in fact, our performance can sometimes exceed that of prior state-of-the-art systems.
 
 We compare against 5 prior state-of-the-art systems.
-1. [`TVA`](https://www.usenix.org/conference/usenixsecurity23/presentation/faisal) in [commit](https://github.com/CASP-Systems-BU/tva/tree/e777cbadd28ce5da7d98c657aca64275bac164ac): A specialized MPC system for time series analytics.
+1. [`TVA`](https://www.usenix.org/conference/usenixsecurity23/presentation/faisal) in [commit](https://github.com/CASP-Systems-BU/tva/tree/36b558bbf1dcd5da57e343bb734ff965ce6dcaed): A specialized MPC system for time series analytics.
 2. [`ORQ`](https://dl.acm.org/doi/10.1145/3731569.3764833) in [commit](https://github.com/CASP-Systems-BU/orq/tree/2d7946a95f6d1d49e020789b70a6cfbdc1198a46): A specialized MPC system for relational queries.
 3. [`Pigeon`](https://petsymposium.org/popets/2025/popets-2025-0090.pdf) in [commit](https://github.com/chart21/hpmpc/tree/3d714566858739b430267c366dc9313ece0e0394): A specialized MPC system in machine learning that utilizes both CPU and GPU for local computation.
 4. [`Piranha`](https://www.usenix.org/conference/usenixsecurity22/presentation/watson) in [commit](https://github.com/ucbrise/piranha/tree/dfbcb59d4e24ab69eb3606b49a102e602fdbee87): A specialized MPC system in machine learning utilizing GPU for local computation.
@@ -136,9 +136,9 @@ $ ./sosp-replication/experiments/figure-7/fig7-tva.sh
 
 This experiment supports claim #2 and runs in BM-LAN. In this experiment we show scalability for [Comparison - RCA/PPA - Conv2d - Sorting] using the 3PC protocol.
 
-Run the following command and the results will be logged in `./sosp-replication/data/logs/fig8-cdough`.
+Run the following command and the results will be logged in `./sosp-replication/data/logs/fig8`.
 ```bash
-$ ./sosp-replication/experiments/figure-8/fig8-cdough.sh
+$ ./sosp-replication/experiments/figure-8/fig8.sh
 ```
 
 #### Table 2 comparison with Pigeon (3PC)

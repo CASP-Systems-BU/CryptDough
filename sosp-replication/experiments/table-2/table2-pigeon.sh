@@ -33,7 +33,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # each node reached over SSH. sosp-replication (script_dir/../..) always exists,
 # so we can resolve it before the log dir itself is created.
 hpmpc_dir="$(cd "$script_dir/../../baselines/hpmpc" && pwd)"
-log_dir="$(cd "$script_dir/../.." && pwd)/data/logs/table2/pigeon"
+log_dir="$(cd "$script_dir/../.." && pwd)/data/logs/table-2/pigeon"
 
 # Node aliases; party N runs on node N.
 NODES=(node0 node1 node2 node3)
@@ -146,15 +146,15 @@ REMOTE
 overall=0
 
 # LAN Experiments with 3PC
-run_experiment "3pc" 3 \
+run_experiment "AlexNet" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=180 PROTOCOL=5" \
     1 "lan-3pc-alexnet.log" || overall=1
 
-run_experiment "3pc" 3 \
+run_experiment "VGG16" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=174 PROTOCOL=5" \
     1 "lan-3pc-vgg16.log" || overall=1
 
-run_experiment "3pc" 3 \
+run_experiment "VGG16_Imagenet" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=179 PROTOCOL=5" \
     1 "lan-3pc-vgg16_imagenet.log" || overall=1
 
@@ -162,15 +162,15 @@ run_experiment "3pc" 3 \
 # TODO: Turn on WAN 
 # WAN Experiments with 3PC
 
-run_experiment "3pc" 3 \
+run_experiment "AlexNet" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=180 PROTOCOL=5" \
     1 "wan-3pc-alexnet.log" || overall=1
 
-run_experiment "3pc" 3 \
+run_experiment "VGG16" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=174 PROTOCOL=5" \
     1 "wan-3pc-vgg16.log" || overall=1
 
-run_experiment "3pc" 3 \
+run_experiment "VGG16_Imagenet" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=179 PROTOCOL=5" \
     1 "wan-3pc-vgg16_imagenet.log" || overall=1
 
