@@ -20,10 +20,13 @@
 #      Protocols/MatrixFile.h) that zero the triples for the online-only Table 4
 #      comparison, plus the AlexNet inference program
 #      (Programs/Source/torch_cifar_alex_infer_single.mpc).
-#   6. Builds the SPDZ2k virtual machine (`make -j spdz2k-party.x`), the VM used
-#      by the Table 4 experiment (built AFTER the overlay so it picks up the
-#      replaced sources; MASCOT is built before the overlay so the tutorial
-#      self-test below runs against pristine sources).
+#   6. Builds the SPDZ2k virtual machine (`make -j spdz2k-party.x`) and the fake
+#      offline generator (`make -j Fake-Offline.x`, used by the experiment's -F
+#      path), the binaries the Table 4 experiment runs. The whole build is
+#      compiled with -DINSECURE (via MY_CFLAGS in CONFIG.mine) because the -F
+#      fake-offline benchmarking path refuses to run otherwise. Built AFTER the
+#      overlay so they pick up the replaced sources; MASCOT is built before the
+#      overlay so the tutorial self-test below runs against pristine sources.
 #   7. Creates a Python virtual environment (.env) inside the MP-SPDZ tree and
 #      installs the ML dependencies the AlexNet inference program imports when
 #      compile.py builds it: numpy, plus CPU-only torch and torchvision (the CPU
@@ -163,6 +166,15 @@ cd "${INSTALL_DIR}"
 git fetch --all --tags
 git checkout ${REPO_COMMIT}
 
+echo "[mpspdz] Enabling insecure preprocessing (-DINSECURE), required by the experiment's -F fake-offline benchmark path..."
+grep -q -- '-DINSECURE' CONFIG.mine 2>/dev/null || echo 'MY_CFLAGS += -DINSECURE' >> CONFIG.mine
+
+# Force a from-scratch recompile so -DINSECURE takes effect even on a re-run over
+# an existing build. This mirrors 'make clean' but deliberately skips clean-deps
+# so the crypto dependencies built by 'make setup' (libOTe, SimpleOT) survive.
+echo "[mpspdz] Removing stale compiled objects so -DINSECURE takes effect..."
+rm -f */*.o *.o */*.d *.d *.x core.* *.a gmon.out */*/*.o static/*.x *.so
+
 echo "[mpspdz] Running 'make setup' (builds the bundled crypto dependencies)..."
 make setup
 
@@ -175,8 +187,8 @@ cp -f "${FILES_DIR}/Data_Files.h"                        "${INSTALL_DIR}/Process
 cp -f "${FILES_DIR}/MatrixFile.h"                        "${INSTALL_DIR}/Protocols/MatrixFile.h"
 cp -f "${FILES_DIR}/torch_cifar_alex_infer_single.mpc"  "${INSTALL_DIR}/Programs/Source/torch_cifar_alex_infer_single.mpc"
 
-echo "[mpspdz] Building the SPDZ2k virtual machine ('make -j spdz2k-party.x')..."
-make -j spdz2k-party.x
+echo "[mpspdz] Building the SPDZ2k virtual machine and fake-offline generator ('make -j spdz2k-party.x Fake-Offline.x')..."
+make -j spdz2k-party.x Fake-Offline.x
 
 echo "[mpspdz] Creating the .env virtualenv and installing the compiler's ML dependencies..."
 if [[ ! -d "${INSTALL_DIR}/.env" ]]; then
