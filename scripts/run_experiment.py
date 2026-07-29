@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import subprocess
 import shlex
@@ -13,6 +14,8 @@ from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple
 from pathlib import Path
 
+# Grace period between SIGTERM and SIGKILL when killing a timed-out run.
+TERMINATION_GRACE_SEC = 5
 SLEEP_BETWEEN_REPS_SEC = 30
 STOPWATCH_FILENAME = ".experiment.json"
 AGG_OUTPUT_FILENAME = "output.json"
@@ -110,6 +113,7 @@ class ExperimentConfig:
     division_correction: bool
     sort_proto: str
     build_only: bool
+    run_timeout_sec: int
     cmake_args: List[str]
     exp_args: List[str]
     node_prefix: str
@@ -280,6 +284,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default sorting protocol; default: quicksort",
     )
     parser.add_argument(
+        "--timeout",
+        dest="run_timeout_sec",
+        type=int,
+        default=0,
+        help="Kill an experiment run if it exceeds this many seconds; 0 disables the timeout (default: 0)",
+    )
+    parser.add_argument(
         "--build-only",
         dest="build_only",
         action="store_true",
@@ -340,6 +351,10 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
     # Validate repetitions
     if args.exp_repetitions < 1:
         raise SystemExit("Invalid repetitions; must be >= 1")
+
+    # Validate timeout (0 disables it)
+    if args.run_timeout_sec < 0:
+        raise SystemExit("Invalid timeout; must be >= 0")
 
     # Default logic: use protocol number, except for SPDZ2k (protocol 5) which defaults to 2
     num_parties = args.num_parties if args.exp_protocol == 5 else args.exp_protocol
@@ -434,6 +449,7 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
         division_correction=division_correction,
         sort_proto=sort_proto,
         build_only=args.build_only,
+        run_timeout_sec=args.run_timeout_sec,
         cmake_args=args.cmake_args or [],
         exp_args=args.exp_args or [],
         node_prefix=args.node_prefix,
@@ -540,6 +556,62 @@ def perform_experiment_setup(cfg: ExperimentConfig) -> None:
     cfg.exp_cmd_prefix = exp_cmd_prefix
 
 
+def _terminate_process_group(proc: "subprocess.Popen") -> None:
+    """
+    Terminate the process group led by ``proc``: send SIGTERM, wait a grace
+    period, then send SIGKILL if the group is still alive.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=TERMINATION_GRACE_SEC)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=TERMINATION_GRACE_SEC)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_with_timeout(cmd: List[str], cwd: str, timeout_sec: int) -> Tuple[int, bool]:
+    """
+    Run ``cmd`` in ``cwd`` and return ``(returncode, timed_out)``.
+
+    When ``timeout_sec`` is greater than zero and the run exceeds it, the whole
+    process group (parent plus any children, e.g. spawned by ``mpirun``/
+    ``startmpc``) is terminated and ``timed_out`` is ``True``. A non-positive
+    ``timeout_sec`` disables the timeout.
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, start_new_session=True)
+    try:
+        if timeout_sec and timeout_sec > 0:
+            try:
+                proc.wait(timeout=timeout_sec)
+                return proc.returncode, False
+            except subprocess.TimeoutExpired:
+                _terminate_process_group(proc)
+                return proc.returncode, True
+        proc.wait()
+        return proc.returncode, False
+    except KeyboardInterrupt:
+        # The child runs in its own session (start_new_session=True), so the
+        # terminal's Ctrl+C (SIGINT) does not reach it. Terminate the whole
+        # process group explicitly, then re-raise to stop the sweep.
+        _terminate_process_group(proc)
+        raise
+
+
 def run_experiments(cfg: ExperimentConfig) -> None:
     """
     Execute the experiment runs across input sizes and thread configurations.
@@ -578,11 +650,19 @@ def run_experiments(cfg: ExperimentConfig) -> None:
             print(f"Running command: {' '.join(full_cmd)}", flush=True)
             for rep in range(cfg.exp_repetitions):
                 _clear_stopwatch_file(cfg.build_dir)
-                res = subprocess.run(full_cmd, cwd=cfg.build_dir)
-                if res.returncode != 0:
-                    print("Returned non-zero exit code", res.returncode)
-
-                stopwatch_obj = _read_stopwatch_file(cfg.build_dir)
+                returncode, timed_out = _run_with_timeout(
+                    full_cmd, cfg.build_dir, cfg.run_timeout_sec
+                )
+                if timed_out:
+                    print(
+                        f"Killed run after exceeding timeout of {cfg.run_timeout_sec}s",
+                        flush=True,
+                    )
+                    stopwatch_obj = {"timed_out": True}
+                else:
+                    if returncode != 0:
+                        print("Returned non-zero exit code", returncode)
+                    stopwatch_obj = _read_stopwatch_file(cfg.build_dir)
                 run_cfg = _select_run_config(
                     cfg=cfg,
                     exp_input=exp_input,
@@ -711,6 +791,10 @@ def _aggregate_profiles(stopwatches: List[dict]) -> dict:
     # Collect per-label values
     label_to_values: dict = {}
     for sw in valid:
+        # Skip markers for runs that were killed due to a timeout; they carry
+        # no profile metrics and must not pollute the aggregates.
+        if sw.get("timed_out"):
+            continue
         profile = sw.get("profile")
         # Prefer nested 'profile' dict when present; otherwise treat the stopwatch
         # itself as a flat mapping from label -> numeric value.
@@ -828,7 +912,7 @@ def _manage_wan_simulation(cfg: ExperimentConfig, state: str) -> None:
     
     # Determine script path relative to run_experiment.py location
     script_dir = Path(__file__).parent
-    cluster_wan_sim_script = script_dir / "comm" / "cluster-wan-sim.sh"
+    cluster_wan_sim_script = script_dir / "profiling" / "comm" / "cluster-wan-sim.sh"
     
     if not cluster_wan_sim_script.exists():
         print(f"Warning: WAN simulation script not found at {cluster_wan_sim_script}", file=sys.stderr)
