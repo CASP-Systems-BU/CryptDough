@@ -1,454 +1,372 @@
 #!/usr/bin/env bash
 #
-# install_piranha.sh
+# setup_piranha.sh — Install Piranha (ucbrise/piranha) on a 2-node GPU cluster.
 #
-# Provisions two AWS g6.8xlarge instances (each with one NVIDIA L4 GPU),
-# installs Piranha (https://github.com/ucbrise/piranha) on both, and runs a
-# distributed 2-party (SecureML / TWOPC) test across the two instances.
+# Unlike orchestrate_piranha.sh (which additionally provisions a fresh 2-node
+# AWS GPU cluster), this script assumes the two nodes ALREADY exist, each has a
+# CUDA-capable NVIDIA GPU (the driver is installed automatically if missing, so
+# the script works on any cluster), and node0 has SSH access to node1. Run it
+# from node0. For each node, over SSH, it:
+#   1. Ensures the NVIDIA driver is active: if nvidia-smi does not work yet, it
+#      installs the recommended driver via `ubuntu-drivers autoinstall` and tries
+#      to load it without a reboot. If the driver cannot be activated without a
+#      reboot, the script stops and asks you to reboot the node(s) and re-run.
+#      It then installs the apt build dependencies (git, build-essential, cmake,
+#      libgtest-dev, libssl-dev, python3, gcc-10).
+#   2. Clones the Piranha repository at the pinned commit into the SAME absolute
+#      path on every node (sosp-replication/baselines/piranha) and initializes
+#      its submodules recursively.
+#   3. Builds gtest (Piranha's tests link against libgtest), creates Piranha's
+#      required output/ and files/ directories, and downloads the MNIST dataset
+#      used by the SecureML smoke test into a local Python virtualenv.
+#   4. Installs the CUDA 11.8 toolkit + gcc-10 side-by-side and builds the
+#      2-party (TWOPC) Piranha binary with them. Piranha is CUDA-11-era code: its
+#      Makefile pins CUDA 11.5 and its Thrust usage does not compile against the
+#      CCCL Thrust shipped in CUDA 12.4+/13, so CUDA 11.8 (the oldest CUDA that
+#      still supports modern GPUs such as the L4's sm_89) is installed alongside
+#      whatever CUDA the driver ships. gcc-10 is the nvcc host compiler because
+#      CUDA 11.8's nvcc miscompiles GCC 11's libstdc++ <ratio>.
 #
-#   ./install_piranha.sh [PREFIX] [AWS_REGION]
+# Once both nodes have built, it runs a minimal distributed 2-party SecureML
+# test across the cluster from node0 (mirroring orchestrate_piranha.sh's smoke
+# test): party 0 listens on node0, party 1 connects from node1.
 #
-# Example:
-#   ./install_piranha.sh piranha us-east-1
+# The install path is derived from this script's own location and is identical
+# on every node, matching the convention of the other baseline setup scripts
+# (setup_mpspdz.sh, setup_tva.sh, setup_pigeon.sh): the CryptDough repo is
+# deployed to the same absolute path on every node.
 #
-# The script will:
-#   - Create a VPC (10.0.0.0/16), subnet, internet gateway, routing, and a
-#     security group (SSH + full intra-VPC traffic for the MPC parties)
-#   - Launch two g6.8xlarge instances from an AWS Deep Learning Base GPU AMI
-#     (NVIDIA driver + CUDA toolkit pre-installed)
-#   - Install Piranha's dependencies, build CUTLASS and Piranha on both nodes
-#   - Download the MNIST dataset on both nodes
-#   - Run a distributed 2-party SecureML test across the two instances
-#   - Write per-node logs to ~/install_piranha.log on each instance
+# Usage:
+#   ./setup_piranha.sh <node0> <node1>
 #
-# Tear down afterwards with:  ./teardown_piranha.sh [PREFIX] [AWS_REGION]
-#
-# ============================================================================
+# Exactly 2 nodes must be given (Piranha runs the 2PC/TWOPC protocol here). Each
+# <nodeN> is an IP address, "user@IP", or an SSH alias (e.g. from ~/.ssh/config)
+# reachable via `ssh <nodeN>`. node0 (the first argument) is the main node and
+# must be able to SSH into node1 so the smoke test can run across the cluster.
 set -euo pipefail
 
-PREFIX="${1:-piranha}"
-AWS_REGION="${2:-us-east-1}"
-AWS_INSTANCE_TYPE="g6.8xlarge"
-ROOT_VOLUME_GB=200
-SSH_USER="ubuntu"
-VPC_CIDR="10.0.0.0/16"
-SUBNET_CIDR="10.0.1.0/24"
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <node0> <node1>" >&2
+    echo "  Provide exactly 2 nodes; Piranha runs the 2-party (TWOPC) protocol." >&2
+    echo "  node0 (first argument) is the main node and must have SSH access to node1." >&2
+    exit 1
+fi
 
-PIRANHA_REPO="https://github.com/ucbrise/piranha.git"
+NODES=("$1" "$2")
+
+REPO_URL="https://github.com/ucbrise/piranha.git"
+REPO_COMMIT="dfbcb59d4e24ab69eb3606b49a102e602fdbee87"
+
+# Piranha build tuning, matching orchestrate_piranha.sh: 26-bit fixed-point
+# precision, the 2-party protocol, and the CUDA 11.8 toolchain used to build it.
 PIRANHA_FLOAT_PRECISION=26
 PIRANHA_PROTOCOL_FLAG="-DTWOPC"
+CUDA_VERSION="11.8"
+CUDA_HOME="/usr/local/cuda-${CUDA_VERSION}"
 
-# State file to record resource IDs for cleanup.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-STATE_FILE="${SCRIPT_DIR}/${PREFIX}-state.env"
+# Resolve the install location from this script's own location so it never
+# depends on the caller's working directory. The script lives in
+# sosp-replication/setup/, so the baselines dir is one level up. Piranha is
+# installed into baselines/piranha, and this absolute path is used on every node.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASELINES_DIR="$(cd "${SCRIPT_DIR}/../baselines" && pwd)"
+INSTALL_DIR="${BASELINES_DIR}/piranha"
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
-}
-
-err() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2
-}
-
-save_state() {
-    local key="$1" value="$2"
-    echo "${key}=${value}" >> "$STATE_FILE"
-}
-
-log "=== Checking prerequisites ==="
-
-for tool in aws jq ssh scp; do
-    if ! command -v "$tool" &>/dev/null; then
-        err "'${tool}' is not installed. Please install it before running this script."
+# IPs the parties advertise to each other over the wire. A host may be given as
+# "user@host", and the host part may be an SSH alias rather than a bare IP.
+# Piranha's config lists party_ips as dotted-decimal addresses, so strip any
+# "user@" prefix and resolve every host to its dotted-decimal IPv4 address.
+resolve_ip() {
+    local host="${1#*@}" # strip any "user@" prefix
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s' "$host" # already a dotted-decimal IPv4 address
+        return 0
+    fi
+    local ip
+    ip="$(python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$host" 2>/dev/null)" || true
+    if [[ -z "$ip" ]]; then
+        echo "!! Could not resolve host '$host' to an IPv4 address." >&2
         exit 1
     fi
-done
-log "  CLI tools (aws, jq, ssh, scp) are available"
-
-log "Checking AWS authentication..."
-if ! aws sts get-caller-identity --region "$AWS_REGION" &>/dev/null; then
-    err "AWS credentials not found or invalid."
-    err "  Option 1: Run 'aws configure' with valid IAM credentials"
-    err "  Option 2: Run 'aws sso login' if using AWS SSO"
-    err "  Option 3: Export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
-    exit 1
-fi
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
-export AWS_DEFAULT_REGION="$AWS_REGION"
-log "  AWS authenticated - Account: ${AWS_ACCOUNT_ID}, Region: ${AWS_REGION}"
-
-# Initialize the state file
-echo "# Resource state file for ${PREFIX}" > "$STATE_FILE"
-echo "# Generated at $(date)" >> "$STATE_FILE"
-echo "PREFIX=${PREFIX}" >> "$STATE_FILE"
-echo "AWS_REGION=${AWS_REGION}" >> "$STATE_FILE"
-log "  State file: ${STATE_FILE}"
-
-echo ""
-log "Configuration:"
-log "  Prefix:        ${PREFIX}"
-log "  Region:        ${AWS_REGION}"
-log "  Instance type: ${AWS_INSTANCE_TYPE} (1x NVIDIA L4 GPU each, 2 instances)"
-log "  Piranha build: PIRANHA_FLAGS=\"-DFLOAT_PRECISION=${PIRANHA_FLOAT_PRECISION} ${PIRANHA_PROTOCOL_FLAG}\""
-echo ""
-
-log "=========================================="
-log "Phase 1: Creating AWS network infrastructure"
-log "=========================================="
-
-log "Creating VPC (${VPC_CIDR})..."
-VPC_ID=$(aws ec2 create-vpc \
-    --cidr-block "$VPC_CIDR" \
-    --query 'Vpc.VpcId' --output text)
-aws ec2 create-tags --resources "$VPC_ID" \
-    --tags Key=Name,Value="${PREFIX}-vpc"
-aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-hostnames '{"Value": true}'
-save_state "VPC_ID" "$VPC_ID"
-log "  Created VPC: ${VPC_ID}"
-
-log "Creating Internet Gateway..."
-IGW_ID=$(aws ec2 create-internet-gateway \
-    --query 'InternetGateway.InternetGatewayId' --output text)
-aws ec2 attach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID"
-aws ec2 create-tags --resources "$IGW_ID" \
-    --tags Key=Name,Value="${PREFIX}-igw"
-save_state "IGW_ID" "$IGW_ID"
-log "  Created and attached Internet Gateway: ${IGW_ID}"
-
-log "Creating route table..."
-RTB_ID=$(aws ec2 create-route-table \
-    --vpc-id "$VPC_ID" \
-    --query 'RouteTable.RouteTableId' --output text)
-aws ec2 create-route \
-    --route-table-id "$RTB_ID" \
-    --destination-cidr-block "0.0.0.0/0" \
-    --gateway-id "$IGW_ID" > /dev/null
-aws ec2 create-tags --resources "$RTB_ID" \
-    --tags Key=Name,Value="${PREFIX}-rtb"
-save_state "RTB_ID" "$RTB_ID"
-log "  Created route table: ${RTB_ID} (0.0.0.0/0 -> IGW)"
-
-log "Creating security group..."
-SG_ID=$(aws ec2 create-security-group \
-    --group-name "${PREFIX}-sg" \
-    --description "Security group for Piranha GPU MPC experiments" \
-    --vpc-id "$VPC_ID" \
-    --query 'GroupId' --output text)
-# SSH from anywhere (management)
-aws ec2 authorize-security-group-ingress \
-    --group-id "$SG_ID" --protocol tcp --port 22 --cidr "0.0.0.0/0" > /dev/null
-# ICMP from anywhere (connectivity checks)
-aws ec2 authorize-security-group-ingress \
-    --group-id "$SG_ID" --protocol icmp --port -1 --cidr "0.0.0.0/0" > /dev/null
-# All traffic within the VPC so the MPC parties can talk on any port
-aws ec2 authorize-security-group-ingress \
-    --group-id "$SG_ID" --protocol -1 --cidr "$VPC_CIDR" > /dev/null
-aws ec2 create-tags --resources "$SG_ID" \
-    --tags Key=Name,Value="${PREFIX}-sg"
-save_state "SG_ID" "$SG_ID"
-log "  Created security group: ${SG_ID}"
-
-log "Creating SSH key pair..."
-KEY_NAME="${PREFIX}-key"
-KEY_FILE="${SCRIPT_DIR}/${KEY_NAME}.pem"
-aws ec2 create-key-pair \
-    --key-name "$KEY_NAME" \
-    --query 'KeyMaterial' --output text > "$KEY_FILE"
-chmod 400 "$KEY_FILE"
-save_state "KEY_NAME" "$KEY_NAME"
-save_state "KEY_FILE" "$KEY_FILE"
-log "  Created key pair: ${KEY_NAME} (saved to ${KEY_FILE})"
-
-echo ""
-
-log "=========================================="
-log "Phase 2: Launching g6.8xlarge instances"
-log "=========================================="
-
-# Look up the latest AWS Deep Learning Base GPU AMI (NVIDIA driver + CUDA
-# toolkit pre-installed). Piranha's README recommends a Deep Learning Base AMI.
-log "Looking up latest Deep Learning Base GPU AMI (Ubuntu 22.04)..."
-AMI_ID=$(aws ec2 describe-images \
-    --owners amazon \
-    --filters "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*" \
-              "Name=state,Values=available" \
-    --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-    --output text)
-if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "None" ]; then
-    err "Could not find a Deep Learning Base GPU AMI in ${AWS_REGION}."
-    err "Set AMI_ID manually or try another region (e.g. us-east-1, us-west-2)."
-    exit 1
-fi
-save_state "AMI_ID" "$AMI_ID"
-log "  Using AMI: ${AMI_ID}"
-
-# Launch both parties. Tag node0 (party 0) and node1 (party 1).
-launch_instance() {
-    local name="$1"
-    aws ec2 run-instances \
-        --image-id "$AMI_ID" \
-        --instance-type "$AWS_INSTANCE_TYPE" \
-        --key-name "$KEY_NAME" \
-        --subnet-id "$SUBNET_ID" \
-        --security-group-ids "$SG_ID" \
-        --associate-public-ip-address \
-        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${ROOT_VOLUME_GB},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${PREFIX}-${name}}]" \
-        --query 'Instances[0].InstanceId' --output text
+    printf '%s' "$ip"
 }
 
-AZS=($(aws ec2 describe-availability-zones --region "$AWS_REGION" \
-    --query 'AvailabilityZones[].ZoneName' --output text))
-[ ${#AZS[@]} -gt 0 ] || AZS=("${AWS_REGION}a" "${AWS_REGION}b" "${AWS_REGION}c")
-log "Candidate AZs: ${AZS[*]}"
-
-launched=false
-for AZ in "${AZS[@]}"; do
-    log "Trying availability zone ${AZ}..."
-    SUBNET_ID=$(aws ec2 create-subnet \
-        --vpc-id "$VPC_ID" --cidr-block "$SUBNET_CIDR" \
-        --availability-zone "$AZ" \
-        --query 'Subnet.SubnetId' --output text 2>/dev/null) \
-        || { log "  Could not create subnet in ${AZ}; skipping."; continue; }
-    aws ec2 create-tags --resources "$SUBNET_ID" \
-        --tags Key=Name,Value="${PREFIX}-subnet" >/dev/null 2>&1 || true
-    aws ec2 associate-route-table --route-table-id "$RTB_ID" --subnet-id "$SUBNET_ID" > /dev/null
-
-    set +e
-    NODE0_ID=$(launch_instance "node0"); r0=$?
-    NODE1_ID=$(launch_instance "node1"); r1=$?
-    set -e
-
-    if [ "$r0" -eq 0 ] && [ "$r1" -eq 0 ] \
-       && [ -n "$NODE0_ID" ] && [ "$NODE0_ID" != None ] \
-       && [ -n "$NODE1_ID" ] && [ "$NODE1_ID" != None ]; then
-        save_state "SUBNET_ID" "$SUBNET_ID"
-        save_state "NODE0_ID" "$NODE0_ID"
-        save_state "NODE1_ID" "$NODE1_ID"
-        log "  Launched node0: ${NODE0_ID}"
-        log "  Launched node1: ${NODE1_ID}"
-        log "  Using AZ ${AZ}, subnet ${SUBNET_ID}"
-        launched=true
-        break
+# Remote login user for a node (the part before "@"), or empty if not given.
+node_user() {
+    local host="$1"
+    if [[ "$host" == *@* ]]; then
+        printf '%s' "${host%%@*}"
     fi
-
-    log "  ${AZ} lacks g6.8xlarge capacity; cleaning up and trying the next AZ..."
-    for _id in "$NODE0_ID" "$NODE1_ID"; do
-        case "$_id" in i-*) aws ec2 terminate-instances --instance-ids "$_id" >/dev/null 2>&1 || true ;; esac
-    done
-    for _id in "$NODE0_ID" "$NODE1_ID"; do
-        case "$_id" in i-*) aws ec2 wait instance-terminated --instance-ids "$_id" 2>/dev/null || true ;; esac
-    done
-    aws ec2 delete-subnet --subnet-id "$SUBNET_ID" >/dev/null 2>&1 || true
-    NODE0_ID=""; NODE1_ID=""
-done
-
-if [ "$launched" != true ]; then
-    err "Could not launch two ${AWS_INSTANCE_TYPE} instances in any AZ of ${AWS_REGION} (insufficient capacity)."
-    err "Try again later or in a different region."
-    exit 1
-fi
-
-log "Waiting for instances to reach 'running'..."
-aws ec2 wait instance-running --instance-ids "$NODE0_ID" "$NODE1_ID"
-log "  Instances are running"
-
-log "Waiting for instance status checks to pass (this can take a few minutes)..."
-aws ec2 wait instance-status-ok --instance-ids "$NODE0_ID" "$NODE1_ID"
-log "  Status checks passed"
-
-# Gather IPs
-get_ip() {
-    local id="$1" field="$2"
-    aws ec2 describe-instances --instance-ids "$id" \
-        --query "Reservations[0].Instances[0].${field}" --output text
+    return 0
 }
-NODE0_PUBLIC_IP=$(get_ip "$NODE0_ID" PublicIpAddress)
-NODE0_PRIVATE_IP=$(get_ip "$NODE0_ID" PrivateIpAddress)
-NODE1_PUBLIC_IP=$(get_ip "$NODE1_ID" PublicIpAddress)
-NODE1_PRIVATE_IP=$(get_ip "$NODE1_ID" PrivateIpAddress)
-save_state "NODE0_PUBLIC_IP" "$NODE0_PUBLIC_IP"
-save_state "NODE0_PRIVATE_IP" "$NODE0_PRIVATE_IP"
-save_state "NODE1_PUBLIC_IP" "$NODE1_PUBLIC_IP"
-save_state "NODE1_PRIVATE_IP" "$NODE1_PRIVATE_IP"
-log "  node0 (party 0) - Public: ${NODE0_PUBLIC_IP}, Private: ${NODE0_PRIVATE_IP}"
-log "  node1 (party 1) - Public: ${NODE1_PUBLIC_IP}, Private: ${NODE1_PRIVATE_IP}"
 
-echo ""
+IP0="$(resolve_ip "${NODES[0]}")"
+IP1="$(resolve_ip "${NODES[1]}")"
+USER0="$(node_user "${NODES[0]}")"
+USER1="$(node_user "${NODES[1]}")"
+echo "==> Wire IPs: party0=${IP0} (node ${NODES[0]}), party1=${IP1} (node ${NODES[1]})"
 
-log "=========================================="
-log "Phase 3: Waiting for SSH on both instances"
-log "=========================================="
+# Piranha's driver Makefile lists these apt dependencies (README): libgtest-dev,
+# libssl-dev. We also need the standard build toolchain plus gcc-10/g++-10 as the
+# CUDA 11.8 nvcc host compiler, python3(+venv) for the MNIST download, and wget
+# to fetch the CUDA 11.8 runfile. The NVIDIA GPU driver is installed separately
+# (via ubuntu-drivers) at the start of Phase 0 if it is not already active.
+DEPS=(
+    git
+    build-essential
+    cmake
+    libgtest-dev
+    libssl-dev
+    python3
+    python3-venv
+    python3-pip
+    gcc-10
+    g++-10
+    wget
+)
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -i "$KEY_FILE")
+LOG_FILE="~/install_piranha.log"
+echo "==> Installing Piranha into ${INSTALL_DIR} on both nodes and building the 2PC binary."
+echo "==> Each node writes its output to ${LOG_FILE} on its own host."
 
-# node0() / node1() run a command on the respective instance.
-node0() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE0_PUBLIC_IP}" "$@"; }
-node1() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODE1_PUBLIC_IP}" "$@"; }
-
-wait_for_ssh() {
-    local label="$1" ip="$2"
-    log "  Waiting for SSH on ${label} (${ip})..."
-    for _ in $(seq 1 40); do
-        if ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "true" 2>/dev/null; then
-            log "  SSH ready on ${label}"
-            return 0
-        fi
-        sleep 10
-    done
-    err "SSH never became ready on ${label} (${ip})"
-    exit 1
-}
-wait_for_ssh "node0" "$NODE0_PUBLIC_IP"
-wait_for_ssh "node1" "$NODE1_PUBLIC_IP"
-
-echo ""
-
-log "=========================================="
-log "Phase 4: Installing & building Piranha on both nodes"
-log "=========================================="
-
-INSTALLER_LOCAL="$(mktemp "${TMPDIR:-/tmp}/piranha_installer.XXXXXX")"
-cat > "$INSTALLER_LOCAL" <<INSTEOF
-#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Phase 0: install build dependencies on both nodes (interactive sudo).
+# ---------------------------------------------------------------------------
+# Dependency installation needs sudo, which requires a password on most nodes.
+# When ssh runs a command non-interactively (no TTY) sudo cannot prompt, so this
+# phase runs on its own with a forced pseudo-terminal (ssh -tt) and is executed
+# sequentially per node so each password prompt reaches your terminal cleanly.
+# All sudo-requiring work runs here so the parallel build phase below needs no
+# TTY: the NVIDIA driver install, apt dependencies, the gtest library
+# build/install, and the side-by-side CUDA 11.8 toolkit install.
+#
+# Exit status contract (consumed by the Phase 0 loop below):
+#   0  = GPU driver active and all dependencies installed; ready to build.
+#   90 = dependencies installed and driver installed, but the driver could not
+#        be activated without a reboot; the node must be rebooted and the script
+#        re-run.
+#   other non-zero = hard failure (no GPU, apt error, etc.).
+remote_deps_script() {
+    cat <<REMOTE
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-export PATH=/usr/local/cuda/bin:\$PATH
 
-echo "===== Piranha install started at \$(date) ====="
+echo "[piranha] Updating apt and checking for an NVIDIA GPU..."
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends pciutils
+if ! lspci | grep -iq 'NVIDIA'; then
+    echo "!! No NVIDIA GPU found on this node (lspci). Piranha requires a CUDA-capable GPU." >&2
+    exit 1
+fi
 
-# --- Detect GPU compute capability (e.g. L4 -> 8.9 -> arch 89) ---
-GPU_ARCH=\$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' .')
-echo "Detected GPU: \$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1) (arch sm_\${GPU_ARCH})"
-NVCC_PATH=\$(command -v nvcc)
-echo "Using nvcc: \${NVCC_PATH} (\$(\${NVCC_PATH} --version | grep release || true))"
+# Ensure the NVIDIA driver is active. If nvidia-smi already works, keep it;
+# otherwise install the recommended driver generically with ubuntu-drivers and
+# try to load it without a reboot.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    driver_ready=1
+    echo "[piranha] NVIDIA driver already active: \$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+else
+    echo "[piranha] NVIDIA driver not active; installing via 'ubuntu-drivers autoinstall'..."
+    sudo apt-get install -y --no-install-recommends ubuntu-drivers-common
+    sudo ubuntu-drivers autoinstall
+    # Try to load the freshly installed driver so we can avoid a reboot.
+    sudo modprobe nvidia 2>/dev/null || true
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+        driver_ready=1
+        echo "[piranha] NVIDIA driver active after install: \$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+    else
+        driver_ready=0
+        echo "[piranha] NVIDIA driver installed but not yet loaded; a reboot is required."
+    fi
+fi
 
-# --- System dependencies (README: libgtest-dev, libssl-dev) ---
-echo "----- Installing apt dependencies -----"
-sudo apt-get update -yq
-sudo apt-get install -yq git build-essential cmake libgtest-dev libssl-dev python3-pip
+echo "[piranha] Installing Piranha build dependencies..."
+sudo apt-get install -y --no-install-recommends ${DEPS[*]}
 
-# --- Clone Piranha ---
-echo "----- Cloning Piranha -----"
-cd ~
-rm -rf ~/piranha
-git clone ${PIRANHA_REPO} ~/piranha
-cd ~/piranha
-git submodule update --init --recursive
-
-# --- Build CUTLASS for the detected architecture ---
-echo "----- Building CUTLASS (arch sm_\${GPU_ARCH}) — this can take a while -----"
-cd ~/piranha/ext/cutlass
-mkdir -p build && cd build
-cmake .. -DCUTLASS_NVCC_ARCHS=\${GPU_ARCH} \
-    -DCUTLASS_ENABLE_PROFILER=OFF \
-    -DCUTLASS_ENABLE_TESTS=OFF \
-    -DCMAKE_CUDA_COMPILER_WORKS=1 \
-    -DCMAKE_CUDA_COMPILER=\${NVCC_PATH}
-make -j\$(nproc)
-
-echo "----- Building gtest -----"
+# Build gtest: Piranha's tests link libgtest, but on Ubuntu libgtest-dev ships
+# only the sources, so they must be compiled and installed to /usr/lib.
+echo "[piranha] Building and installing gtest..."
 if [ -d /usr/src/googletest ]; then GTEST_SRC=/usr/src/googletest; else GTEST_SRC=/usr/src/gtest; fi
 sudo cmake -S "\$GTEST_SRC" -B "\$GTEST_SRC/build"
 sudo cmake --build "\$GTEST_SRC/build" -j\$(nproc)
-sudo find "\$GTEST_SRC/build" -name 'libgtest*.a' -exec cp -v {} /usr/lib/ \;
+sudo find "\$GTEST_SRC/build" -name 'libgtest*.a' -exec cp -v {} /usr/lib/ \\;
 
-# --- Required directories ---
-echo "----- Creating output/data directories -----"
-cd ~/piranha
-mkdir -p output files/MNIST files/CIFAR10
-
-# --- Download MNIST (needed by the SecureML test) ---
-echo "----- Downloading MNIST dataset -----"
-python3 -m pip install --quiet --user torch torchvision
-cd ~/piranha/scripts
-python3 download_mnist.py
-
-# --- Install Piranha's required CUDA toolchain (CUDA 11.8 + gcc-10) ---
-# Piranha is CUDA-11-era code: its Makefile pins CUDA 11.5 and its Thrust usage
-# does not compile against the CCCL Thrust shipped in CUDA 12.4+/13. The Deep
-# Learning AMI now ships only CUDA 12.8-13.2, so install CUDA 11.8 (the oldest
-# CUDA that still supports the L4's sm_89) side-by-side. gcc-10 is also needed:
-# CUDA 11.8's nvcc miscompiles GCC 11's libstdc++ <ratio>, so it is used as the
-# nvcc host compiler. (Piranha links CUTLASS headers only — no libcutlass.a — so
-# the CUTLASS build above is not actually required by Piranha itself.)
-echo "----- Installing CUDA 11.8 toolkit + gcc-10 -----"
-if [ ! -x /usr/local/cuda-11.8/bin/nvcc ]; then
-    wget -q -O /tmp/cuda_11.8.run \
-        https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_520.61.05_linux.run
-    sudo sh /tmp/cuda_11.8.run --silent --toolkit --toolkitpath=/usr/local/cuda-11.8 --override
+# Install Piranha's required CUDA toolchain side-by-side. Piranha is CUDA-11-era
+# code: its Makefile pins CUDA 11.5 and its Thrust usage does not compile against
+# the CCCL Thrust in CUDA 12.4+/13, so CUDA ${CUDA_VERSION} (the oldest CUDA that still
+# supports modern GPUs such as the L4's sm_89) is installed alongside whatever
+# CUDA the driver ships. gcc-10 (installed above) is the nvcc host compiler.
+echo "[piranha] Installing CUDA ${CUDA_VERSION} toolkit..."
+if [ ! -x ${CUDA_HOME}/bin/nvcc ]; then
+    wget -q -O /tmp/cuda_${CUDA_VERSION}.run \\
+        https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}.0/local_installers/cuda_${CUDA_VERSION}.0_520.61.05_linux.run
+    sudo sh /tmp/cuda_${CUDA_VERSION}.run --silent --toolkit --toolkitpath=${CUDA_HOME} --override
 fi
-sudo apt-get install -yq gcc-10 g++-10
 
-# --- Build Piranha (2-party protocol) with the CUDA 11.8 + gcc-10 toolchain ---
-echo "----- Building Piranha -----"
-cd ~/piranha
-export PATH=/usr/local/cuda-11.8/bin:\$PATH
-export NVCC_PREPEND_FLAGS='-ccbin /usr/bin/g++-10'
-make -j\$(nproc) CUDA_VERSION=11.8 PIRANHA_FLAGS="-DFLOAT_PRECISION=${PIRANHA_FLOAT_PRECISION} ${PIRANHA_PROTOCOL_FLAG}"
-
-test -x ~/piranha/piranha
-echo "===== PIRANHA_INSTALL_DONE at \$(date) ====="
-INSTEOF
-
-# Push the installer to both nodes and start it in the background, logging to
-# ~/install_piranha.log. We poll the log for the completion sentinel so a long
-# build doesn't depend on a single held-open SSH connection.
-log "Copying installer to both nodes..."
-scp "${SSH_OPTS[@]}" "$INSTALLER_LOCAL" "${SSH_USER}@${NODE0_PUBLIC_IP}:/tmp/piranha_installer.sh"
-scp "${SSH_OPTS[@]}" "$INSTALLER_LOCAL" "${SSH_USER}@${NODE1_PUBLIC_IP}:/tmp/piranha_installer.sh"
-
-log "Starting build on node0 and node1 (logging to ~/install_piranha.log)..."
-node0 "chmod +x /tmp/piranha_installer.sh; nohup bash /tmp/piranha_installer.sh > ~/install_piranha.log 2>&1 & echo started"
-node1 "chmod +x /tmp/piranha_installer.sh; nohup bash /tmp/piranha_installer.sh > ~/install_piranha.log 2>&1 & echo started"
-
-# Poll each node's log until the success or failure sentinel appears.
-wait_for_install() {
-    local label="$1"
-    local runner="$2"
-    local timeout_secs=1800   # 30 min
-    local elapsed=0 interval=30
-    log "  Waiting for build to finish on ${label} (timeout: ${timeout_secs}s)..."
-    while true; do
-        if $runner "grep -q PIRANHA_INSTALL_DONE ~/install_piranha.log" 2>/dev/null; then
-            log "  ${label}: build complete"
-            return 0
-        fi
-        if ! $runner "pgrep -f piranha_installer.sh >/dev/null" 2>/dev/null; then
-            if ! $runner "grep -q PIRANHA_INSTALL_DONE ~/install_piranha.log" 2>/dev/null; then
-                err "${label}: installer exited without success. Last log lines:"
-                $runner "tail -n 30 ~/install_piranha.log" 2>/dev/null || true
-                return 1
-            fi
-        fi
-        if [ "$elapsed" -ge "$timeout_secs" ]; then
-            err "${label}: timed out waiting for build. Last log lines:"
-            $runner "tail -n 30 ~/install_piranha.log" 2>/dev/null || true
-            return 1
-        fi
-        sleep "$interval"
-        elapsed=$((elapsed + interval))
-    done
+# If the driver was installed but is not yet loaded, signal that a reboot is
+# required so the caller can prompt for it (exit code 90).
+if [ "\$driver_ready" -ne 1 ]; then
+    echo "[piranha] Dependencies installed. REBOOT required to activate the NVIDIA driver." >&2
+    exit 90
+fi
+REMOTE
 }
 
-wait_for_install "node0" node0
-wait_for_install "node1" node1
+echo "==> Phase 0/2: installing GPU driver + build dependencies on both nodes (sudo; you may be prompted for a password per node)..."
+# The script is sent as a base64 argument (not via stdin) so the interactive
+# terminal stays connected to sudo. If it were piped through stdin, sudo could
+# neither read the password nor disable echo, so the password would be shown.
+#
+# Every node is processed even if some need a reboot, so a single reboot round
+# covers the whole cluster. A node exits 90 when its driver was installed but
+# needs a reboot to activate; any other non-zero exit is a hard failure.
+reboot_needed_nodes=()
+deps_failed=0
+for i in "${!NODES[@]}"; do
+    echo "    - node $i -> ${NODES[$i]}"
+    deps_b64="$(remote_deps_script | base64 | tr -d '\n')"
+    # -tt forces a pseudo-terminal so sudo can prompt for and read the password
+    # with echo disabled; bash reads the decoded script from the pipe, leaving
+    # the terminal free for the password.
+    set +e
+    ssh -tt "${NODES[$i]}" "echo ${deps_b64} | base64 -d | bash"
+    status=$?
+    set -e
+    case "$status" in
+        0)
+            echo "    node ${i} ready (driver active, dependencies installed)"
+            ;;
+        90)
+            echo "    node ${i}: driver installed, REBOOT required"
+            reboot_needed_nodes+=("${NODES[$i]}")
+            ;;
+        *)
+            echo "!! Dependency installation FAILED on node ${i} (${NODES[$i]}) (status ${status})." >&2
+            deps_failed=1
+            ;;
+    esac
+done
 
-echo ""
+if [[ "$deps_failed" -ne 0 ]]; then
+    echo "==> Dependency installation failed on at least one node; aborting." >&2
+    exit 1
+fi
 
-log "=========================================="
-log "Phase 5: Running distributed 2-party Piranha test"
-log "=========================================="
+if [[ "${#reboot_needed_nodes[@]}" -gt 0 ]]; then
+    echo
+    echo "======================================================================"
+    echo "ACTION REQUIRED: the NVIDIA driver was installed but is not yet active on:"
+    for n in "${reboot_needed_nodes[@]}"; do echo "    - $n"; done
+    echo
+    echo "Reboot the node(s) above, then re-run this script to continue. All other"
+    echo "dependencies are already installed, so the re-run proceeds to the build."
+    echo "  e.g.  ssh <node> 'sudo reboot'"
+    echo "======================================================================"
+    exit 2
+fi
+echo "==> Dependencies installed and the NVIDIA driver is active on both nodes."
 
-log "Generating distributed config from the localhost sample..."
-node0 "cd ~/piranha && python3 - '${NODE0_PRIVATE_IP}' '${NODE1_PRIVATE_IP}' <<'PYEOF'
-import json, sys
+# ---------------------------------------------------------------------------
+# Phase 1: clone + build Piranha on both nodes, in parallel.
+# ---------------------------------------------------------------------------
+# The parallel build phase needs no sudo: all privileged steps ran in Phase 0.
+remote_build_script() {
+    cat <<REMOTE
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+echo "===== Piranha build started at \$(date) ====="
+
+# --- Clone Piranha at the pinned commit into the shared install path ---
+echo "[piranha] Cloning ${REPO_URL} into ${INSTALL_DIR}..."
+mkdir -p "$(dirname "${INSTALL_DIR}")"
+if [[ ! -d "${INSTALL_DIR}/.git" ]]; then
+    git clone "${REPO_URL}" "${INSTALL_DIR}"
+fi
+cd "${INSTALL_DIR}"
+git fetch --all --tags
+git checkout ${REPO_COMMIT}
+git submodule update --init --recursive
+
+# --- Required directories ---
+echo "[piranha] Creating output/data directories..."
+mkdir -p "${INSTALL_DIR}/output" "${INSTALL_DIR}/files/MNIST" "${INSTALL_DIR}/files/CIFAR10"
+
+# --- Download MNIST (needed by the SecureML smoke test). Use a local venv with
+#     CPU-only torch/torchvision so the download works on PEP 668 nodes and
+#     avoids the large CUDA wheels; the dataset is only fetched in cleartext. ---
+echo "[piranha] Downloading MNIST dataset (via a local .env virtualenv)..."
+if [[ ! -d "${INSTALL_DIR}/.env" ]]; then
+    python3 -m venv "${INSTALL_DIR}/.env"
+fi
+"${INSTALL_DIR}/.env/bin/pip" install --quiet --upgrade pip
+"${INSTALL_DIR}/.env/bin/pip" install --quiet torch torchvision --index-url https://download.pytorch.org/whl/cpu
+cd "${INSTALL_DIR}/scripts"
+"${INSTALL_DIR}/.env/bin/python" download_mnist.py
+
+# --- Build Piranha (2-party protocol) with the CUDA ${CUDA_VERSION} + gcc-10 toolchain
+#     installed in Phase 0. Piranha uses CUTLASS headers only (no libcutlass.a),
+#     so no separate CUTLASS build is needed — the submodule checkout above
+#     provides the headers. ---
+echo "[piranha] Building Piranha (FLOAT_PRECISION=${PIRANHA_FLOAT_PRECISION}, ${PIRANHA_PROTOCOL_FLAG})..."
+cd "${INSTALL_DIR}"
+export PATH=${CUDA_HOME}/bin:\$PATH
+export NVCC_PREPEND_FLAGS='-ccbin /usr/bin/g++-10'
+make -j\$(nproc) CUDA_VERSION=${CUDA_VERSION} PIRANHA_FLAGS="-DFLOAT_PRECISION=${PIRANHA_FLOAT_PRECISION} ${PIRANHA_PROTOCOL_FLAG}"
+
+test -x "${INSTALL_DIR}/piranha"
+echo "===== PIRANHA_BUILD_DONE at \$(date) ====="
+REMOTE
+}
+
+echo "==> Phase 1/2: cloning + building Piranha on both nodes in parallel..."
+build_pids=()
+for i in "${!NODES[@]}"; do
+    echo "    - node $i -> ${NODES[$i]}"
+    ssh "${NODES[$i]}" "bash -s > ${LOG_FILE} 2>&1" \
+        <<<"$(remote_build_script)" &
+    build_pids+=("$!")
+done
+
+build_failed=0
+for i in "${!NODES[@]}"; do
+    if ! wait "${build_pids[$i]}"; then
+        echo "!! Build FAILED on node ${i} (${NODES[$i]}). Last log lines:" >&2
+        ssh "${NODES[$i]}" "tail -n 30 ${LOG_FILE}" 2>/dev/null || true
+        build_failed=1
+    else
+        echo "    node ${i} build OK"
+    fi
+done
+
+if [[ "$build_failed" -ne 0 ]]; then
+    echo "==> One or more builds failed; aborting before the smoke test." >&2
+    exit 1
+fi
+echo "==> Both nodes built successfully."
+
+# ---------------------------------------------------------------------------
+# Phase 2: run a minimal distributed 2-party SecureML test across the cluster.
+# ---------------------------------------------------------------------------
+# The piranha binary is linked against the side-by-side CUDA runtime, which is
+# not on the default loader path, so every invocation needs LD_LIBRARY_PATH.
+PIRANHA_RUN_ENV="LD_LIBRARY_PATH=${CUDA_HOME}/lib64 CUDA_VISIBLE_DEVICES=0"
+
+echo "==> Phase 2/2: running the distributed 2-party smoke test from node0 (${NODES[0]})..."
+
+# Generate the distributed 2-party config on node0 from the localhost sample,
+# then copy it to node1 so both parties use identical settings.
+echo "    Generating files/samples/dist_config.json on node0..."
+if ! ssh "${NODES[0]}" "cd '${INSTALL_DIR}' && python3 - '${IP0}' '${IP1}' '${USER0}' '${USER1}' <<'PYEOF'
+import getpass, json, sys
+ip0, ip1, user0, user1 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+default_user = getpass.getuser()
 cfg = json.load(open('files/samples/localhost_config.json'))
 cfg['num_parties'] = 2
-cfg['party_ips']   = [sys.argv[1], sys.argv[2]]
-cfg['party_users'] = ['${SSH_USER}', '${SSH_USER}']
+cfg['party_ips']   = [ip0, ip1]
+cfg['party_users'] = [user0 or default_user, user1 or default_user]
 cfg['run_name']    = 'piranha_dist_test'
-# Minimal fast smoke test: 1 epoch, 1 training iteration.
+# Minimal fast smoke test: 1 epoch, 1 training iteration, no test pass.
 cfg['lr_schedule']            = [3]
 cfg['custom_epochs']          = True
 cfg['custom_epoch_count']     = 1
@@ -458,85 +376,51 @@ cfg['no_test']                = True
 cfg['last_test']              = False
 json.dump(cfg, open('files/samples/dist_config.json', 'w'), indent=2)
 print('wrote files/samples/dist_config.json')
-PYEOF"
+PYEOF"; then
+    echo "!! Failed to generate the distributed config on node0." >&2
+    exit 1
+fi
 
-# Copy the generated config to node1 so both parties use identical settings.
-log "Distributing config to node1..."
-node0 "cat ~/piranha/files/samples/dist_config.json" | \
-    node1 "cat > ~/piranha/files/samples/dist_config.json"
+echo "    Distributing config to node1..."
+ssh "${NODES[0]}" "cat '${INSTALL_DIR}/files/samples/dist_config.json'" | \
+    ssh "${NODES[1]}" "cat > '${INSTALL_DIR}/files/samples/dist_config.json'"
 
-# The piranha binary is linked against the side-by-side CUDA 11.8 runtime, which
-# is not on the default loader path, so every invocation needs LD_LIBRARY_PATH.
-PIRANHA_RUN_ENV="LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64 CUDA_VISIBLE_DEVICES=0"
+# Start party 0 (the listener) first, detached, and wait until it is actually
+# listening before starting party 1 (the connector). Otherwise party 1 can
+# exhaust its connection-retry budget while party 0 is still initializing CUDA,
+# and the two parties never connect.
+echo "    Starting party 0 on node0 (listener; detached)..."
+ssh "${NODES[0]}" "echo '===== Piranha 2PC run (party 0) started at '\$(date)' =====' >> ${LOG_FILE}"
+ssh -f -n "${NODES[0]}" \
+    "cd '${INSTALL_DIR}' && env ${PIRANHA_RUN_ENV} ./piranha -p 0 -c files/samples/dist_config.json < /dev/null >> ${LOG_FILE} 2>&1"
 
-# Start party 0 (the listener) first, in the background, and wait until it is
-# actually listening before starting party 1 (the connector). Otherwise party 1
-# can exhaust its connection-retry budget while party 0 is still initializing
-# CUDA, and the two parties never connect.
-log "Starting party 0 on node0 (listener; detached)..."
-node0 "echo '===== Piranha 2PC run (party 0) started at '\$(date)' =====' >> ~/install_piranha.log"
-ssh "${SSH_OPTS[@]}" -f -n "${SSH_USER}@${NODE0_PUBLIC_IP}" \
-    "cd ~/piranha && env ${PIRANHA_RUN_ENV} ./piranha -p 0 -c files/samples/dist_config.json < /dev/null >> ~/install_piranha.log 2>&1"
-
-log "Waiting for party 0 to begin listening..."
+echo "    Waiting for party 0 to begin listening..."
 for _ in $(seq 1 30); do
-    if node0 "ss -tln 2>/dev/null | grep -q ':3200'"; then
-        log "  party 0 is listening"
+    if ssh "${NODES[0]}" "ss -tln 2>/dev/null | grep -q ':3200'"; then
+        echo "    party 0 is listening"
         break
     fi
     sleep 2
 done
 
-log "Starting party 1 on node1 (connector; foreground, streaming output)..."
+echo "    Starting party 1 on node1 (connector; foreground, streaming output)..."
 set +e
-node1 "cd ~/piranha && echo '===== Piranha 2PC run (party 1) started at '\$(date)' =====' | tee -a ~/install_piranha.log && \
-    env ${PIRANHA_RUN_ENV} ./piranha -p 1 -c files/samples/dist_config.json 2>&1 | tee -a ~/install_piranha.log"
-RUN_STATUS=$?
+ssh "${NODES[1]}" "cd '${INSTALL_DIR}' && echo '===== Piranha 2PC run (party 1) started at '\$(date)' =====' | tee -a ${LOG_FILE} && \
+    env ${PIRANHA_RUN_ENV} ./piranha -p 1 -c files/samples/dist_config.json 2>&1 | tee -a ${LOG_FILE}"
+run_status=$?
 set -e
 
-echo ""
-if [ "$RUN_STATUS" -eq 0 ]; then
-    log "  Distributed 2-party Piranha test completed successfully."
-else
-    log "  NOTE: party 1 exited with status ${RUN_STATUS}. Check the node logs:"
-    log "    node0: ssh -i ${KEY_FILE} ${SSH_USER}@${NODE0_PUBLIC_IP} 'tail -n 40 ~/install_piranha.log'"
-    log "    node1: ssh -i ${KEY_FILE} ${SSH_USER}@${NODE1_PUBLIC_IP} 'tail -n 40 ~/install_piranha.log'"
+echo
+echo "======================================================================"
+if [[ "$run_status" -ne 0 ]]; then
+    echo "Piranha installed and built on both nodes, but the 2-party smoke test"
+    echo "did not complete (party 1 exited with status ${run_status})."
+    echo "Inspect ${LOG_FILE} on each node:"
+    echo "    node0: ssh ${NODES[0]} 'tail -n 40 ${LOG_FILE}'"
+    echo "    node1: ssh ${NODES[1]} 'tail -n 40 ${LOG_FILE}'"
+    exit 1
 fi
-
-rm -f "$INSTALLER_LOCAL"
-echo ""
-
-log "=========================================="
-log "Phase 6: Summary"
-log "=========================================="
-
-cat <<SUMMARY
-
-============================================================
-  PIRANHA TWO-INSTANCE SETUP COMPLETE
-============================================================
-
---- Instances ---
-  node0 (party 0): ${NODE0_PUBLIC_IP} (private: ${NODE0_PRIVATE_IP})
-    ssh -i ${KEY_FILE} ${SSH_USER}@${NODE0_PUBLIC_IP}
-
-  node1 (party 1): ${NODE1_PUBLIC_IP} (private: ${NODE1_PRIVATE_IP})
-    ssh -i ${KEY_FILE} ${SSH_USER}@${NODE1_PUBLIC_IP}
-
---- Logs ---
-  Per-node install/build/run log: ~/install_piranha.log on each instance.
-    ssh -i ${KEY_FILE} ${SSH_USER}@${NODE0_PUBLIC_IP} 'tail -f ~/install_piranha.log'
-
---- Re-running the distributed test manually ---
-  On node1:  cd ~/piranha && CUDA_VISIBLE_DEVICES=0 ./piranha -p 1 -c files/samples/dist_config.json
-  On node0:  cd ~/piranha && CUDA_VISIBLE_DEVICES=0 ./piranha -p 0 -c files/samples/dist_config.json
-
---- Teardown ---
-  State file: ${STATE_FILE}
-  ./teardown_piranha.sh ${PREFIX} ${AWS_REGION}
-  (or terminate instances ${NODE0_ID}, ${NODE1_ID} and delete VPC ${VPC_ID})
-
-============================================================
-SUMMARY
-
-log "Done. State saved to: ${STATE_FILE}"
+echo "SUCCESS: Piranha cloned into ${INSTALL_DIR} on both nodes, built (2PC), and"
+echo "the distributed 2-party smoke test ran across: ${NODES[*]}"
+echo "Per-node output: ${LOG_FILE} on each host."
+echo "======================================================================"

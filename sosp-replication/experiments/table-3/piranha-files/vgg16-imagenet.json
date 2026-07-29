@@ -1,0 +1,251 @@
+{
+    "name": "VGG16",
+    "dataset": "ImageNet",
+    "batch_size": 8,
+    "input_size": 150528,
+    "num_classes": 1000,
+    "model": [
+        {
+            "layer": "cnn",
+            "input_hw": [224, 224],
+            "in_channels": 3,
+            "out_channels": 64,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 3211264
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [224, 224],
+            "in_channels": 64,
+            "out_channels": 64,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "averagepool",
+            "input_hw": [224, 224],
+            "in_channels": 64,
+            "pool_hw": [2, 2],
+            "stride": 2
+        },
+        {
+            "layer": "relu",
+            "input_dim": 802816
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [112, 112],
+            "in_channels": 64,
+            "out_channels": 128,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 1605632
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [112, 112],
+            "in_channels": 128,
+            "out_channels": 128,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "averagepool",
+            "input_hw": [112, 112],
+            "in_channels": 128,
+            "pool_hw": [2, 2],
+            "stride": 2
+        },
+        {
+            "layer": "relu",
+            "input_dim": 401408
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [56, 56],
+            "in_channels": 128,
+            "out_channels": 256,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 802816
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [56, 56],
+            "in_channels": 256,
+            "out_channels": 256,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 802816
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [56, 56],
+            "in_channels": 256,
+            "out_channels": 256,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "averagepool",
+            "input_hw": [56, 56],
+            "in_channels": 256,
+            "pool_hw": [2, 2],
+            "stride": 2
+        },
+        {
+            "layer": "relu",
+            "input_dim": 200704
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [28, 28],
+            "in_channels": 256,
+            "out_channels": 512,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 401408
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [28, 28],
+            "in_channels": 512,
+            "out_channels": 512,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 401408
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [28, 28],
+            "in_channels": 512,
+            "out_channels": 512,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "averagepool",
+            "input_hw": [28, 28],
+            "in_channels": 512,
+            "pool_hw": [2, 2],
+            "stride": 2
+        },
+        {
+            "layer": "relu",
+            "input_dim": 100352
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [14, 14],
+            "in_channels": 512,
+            "out_channels": 512,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 100352
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [14, 14],
+            "in_channels": 512,
+            "out_channels": 512,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "relu",
+            "input_dim": 100352
+        },
+        {
+            "layer": "cnn",
+            "input_hw": [14, 14],
+            "in_channels": 512,
+            "out_channels": 512,
+            "filter_hw": [3, 3],
+            "stride": 1,
+            "padding": 1
+        },
+        {
+            "layer": "averagepool",
+            "input_hw": [14, 14],
+            "in_channels": 512,
+            "pool_hw": [2, 2],
+            "stride": 2
+        },
+        {
+            "layer": "relu",
+            "input_dim": 25088
+        },
+        {
+            "layer": "averagepool",
+            "input_hw": [7, 7],
+            "in_channels": 512,
+            "pool_hw": [2, 2],
+            "stride": 2
+        },
+        {
+            "layer": "relu",
+            "input_dim": 4608
+        },
+        {
+            "layer": "fc",
+            "input_dim": 4608,
+            "output_dim": 4096
+        },
+        {
+            "layer": "relu",
+            "input_dim": 4096
+        },
+        {
+            "layer": "fc",
+            "input_dim": 4096,
+            "output_dim": 4096
+        },
+        {
+            "layer": "relu",
+            "input_dim": 4096
+        },
+        {
+            "layer": "fc",
+            "input_dim": 4096,
+            "output_dim": 1000
+        },
+        {
+            "layer": "relu",
+            "input_dim": 1000
+        }
+    ]
+}
