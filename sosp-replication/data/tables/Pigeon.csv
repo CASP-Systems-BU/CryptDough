@@ -1,0 +1,6 @@
+,3PC,,,,,,4PC,,,,,
+,LAN,,,WAN,,,LAN,,,WAN,,
+Query,Pigeon,US,SpeedUp,Pigeon,US,SpeedUp
+AlexNet + CIFAR-10,0.492,0.17,2.86,2.68,3.92,0.7
+VGG16 + CIFAR-10,1.133,1.111,1.0,5.519,15.3,0.4
+VGG16 + ImageNet,52.339,51,1.0,183.549,219.6,0.8
