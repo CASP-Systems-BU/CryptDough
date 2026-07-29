@@ -80,25 +80,54 @@ $ ./scripts/orchestration/deploy.sh ~/CryptDough node0 node1 node2 node3
 ```
 
 #### Baseline installation
-After [installing CryptDough](#cryptdough-installation), you can run the following script to install all baseline systems.
+After [installing CryptDough](#cryptdough-installation), you can run the following script to install all baseline systems except for Piranha. Note, this step depends on a successful installtion of CryptDough on the cluster using node prefix of `node`.
 
 ```bash
-$ ./sosp-replication/setup/setup_baselines.sh node0 node1 node2 node3
+$ ./sosp-replication/setup/setup_baselines.sh
+```
+
+If you are on a cluster with GPU access, you can run the Piranha installation using the following command. After installtion, you might need to restart the cluster for GPU drivers to complete installtion.
+
+```bash
+$ ./sosp-replication/setup/setup_piranha.sh node0 node1
 ```
 
 ### Experiments
 All of the following experiments are long-running. To avoid improper termination, please use [screen](https://linuxize.com/post/how-to-use-linux-screen/) to run them. All commands are run from `node0`.
 
-After running all experiments, you can proceed to the [plotting section](#plotting).
+For instance, once you have access to the cluster with CryptDough and baselines installed on them, run the following command to create a new screen and be ready to proceed with next experiments.
+```bash
+$ screen -S cdough
+$ cd ~/CryptDough/build
+```
+
+Kindly, run all experiments from the CryptDough `build` directory. After running all experiments, you can proceed to the [plotting section](#plotting).
+
+You have two alternatives to run the experiments.
+
+**Aleternative 1** Instead of going through each subsection, If you are on the CPU based cluster, you can the following command from inside the `build` directory to run all experiments except for Piranha:
+
+```bash
+$ ../sosp-replication/experiments/run-all.sh
+```
+
+Once you are on the GPU based cluster, you can run the Piranha experiments using the following command:
+
+```bash
+$ ../sosp-replication/experiments/table-3/table3-piranha.sh
+```
+
+
+**Aleternative 2** You can run each figure/table experiment separately by following instructions in each following subsection.
 
 #### Fig 5: Multi-workload Query 
-(Human time: 2 minutes, runtime: 3 hours)
+(Human time: 2 minutes, runtime: 6 hours)
 
 This experiment supports claim #1 and runs in BM-LAN and BM-WAN. In this experiment, we run our multi-workload query using the 4 protocols {2PC, 3PC, 4PC, SPDZ2k} in both LAN and WAN setups.
 
-From `node0`, run the following command and the results will be logged in `./sosp-replication/data/logs/fig5`.
+From `node0` and inside the `build` directory, run the following command and the results will be logged in `./sosp-replication/data/logs/fig5`.
 ```bash
-$ ./sosp-replication/experiments/figure-5/fig5.sh
+$ ../sosp-replication/experiments/figure-5/fig5.sh
 ```
 
 #### Fig 6 Comparison with ORQ
@@ -106,14 +135,14 @@ $ ./sosp-replication/experiments/figure-5/fig5.sh
 
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare against ORQ performance using 8 queries for both the 2PC and 3PC protocols.
 
-For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/fig6-cdough`.
+For CryptDough, first run the following command from inside the `build` directory and the results will be logged in `./sosp-replication/data/logs/fig6-cdough`.
 ```bash
-$ ./sosp-replication/experiments/figure-6/fig6-cdough.sh
+$ ../sosp-replication/experiments/figure-6/fig6-cdough.sh
 ```
 
 For ORQ, run the following command and the results will be logged in `./sosp-replication/data/logs/fig6-orq`.
 ```bash
-$ ./sosp-replication/experiments/figure-6/fig6-orq.sh
+$ ../sosp-replication/experiments/figure-6/fig6-orq.sh
 ```
 
 #### Fig 7 Comparison with TVA
@@ -121,14 +150,14 @@ $ ./sosp-replication/experiments/figure-6/fig6-orq.sh
 
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare against TVA performance using 3 queries for both 3PC and 4PC protocols.
 
-For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/fig7-cdough`.
+For CryptDough, first run the following command from inside the `build` directory and the results will be logged in `./sosp-replication/data/logs/fig7-cdough`.
 ```bash
-$ ./sosp-replication/experiments/figure-7/fig7-cdough.sh
+$ ../sosp-replication/experiments/figure-7/fig7-cdough.sh
 ```
 
 For TVA, run the following command and the results will be logged in `./sosp-replication/data/logs/fig7-tva`.
 ```bash
-$ ./sosp-replication/experiments/figure-7/fig7-tva.sh
+$ ../sosp-replication/experiments/figure-7/fig7-tva.sh
 ```
 
 #### Fig 8 Scalability
@@ -136,39 +165,39 @@ $ ./sosp-replication/experiments/figure-7/fig7-tva.sh
 
 This experiment supports claim #2 and runs in BM-LAN. In this experiment we show scalability for [Comparison - RCA/PPA - Conv2d - Sorting] using the 3PC protocol.
 
-Run the following command and the results will be logged in `./sosp-replication/data/logs/fig8`.
+Run the following command from inside the `build` directory and the results will be logged in `./sosp-replication/data/logs/fig8`.
 ```bash
-$ ./sosp-replication/experiments/figure-8/fig8.sh
+$ ../sosp-replication/experiments/figure-8/fig8.sh
 ```
 
 #### Table 2 comparison with Pigeon (3PC)
-(Human time: 2 minutes, runtime: 1 hour)
+(Human time: 2 minutes, runtime: 1/2 hour)
 
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare against Pigeon ML inference for the 3PC protocol. Both systems use model parallelism, where multiple processes perform inference at the same time. We use the slowest process latency in both systems to determine the end-to-end latency.
 
-For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/table2-cdough`.
+For CryptDough, first run the following command from inside the `build` directory and the results will be logged in `./sosp-replication/data/logs/table2-cdough`.
 ```bash
-$ ./sosp-replication/experiments/table-2/table2-cdough.sh
+$ ../sosp-replication/experiments/table-2/table2-cdough.sh
 ```
 
 For Pigeon, run the following command and the results will be logged in `./sosp-replication/data/logs/table2-pigeon`.
 ```bash
-$ ./sosp-replication/experiments/table-2/table2-pigeon.sh
+$ ../sosp-replication/experiments/table-2/table2-pigeon.sh
 ```
 
 #### Table 3 comparison with Piranha (2PC)
-(Human time: 2 minutes, runtime: 1 hour)
+(Human time: 2 minutes, runtime: 1/2 hour)
 
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN for CryptDough, but in AWS-LAN and AWS-WAN for Piranha since it requires a GPU. In this experiment, we compare against Piranha using the 2PC protocol.
 
-For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/table3-cdough`.
+For CryptDough, first run the following command from inside the `build` directory and the results will be logged in `./sosp-replication/data/logs/table3-cdough`.
 ```bash
-$ ./sosp-replication/experiments/table-3/table3-cdough.sh
+$ ../sosp-replication/experiments/table-3/table3-cdough.sh
 ```
 
 For Piranha, run the following command and the results will be logged in `./sosp-replication/data/logs/table3-piranha`.
 ```bash
-$ ./sosp-replication/experiments/table-3/table3-piranha.sh
+$ ../sosp-replication/experiments/table-3/table3-piranha.sh
 ```
 
 #### Table 4 comparison with MP-SPDZ (SPDZ2k)
@@ -176,14 +205,14 @@ $ ./sosp-replication/experiments/table-3/table3-piranha.sh
 
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare CryptDough against MP-SPDZ.
 
-For CryptDough, first run the following command and the results will be logged in `./sosp-replication/data/logs/table4-cdough`.
+For CryptDough, first run the following command from inside the `build` directory and the results will be logged in `./sosp-replication/data/logs/table4-cdough`.
 ```bash
-$ ./sosp-replication/experiments/table-4/table4-cdough.sh
+$ ../sosp-replication/experiments/table-4/table4-cdough.sh
 ```
 
 For MP-SPDZ, run the following command and the results will be logged in `./sosp-replication/data/logs/table4-mpspdz`.
 ```bash
-$ ./sosp-replication/experiments/table-4/table4-mpspdz.sh
+$ ../sosp-replication/experiments/table-4/table4-mpspdz.sh
 ```
 
 ### Plotting
