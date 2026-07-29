@@ -43,6 +43,14 @@ mpspdz_dir="$(cd "$script_dir/../../baselines/mpspdz" && pwd)"
 log_dir="$(cd "$script_dir/../.." && pwd)/data/logs/table-4/mpspdz"
 mkdir -p "$log_dir"
 
+# WAN emulation script shared with the CryptDough side (run_experiment.py -s wan).
+# The repository is deployed to the same absolute path on both nodes, so the
+# same path is valid on node1 over SSH. cluster-wan-sim.sh is not used here
+# because it identifies node0 by `hostname --short`, which the other node cannot
+# resolve on this cluster; the node0/node1 aliases are used instead (the same
+# reasoning as table3-piranha.sh).
+wan_sim_py="$(cd "$script_dir/../../../scripts/profiling/comm" && pwd)/wan-sim.py"
+
 USE_F=${USE_F:-1}
 RUNS=${RUNS:-1}
 PROGRAM="torch_cifar_alex_infer_single-192-16"
@@ -109,14 +117,46 @@ run_mpspdz() {
     done
 }
 
+# Apply the WAN emulation state on both directions of the node0<->node1 link:
+# locally toward node1 and on node1 toward node0. Each side auto-detects its
+# interface from the (resolvable) peer alias. Needs passwordless sudo for tc on
+# both nodes (tc netem: 6 Gbit rate + 10 ms per-link delay = 20 ms RTT).
+set_wan() { # $1 = on|off
+    local state="$1"
+    python3 "$wan_sim_py" "$state" -H "${NODES[1]}" &&
+        ssh "${NODES[1]}" "python3 '${wan_sim_py}' ${state} -H ${NODES[0]}"
+}
+
+# Always disable WAN emulation on exit so an aborted WAN half can never corrupt
+# later measurements.
+wan_enabled=0
+disable_wan() {
+    if [ "$wan_enabled" -eq 1 ]; then
+        echo "==> Disabling WAN emulation (cleanup)..."
+        set_wan off
+        wan_enabled=0
+    fi
+}
+trap disable_wan EXIT
+
 build_mpspdz
 
 # LAN experiments with 2PC
 run_mpspdz "LAN" "lan-2pc-alexnet"
 
-# TODO: turn on WAN
+# Enable WAN emulation between node0 and node1 for the WAN half.
+echo "==> Enabling WAN emulation (6 Gbit, 20 ms RTT) between ${NODES[0]} and ${NODES[1]}..."
+wan_enabled=1
+if ! set_wan on; then
+    echo "!! Failed to enable WAN emulation; aborting before the WAN half." >&2
+    exit 1
+fi
+
 # WAN experiments with 2PC
 run_mpspdz "WAN" "wan-2pc-alexnet"
+
+# Turn off WAN emulation.
+disable_wan
 
 echo ""
 echo "Results in $log_dir"
