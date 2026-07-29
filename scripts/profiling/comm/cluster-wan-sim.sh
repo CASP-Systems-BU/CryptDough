@@ -8,7 +8,7 @@ shift
 
 NODES=$*
 
-me=$(hostname --short)
+me=$(getent hosts $(hostname -I) | awk '{print $2}' | grep -E '^node' | head -n1)
 
 for n in $NODES
 do
@@ -17,5 +17,5 @@ do
 
     # assume nodeX access node0 with same interface as it does nodeY
     scp ./wan-sim.py $n:~/
-    ssh $n ./wan-sim.py $CONTROL -H $me
+    ssh $n python3 wan-sim.py $CONTROL -H $me
 done
