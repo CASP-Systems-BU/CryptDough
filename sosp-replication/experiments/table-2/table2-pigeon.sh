@@ -38,6 +38,12 @@ log_dir="$(cd "$script_dir/../.." && pwd)/data/logs/table-2/pigeon"
 # Node aliases; party N runs on node N.
 NODES=(node0 node1 node2 node3)
 
+# WAN simulation helper (the same one run_experiment.py uses) and the peer nodes
+# to shape. node0 is the local orchestrator, so only the remote parties are
+# shaped; the 3PC experiments below run across node0,node1,node2.
+wan_sim="$script_dir/../../../scripts/profiling/comm/cluster-wan-sim.sh"
+wan_nodes=("${NODES[@]:1:2}")
+
 # Resolve a node alias/host to a dotted-decimal IPv4 address. hpmpc's Connect()
 # (core/networking/socket.hpp) resolves peers with inet_aton(), which accepts
 # ONLY dotted-decimal IPv4 and rejects hostnames; passing an alias makes the
@@ -159,9 +165,12 @@ run_experiment "VGG16_Imagenet" 3 \
     1 "lan-3pc-vgg16_imagenet.log" || overall=1
 
 
-# TODO: Turn on WAN 
-# WAN Experiments with 3PC
+# Turn on WAN simulation and ensure it is turned back off even if a WAN
+# experiment fails or the script is interrupted.
+"$wan_sim" on "${wan_nodes[@]}"
+trap '"$wan_sim" off "${wan_nodes[@]}"' EXIT
 
+# WAN Experiments with 3PC
 run_experiment "AlexNet" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=180 PROTOCOL=5" \
     1 "wan-3pc-alexnet.log" || overall=1
@@ -173,6 +182,10 @@ run_experiment "VGG16" 3 \
 run_experiment "VGG16_Imagenet" 3 \
     "NUM_INPUTS=1 PROCESS_NUM=4 SPLITROLES=1 DATTYPE=512 BITLENGTH=64 FUNCTION_IDENTIFIER=179 PROTOCOL=5" \
     1 "wan-3pc-vgg16_imagenet.log" || overall=1
+
+# Turn off WAN simulation.
+trap - EXIT
+"$wan_sim" off "${wan_nodes[@]}"
 
 echo
 echo "======================================================================"

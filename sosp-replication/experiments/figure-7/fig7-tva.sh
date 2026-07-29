@@ -2,6 +2,13 @@
 
 script_dir=$(dirname "$0")
 
+# Resolve the WAN simulation helper (the same one run_experiment.py uses) to an
+# absolute path now, before we cd into the build directory below, so it stays
+# valid regardless of the current working directory. The WAN block runs both
+# 3PC and 4PC, so every remote party (node1..node3) is shaped; node0 is local.
+wan_sim=$(cd "$script_dir/../../../scripts/profiling/comm" && pwd)/cluster-wan-sim.sh
+wan_nodes=(node1 node2 node3)
+
 baseline_dir="$script_dir/../../baselines/tva/build"
 build_dir=$(cd "$baseline_dir" && pwd)
 cd "$build_dir"
@@ -74,7 +81,10 @@ $run_command_4pc -np 4 ./energy 16 1 4096 4194304 >> "$log_dir/lan-4pc-energy.lo
 $run_command_4pc -np 4 ./medical 16 1 4096 4194304 >> "$log_dir/lan-4pc-medical.log"
 $run_command_4pc -np 4 ./cloud 16 1 4096 4194304 >> "$log_dir/lan-4pc-cloud.log"
 
-# TODO: turn on WAN
+# Turn on WAN simulation and ensure it is turned back off even if a WAN
+# experiment fails or the script is interrupted.
+"$wan_sim" on "${wan_nodes[@]}"
+trap '"$wan_sim" off "${wan_nodes[@]}"' EXIT
 
 build_tva 3
 # WAN experiments with 3PC
@@ -87,3 +97,7 @@ build_tva 4
 $run_command_4pc -np 4 ./energy 16 1 65536 4194304 >> "$log_dir/wan-4pc-energy.log"
 $run_command_4pc -np 4 ./medical 16 1 65536 4194304 >> "$log_dir/wan-4pc-medical.log"
 $run_command_4pc -np 4 ./cloud 16 1 65536 4194304 >> "$log_dir/wan-4pc-cloud.log"
+
+# Turn off WAN simulation.
+trap - EXIT
+"$wan_sim" off "${wan_nodes[@]}"
