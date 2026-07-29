@@ -189,12 +189,20 @@ $ ./sosp-replication/experiments/table-4/table4-mpspdz.sh
 ### Plotting
 After running the [experiments above](#experiments), the logs are collected and stored under `./sosp-replication/data/logs/`.
 
-To extract this data into CSV tables, run the following command:
+The plotting scripts require a few Python packages listed in [`requirements.txt`](../requirements.txt). We recommend installing them in a virtual environment named `.env` at the repository root:
+```bash
+$ python3 -m venv .env
+$ ./.env/bin/pip install -r requirements.txt
+```
+`extract_data.sh` automatically uses this `.env` interpreter when it is present (falling back to the system `python3` otherwise).
+
+To extract this data into CSV tables, run the following command. Figure data is written under `sosp-replication/data/results` and the comparison tables (Pigeon, Piranha, MP-SPDZ) under `sosp-replication/data/tables`:
 ```bash
 $ sosp-replication/plotting/extract_data.sh
 ```
 
-After extracting the data from the logs, run the plotting script; the paper plots will be produced under `sosp-replication/data/plots`.
+After extracting the data from the logs, run the plotting script; the paper plots will be produced under `sosp-replication/data/plots`, organized into one subdirectory per figure/table (`fig5`, `fig6`, `fig7`, `fig8`, `table-2`, `table-3`, `table-4`, and `appendix`), mirroring the `data/logs` layout.
 ```bash
-$ ./sosp-replication/plotting/plot_benchmarks.py
+$ ./.env/bin/python3 ./sosp-replication/plotting/plot_benchmarks.py
 ```
+

@@ -8,8 +8,9 @@ import numpy as np
 import os
 from matplotlib.patches import Patch
 
-DATA_DIR = "data"
-OUT_DIR  = "plots"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(_SCRIPT_DIR, "..", "data", "results")
+OUT_DIR  = os.path.join(_SCRIPT_DIR, "..", "data", "plots")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 BASE_FONT  = 28
@@ -228,8 +229,10 @@ def ours_bar_plot(ax, x_labels, vals, protocol, log_scale=False, rotate_xticks=2
     ax.set_axisbelow(True)
 
 
-def save(fig, name):
-    path = os.path.join(OUT_DIR, name.replace(".pdf", ".png"))
+def save(fig, name, subdir=""):
+    out_dir = os.path.join(OUT_DIR, subdir) if subdir else OUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, name.replace(".pdf", ".png"))
     fig.savefig(path, bbox_inches="tight", dpi=180)
     print(f"  saved {path}")
     plt.close(fig)
@@ -263,7 +266,7 @@ def plot_orq():
                              show_ylabel=(network == "LAN" and protocol == "2PC"),
                              show_legend=(network == "LAN"))
             fig.tight_layout()
-            save(fig, f"orq_{protocol}_{network}.pdf")
+            save(fig, f"orq_{protocol}_{network}.pdf", subdir="fig6")
 
 
 def plot_tva():
@@ -282,7 +285,7 @@ def plot_tva():
                              show_ylabel=(network == "LAN" and protocol == "3PC"),
                              show_legend=(network == "WAN"))
             fig.tight_layout()
-            save(fig, f"tva_{protocol}_{network}.pdf")
+            save(fig, f"tva_{protocol}_{network}.pdf", subdir="fig7")
 
 
 def plot_pigeon():
@@ -302,7 +305,7 @@ def plot_pigeon():
                              show_ylabel=(network == "WAN"),
                              show_legend=(network == "WAN"))
             fig.tight_layout()
-            save(fig, f"pigeon_{protocol}_{network}.pdf")
+            save(fig, f"pigeon_{protocol}_{network}.pdf", subdir="table-2")
 
 
 def plot_piranha():
@@ -321,7 +324,7 @@ def plot_piranha():
                          show_ylabel=(network == "LAN"),
                          show_legend=(network == "WAN"))
         fig.tight_layout()
-        save(fig, f"piranha_2PC_{network}.pdf")
+        save(fig, f"piranha_2PC_{network}.pdf", subdir="table-3")
 
 
 def plot_mpspdz():
@@ -340,7 +343,7 @@ def plot_mpspdz():
                      rotate_xticks=0)
     fig.tight_layout()
     ax.legend(loc="upper left", frameon=False, ncol=1)
-    save(fig, "mpspdz_alexnet_cifar10.pdf")
+    save(fig, "mpspdz_alexnet_cifar10.pdf", subdir="table-4")
 
 ## threat model annotation
 def add_group_bracket(ax, x0, x1, label, y, direction="up", color="black", h=0.03):
@@ -435,7 +438,7 @@ def plot_multi_workload():
 
     fig.subplots_adjust(bottom=0.35, top=0.82)
     fig.tight_layout()
-    save(fig, "multi_workload.pdf")
+    save(fig, "multi_workload.pdf", subdir="fig5")
 
 def scalability_line_plot(ax, x, y, label, color,
                           marker="o", linestyle="-"):
@@ -501,7 +504,7 @@ def plot_sorting_scalability():
         ax.legend(frameon=False)
 
         fig.tight_layout()
-        save(fig, f"sorting_scalability_{protocol}_{network}.pdf")
+        save(fig, f"sorting_scalability_{protocol}_{network}.pdf", subdir="fig8")
 
 def scalability_line_plot_sec(ax, x, y, label, color, marker="o", linestyle="-"):
     ax.plot(x, y,
@@ -542,7 +545,7 @@ def plot_gr_scalability():
     ax.set_xticks(sorted(set(xs)))
     ax.legend(frameon=False)
     fig.tight_layout()
-    save(fig, "gr_scalability_3PC_LAN.pdf")
+    save(fig, "gr_scalability_3PC_LAN.pdf", subdir="fig8")
 
 
 def plot_rca_ppa_scalability():
@@ -577,11 +580,11 @@ def plot_rca_ppa_scalability():
     ax.set_xticks(sorted({t for pts in per_query.values() for (t, _) in pts}))
     ax.legend(frameon=False)
     fig.tight_layout()
-    save(fig, "rca_ppa_scalability_3PC_LAN.pdf")
+    save(fig, "rca_ppa_scalability_3PC_LAN.pdf", subdir="fig8")
 
 
 def plot_conv2d_scalability():
-    path = os.path.join(DATA_DIR, "CONV2D_SCALABILITY.csv")
+    path = os.path.join(DATA_DIR, "Conv2D_SCALABILITY.csv")
 
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as f:
@@ -603,7 +606,7 @@ def plot_conv2d_scalability():
     ax.set_xticks(sorted(set(int(r["Threads"]) for r in rows)))
     ax.legend(frameon=False)
     fig.tight_layout()
-    save(fig, "conv2d_scalability_3PC_LAN.pdf")
+    save(fig, "conv2d_scalability_3PC_LAN.pdf", subdir="fig8")
 
 
 def load_scalability_sheet(filename):
@@ -675,7 +678,7 @@ def plot_primitives_scalability():
             ax.legend(frameon=False, loc="upper right")
             fig.tight_layout()
             fname = caption.replace("/", "_")
-            save(fig, f"primitives_scalability_{proto}_{fname}_LAN.pdf")
+            save(fig, f"primitives_scalability_{proto}_{fname}_LAN.pdf", subdir="appendix")
 
 
 if __name__ == "__main__":
