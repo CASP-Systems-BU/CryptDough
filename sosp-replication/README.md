@@ -201,7 +201,7 @@ $ ../sosp-replication/experiments/table-3/table3-piranha.sh
 ```
 
 #### Table 4 comparison with MP-SPDZ (SPDZ2k)
-(Human time: 2 minutes, runtime: 1 hour)
+(Human time: 2 minutes, runtime: 3 hour)
 
 This experiment supports claim #2 and runs in BM-LAN and BM-WAN. In this experiment, we compare CryptDough against MP-SPDZ.
 
