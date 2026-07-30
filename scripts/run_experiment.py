@@ -650,6 +650,10 @@ def run_experiments(cfg: ExperimentConfig) -> None:
             print(f"Running command: {' '.join(full_cmd)}", flush=True)
             for rep in range(cfg.exp_repetitions):
                 _clear_stopwatch_file(cfg.build_dir)
+                print(
+                    f"Starting execution at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    flush=True,
+                )
                 returncode, timed_out = _run_with_timeout(
                     full_cmd, cfg.build_dir, cfg.run_timeout_sec
                 )
