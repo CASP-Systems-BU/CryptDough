@@ -73,7 +73,8 @@ FFLAG=""
 build_mpspdz() {
     local build_cmd="cd '${mpspdz_dir}' && ./.env/bin/python ./compile.py -R 64 --budget=100000 torch_cifar_alex_infer_single 192 16"
     if [ "$USE_F" = "1" ]; then
-        build_cmd="${build_cmd} && ./Fake-Offline.x 2 -Z 64 -S 64 -p ${PROGRAM}"
+        # Delets previous preprocessing and passes a fixed seed for fake generation
+        build_cmd="${build_cmd} && rm -rf Player-Data/2-* && ./Fake-Offline.x 2 -Z 64 -S 64 --prngseed CryptDoughSeed01 -p ${PROGRAM}"
     fi
 
     echo "==> Building MP-SPDZ program on: ${NODES[*]} (USE_F=${USE_F})"

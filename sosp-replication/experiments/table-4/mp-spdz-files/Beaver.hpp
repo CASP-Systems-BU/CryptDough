@@ -46,7 +46,13 @@ void Beaver<T>::prepare_mul(const T& x, const T& y, int n)
     (void) n;
     triples.push_back({{}});
     auto& triple = triples.back();
-    // triple = prep->get_triple(n);  // zero triples
+    // Fetch the triple so it is zeroed at the right layer: for scalar shares
+    // Sub_Data_Files::get_three_no_count (Data_Files.h) returns default-zero
+    // shares without reading any preprocessing file, and for ShareMatrix
+    // MatrixFile::get_three_no_count (MatrixFile.h) returns a zeroed matrix with
+    // the CORRECT dimensions. Skipping this call left matrix triples as 0x0,
+    // which made "x - triple[0]" trip the ValueMatrix::operator- size assertion.
+    triple = prep->get_triple(n);
     shares.push_back(x - triple[0]);
     shares.push_back(y - triple[1]);
     lengths.push_back(n);
