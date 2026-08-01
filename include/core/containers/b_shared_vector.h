@@ -78,7 +78,11 @@ public:
 
     unique_B binary_adder(const BSharedVector<Share, EVector, Engine>& a,
                           const BSharedVector<Share, EVector, Engine>& b, bool carry_in) const {
-#ifndef FORCE_PARALLEL_PREFIX_ADDER
+#if defined(FORCE_RIPPLE_CARRY_ADDER)
+        return a.rca(b, carry_in);
+#elif defined(FORCE_PARALLEL_PREFIX_ADDER)
+        return a.ppa(b, carry_in);
+#else
         const double latency_sec = 1e-3 * this->engine.comm0()->getLatency();
         const double bandwidth_bps = 1e9 * this->engine.comm0()->getBandwidth();
 
@@ -92,11 +96,10 @@ public:
 
         if (t_rca <= t_ppa) {
             return a.rca(b, carry_in);
-        } else
-#endif
-        {
+        } else {
             return a.ppa(b, carry_in);
         }
+#endif
     }
 
    public:

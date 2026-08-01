@@ -75,6 +75,25 @@
 // #define MPC_PRINT_RESULT 1
 // #define MPC_COMMUNICATOR_PRINT_DATA 1
 
+// Boolean adder selection. By default (CDOUGH_BOOLEAN_ADDER_AUTO) the automatic
+// cost-model selector in b_shared_vector.h chooses between RCA and PPA. Set
+// CONFIG_BOOLEAN_ADDER (e.g. via `-DBOOLEAN_ADDER=RCA` / `PPA` through CMake) to
+// force one adder. Manually defining FORCE_RIPPLE_CARRY_ADDER or
+// FORCE_PARALLEL_PREFIX_ADDER below also forces the respective adder.
+#define CDOUGH_BOOLEAN_ADDER_AUTO 0
+#define CDOUGH_BOOLEAN_ADDER_RCA 1
+#define CDOUGH_BOOLEAN_ADDER_PPA 2
+#ifndef CONFIG_BOOLEAN_ADDER
+#define CONFIG_BOOLEAN_ADDER CDOUGH_BOOLEAN_ADDER_AUTO
+#endif
+#if CONFIG_BOOLEAN_ADDER == CDOUGH_BOOLEAN_ADDER_PPA
+// Force the parallel-prefix adder (PPA).
+#define FORCE_PARALLEL_PREFIX_ADDER 1
+#elif CONFIG_BOOLEAN_ADDER == CDOUGH_BOOLEAN_ADDER_RCA
+// Force the ripple-carry adder (RCA).
+#define FORCE_RIPPLE_CARRY_ADDER 1
+#endif
+
 // If defined, do not use the automatic adder circuit selector, and always use PPA.
 // (To force RCA, do not pass any network parameters. The default is RCA.)
 // #define FORCE_PARALLEL_PREFIX_ADDER 1

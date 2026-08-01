@@ -95,6 +95,16 @@ if(NOT SORT_PROTO IN_LIST VALID_SORT_PROTOS)
 endif()
 add_compile_definitions(CONFIG_DEFAULT_SORT_PROTO=${SORT_PROTO})
 
+# Option: choose the boolean adder circuit (see include/debug/cdough_debug.h and
+# include/core/containers/b_shared_vector.h). AUTO uses the runtime cost model to
+# pick RCA vs PPA; RCA/PPA force that adder. Passed through as CONFIG_BOOLEAN_ADDER.
+set(BOOLEAN_ADDER "AUTO" CACHE STRING "Boolean adder selection (AUTO, RCA, PPA)")
+set(VALID_BOOLEAN_ADDERS "AUTO" "RCA" "PPA")
+if(NOT BOOLEAN_ADDER IN_LIST VALID_BOOLEAN_ADDERS)
+    message(FATAL_ERROR "Invalid value for BOOLEAN_ADDER: ${BOOLEAN_ADDER}. Choose one of: ${VALID_BOOLEAN_ADDERS}.")
+endif()
+add_compile_definitions(CONFIG_BOOLEAN_ADDER=CDOUGH_BOOLEAN_ADDER_${BOOLEAN_ADDER})
+
 # Set a flag if we're running inside the CI
 if(DEFINED ENV{GITHUB_ACTIONS})
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DGITHUB_ACTIONS")

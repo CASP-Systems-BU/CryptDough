@@ -112,6 +112,7 @@ class ExperimentConfig:
     triples_type: str
     division_correction: bool
     sort_proto: str
+    boolean_adder: str
     build_only: bool
     run_timeout_sec: int
     cmake_args: List[str]
@@ -284,6 +285,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Default sorting protocol; default: quicksort",
     )
     parser.add_argument(
+        "--adder",
+        dest="boolean_adder",
+        choices=["auto", "rca", "ppa"],
+        type=str.lower,
+        default=None,
+        help="Boolean adder circuit: auto (cost model), rca, or ppa; default: auto (ppa for WAN)",
+    )
+    parser.add_argument(
         "--timeout",
         dest="run_timeout_sec",
         type=int,
@@ -427,6 +436,12 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
     division_correction = not args.disable_division_correction
     # Sorting protocol name in the C++ enum form (uppercase).
     sort_proto = args.sort_proto.upper()
+    # Boolean adder selection in the C++ enum form (uppercase). When not
+    # explicitly specified, default to PPA for WAN and AUTO otherwise.
+    if args.boolean_adder is not None:
+        boolean_adder = args.boolean_adder.upper()
+    else:
+        boolean_adder = "PPA" if args.exp_setting == "wan" else "AUTO"
 
     return ExperimentConfig(
         exp_protocol=args.exp_protocol,
@@ -448,6 +463,7 @@ def derive_config(args: argparse.Namespace) -> ExperimentConfig:
         triples_type=triples_type,
         division_correction=division_correction,
         sort_proto=sort_proto,
+        boolean_adder=boolean_adder,
         build_only=args.build_only,
         run_timeout_sec=args.run_timeout_sec,
         cmake_args=args.cmake_args or [],
@@ -509,6 +525,8 @@ def perform_experiment_setup(cfg: ExperimentConfig) -> None:
     ]
     # Select the default sorting protocol.
     extra_cmake_args = extra_cmake_args + [f"-DSORT_PROTO={cfg.sort_proto}"]
+    # Select the boolean adder circuit (AUTO cost model by default).
+    extra_cmake_args = extra_cmake_args + [f"-DBOOLEAN_ADDER={cfg.boolean_adder}"]
     cmake_args_flat = _flatten_args(extra_cmake_args)
 
     # Run cmake
