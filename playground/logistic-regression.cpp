@@ -67,10 +67,16 @@ struct OptResult {
 // secure (MPC) port, where transcendental primitives are unavailable and must be
 // approximated by polynomial series.
 // ---------------------------------------------------------------------------
-#define USE_TAYLOR_MATH 1
 #ifndef USE_TAYLOR_MATH
 #define USE_TAYLOR_MATH 0
 #endif
+
+// Trust-region cap on the per-iteration Newton step. A nearly flat prior (large
+// sigma^2) combined with (quasi-)separable binary data pushes the mode far from
+// 0; without a cap the undamped Newton step overshoots into overflow and then
+// oscillates. Capping keeps every iterate finite while leaving normal steps
+// (well under the cap) unaffected.
+constexpr double kMaxNewtonStep = 4.0;
 
 #if USE_TAYLOR_MATH
 
@@ -83,9 +89,11 @@ constexpr double kLn2 = 0.693;
 constexpr double kSqrt2 = 1.414;
 constexpr double kSqrt1_2 = 0.707;
 
+constexpr double SmallEpsilon = 0.0001;
+
 // Number of significant terms is bounded because all series arguments are small
 // after range reduction; the loops break early on negligible terms.
-constexpr double kSeriesTolerance = 0.001;   // constexpr double kSeriesTolerance = 1e-18;
+constexpr double kSeriesTolerance = 0.0001;   // constexpr double kSeriesTolerance = 1e-18;
 constexpr int kMaxSeriesTerms = 3; // Maximum number of terms in the Taylor series (best 60)
 
 // exp(x) via range reduction x = k*ln2 + r with |r| <= ln2/2, then the Maclaurin
@@ -160,6 +168,8 @@ double Exp(double x) { return std::exp(x); }
 double Log(double x) { return std::log(x); }
 double Log1p(double x) { return std::log1p(x); }
 
+constexpr double SmallEpsilon = 1e-14;
+
 #endif  // USE_TAYLOR_MATH
 
 // Numerically stable logistic function 1 / (1 + exp(-eta)).
@@ -214,9 +224,13 @@ double ConditionalMode(const Group& group, const Vector& beta, double sigma2) {
       gradient += group.y[j] - p;  // Random-intercept design entry z = 1.
       curvature += p * (1.0 - p);
     }
-    const double step = gradient / curvature;  // Newton step (g'' = -curvature).
+    double step = gradient / curvature;  // Newton step (g'' = -curvature).
+    step = std::max(-kMaxNewtonStep, std::min(kMaxNewtonStep, step));
     u += step;
-    if (std::abs(step) < 1e-12) {
+    if (!std::isfinite(u)) {
+      break;  // Degenerate trial; caller rejects it via the finiteness guard.
+    }
+    if (std::abs(step) < SmallEpsilon) {
       break;
     }
   }
@@ -259,6 +273,11 @@ double NegMarginalLogLik(const Dataset& data, const Vector& params) {
   double total = 0.0;
   for (const Group& group : data.groups) {
     total += GroupLaplaceLogLik(group, beta, sigma2);
+  }
+  // Reject degenerate trial parameters (overflow / NaN) by reporting a value the
+  // minimizer will never accept, so the line search backtracks away from them.
+  if (!std::isfinite(total)) {
+    return std::numeric_limits<double>::infinity();
   }
   return -total;
 }
@@ -381,12 +400,18 @@ OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
         x_new[i] = x[i] + alpha * direction[i];
       }
       fx_new = f(x_new);
-      if (fx_new <= fx + c1 * alpha * directional_derivative) {
+      // Only accept a finite objective that meets the sufficient-decrease rule.
+      if (std::isfinite(fx_new) &&
+          fx_new <= fx + c1 * alpha * directional_derivative) {
         break;
       }
       alpha *= 0.5;
-      if (alpha < 1e-14) {
-        break;  // Line search stalled; accept the tiny step and stop below.
+      if (alpha < SmallEpsilon) {
+        // Line search stalled; reject the step and keep the current point rather
+        // than accepting a poisoned (non-finite or non-decreasing) trial.
+        x_new = x;
+        fx_new = fx;
+        break;
       }
     }
 
@@ -401,7 +426,7 @@ OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
     }
 
     const double curvature = Dot(step, gradient_delta);
-    if (curvature > 1e-12) {
+    if (curvature > SmallEpsilon) {
       h_inv = BfgsInverseUpdate(h_inv, step, gradient_delta, 1.0 / curvature);
     }
 
@@ -415,9 +440,9 @@ OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
         << "  |grad|=" << std::scientific << std::setprecision(3)
         << InfNorm(gradient) << "  alpha=" << alpha
         << "  |step|=" << InfNorm(step)
-        << "  d_obj=" << objective_change << '\n';
+        << "  d_obj=" << objective_change << std::endl;
 
-    if (InfNorm(step) < 1e-10 || objective_change < 1e-12) {
+    if (InfNorm(step) < SmallEpsilon || objective_change < SmallEpsilon) {
       result.converged = true;
       break;
     }
@@ -476,7 +501,7 @@ void PrintEstimate(const std::string& label, double estimate, double truth) {
 int main() {
   // Ground truth: intercept plus two covariates and a moderate random-intercept
   // standard deviation.
-  const Vector true_beta = {-0.5, 1.0, -0.75, 0.3};
+  const Vector true_beta = {-0.5, 1.0, -0.75, 0.3, -0.5, 1.0, -0.75, 0.3, -0.5, 1.0, -0.75, 0.3};
   const double true_sigma = 0.7;
   constexpr std::size_t num_groups = 300;
   constexpr std::size_t obs_per_group = 25;
