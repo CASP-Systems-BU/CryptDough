@@ -248,6 +248,7 @@ endfunction()
 ##################### EXECUTABLES ####################
 ######################################################
 file(GLOB EXE_EXAMPLES examples/*.cpp)
+file(GLOB EXE_PLAYGROUND playground/*.cpp)
 file(GLOB EXE_BENCH bench/*.cpp)
 file(GLOB EXE_MICRO bench/micro/*.cpp)
 file(GLOB EXE_ML bench/models/*.cpp)
@@ -260,7 +261,7 @@ file(GLOB SECRETFLOW_QUERIES bench/queries/secretflow/*.cpp)
 file(GLOB OTHER_QUERIES bench/queries/other/*.cpp)
 
 foreach (_target
-            ${EXE_EXAMPLES} ${EXE_MICRO} ${EXE_ML} ${EXE_TVA} ${EXE_MULTI_WORKLOAD} ${EXE_TESTS} ${EXE_BENCH})
+            ${EXE_EXAMPLES} ${EXE_MICRO} ${EXE_ML} ${EXE_TVA} ${EXE_MULTI_WORKLOAD} ${EXE_TESTS} ${EXE_BENCH} ${EXE_PLAYGROUND})
     configure_target(${_target})
 endforeach ()
 
