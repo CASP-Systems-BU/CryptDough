@@ -32,8 +32,9 @@
 
 namespace {
 
-using Vector = std::vector<double>;
-using Matrix = std::vector<std::vector<double>>;
+using Value = double;
+using Vector = std::vector<Value>;
+using Matrix = std::vector<std::vector<Value>>;
 
 // One cluster/group of observations sharing a common random intercept.
 struct Group {
@@ -50,7 +51,7 @@ struct Dataset {
 // Result of the outer quasi-Newton optimization.
 struct OptResult {
   Vector params;         // [beta_0..beta_{p-1}, s] with sigma = exp(s).
-  double value = 0.0;    // Final objective value (negative marginal log-lik).
+  Value value = 0.0;     // Final objective value (negative marginal log-lik).
   int iterations = 0;    // Number of BFGS iterations performed.
   bool converged = false;
 };
@@ -67,6 +68,7 @@ struct OptResult {
 // secure (MPC) port, where transcendental primitives are unavailable and must be
 // approximated by polynomial series.
 // ---------------------------------------------------------------------------
+#define USE_TAYLOR_MATH 0
 #ifndef USE_TAYLOR_MATH
 #define USE_TAYLOR_MATH 0
 #endif
@@ -76,39 +78,39 @@ struct OptResult {
 // 0; without a cap the undamped Newton step overshoots into overflow and then
 // oscillates. Capping keeps every iterate finite while leaving normal steps
 // (well under the cap) unaffected.
-constexpr double kMaxNewtonStep = 4.0;
+constexpr Value kMaxNewtonStep = 4.0;
 
 #if USE_TAYLOR_MATH
 
 // High-precision constants for the range-reduction steps.
-// constexpr double kLn2 = 0.6931471805599453094172321214582;
-// constexpr double kSqrt2 = 1.4142135623730950488016887242097;
-// constexpr double kSqrt1_2 = 0.7071067811865475244008443621048;
+// constexpr Value kLn2 = 0.6931471805599453094172321214582;
+// constexpr Value kSqrt2 = 1.4142135623730950488016887242097;
+// constexpr Value kSqrt1_2 = 0.7071067811865475244008443621048;
 
-constexpr double kLn2 = 0.693;
-constexpr double kSqrt2 = 1.414;
-constexpr double kSqrt1_2 = 0.707;
+constexpr Value kLn2 = 0.693;
+constexpr Value kSqrt2 = 1.414;
+constexpr Value kSqrt1_2 = 0.707;
 
-constexpr double SmallEpsilon = 0.0001;
+constexpr Value SmallEpsilon = 0.0001;
 
 // Number of significant terms is bounded because all series arguments are small
 // after range reduction; the loops break early on negligible terms.
-constexpr double kSeriesTolerance = 0.0001;   // constexpr double kSeriesTolerance = 1e-18;
+constexpr Value kSeriesTolerance = 0.0001;   // constexpr Value kSeriesTolerance = 1e-18;
 constexpr int kMaxSeriesTerms = 3; // Maximum number of terms in the Taylor series (best 60)
 
 // exp(x) via range reduction x = k*ln2 + r with |r| <= ln2/2, then the Maclaurin
 // series exp(r) = sum_{n>=0} r^n / n!, scaled by 2^k. The 2^k factor is built by
 // repeated doubling/halving (no libm, no std::round).
-double Exp(double x) {
-  const double quotient = x / kLn2;
+Value Exp(Value x) {
+  const Value quotient = x / kLn2;
   const long k =
       static_cast<long>(quotient >= 0.0 ? quotient + 0.5 : quotient - 0.5);
-  const double r = x - static_cast<double>(k) * kLn2;
+  const Value r = x - static_cast<Value>(k) * kLn2;
 
-  double term = 1.0;
-  double series = 1.0;
+  Value term = 1.0;
+  Value series = 1.0;
   for (int n = 1; n <= kMaxSeriesTerms; ++n) {
-    term *= r / static_cast<double>(n);
+    term *= r / static_cast<Value>(n);
     series += term;
     // TODO: measure effect of early termination on accuracy.
     // if (term < kSeriesTolerance && term > -kSeriesTolerance) {
@@ -116,7 +118,7 @@ double Exp(double x) {
     // }
   }
 
-  double scale = 1.0;
+  Value scale = 1.0;
   for (long i = 0; i < k; ++i) {
     scale *= 2.0;
   }
@@ -129,8 +131,12 @@ double Exp(double x) {
 // log(x) for x > 0 via reduction x = m * 2^e with m in [sqrt(1/2), sqrt(2)), then
 // log(m) = 2 * sum_{n odd} w^n / n with w = (m - 1) / (m + 1) (the Taylor series
 // of log). Centering m keeps |w| <= 0.172, so the series converges quickly.
-double Log(double x) {
-  double m = x;
+Value Log(Value x) {
+  if (!(x > 0.0) || !std::isfinite(x)) {
+    return std::numeric_limits<Value>::quiet_NaN();
+  }
+
+  Value m = x;
   long e = 0;
 
 // TODO: measure effect on accuracy of the range reduction.
@@ -143,12 +149,12 @@ double Log(double x) {
     e -= 1;
   }
 
-  const double w = (m - 1.0) / (m + 1.0);
-  const double w_squared = w * w;
-  double power = w;  // Holds w^(2i+1) across iterations.
-  double series = 0.0;
+  const Value w = (m - 1.0) / (m + 1.0);
+  const Value w_squared = w * w;
+  Value power = w;  // Holds w^(2i+1) across iterations.
+  Value series = 0.0;
   for (int i = 0; i < kMaxSeriesTerms; ++i) {
-    const double increment = power / static_cast<double>(2 * i + 1);
+    const Value increment = power / static_cast<Value>(2 * i + 1);
     series += increment;
     // TODO: measure effect of early termination on accuracy.
     // if (increment < kSeriesTolerance && increment > -kSeriesTolerance) {
@@ -156,34 +162,40 @@ double Log(double x) {
     // }
     power *= w_squared;
   }
-  return static_cast<double>(e) * kLn2 + 2.0 * series;
+  return static_cast<Value>(e) * kLn2 + 2.0 * series;
 }
 
 // log(1 + x) routed through Log for accuracy over the (0, 1] range used here.
-double Log1p(double x) { return Log(1.0 + x); }
+Value Log1p(Value x) { return Log(1.0 + x); }
 
 #else  // USE_TAYLOR_MATH
 
-double Exp(double x) { return std::exp(x); }
-double Log(double x) { return std::log(x); }
-double Log1p(double x) { return std::log1p(x); }
+Value Exp(Value x) { return std::exp(x); }
+Value Log(Value x) { return std::log(x); }
+Value Log1p(Value x) { return std::log1p(x); }
 
-constexpr double SmallEpsilon = 1e-14;
+const Value SmallEpsilon = static_cast<Value>(
+    std::sqrt(std::numeric_limits<Value>::epsilon()));
 
 #endif  // USE_TAYLOR_MATH
 
+const Value kNumericalGradientStep = static_cast<Value>(
+    std::cbrt(std::numeric_limits<Value>::epsilon()));
+const Value kGradientTolerance = static_cast<Value>(
+  10.0 * std::sqrt(std::numeric_limits<Value>::epsilon()));
+
 // Numerically stable logistic function 1 / (1 + exp(-eta)).
-double Sigmoid(double eta) {
+Value Sigmoid(Value eta) {
   if (eta >= 0.0) {
-    const double z = Exp(-eta);
+    const Value z = Exp(-eta);
     return 1.0 / (1.0 + z);
   }
-  const double z = Exp(eta);
+  const Value z = Exp(eta);
   return z / (1.0 + z);
 }
 
 // Numerically stable log(1 + exp(eta)) (the "softplus" function).
-double LogOnePlusExp(double eta) {
+Value LogOnePlusExp(Value eta) {
   if (eta > 0.0) {
     return eta + Log1p(Exp(-eta));
   }
@@ -191,9 +203,9 @@ double LogOnePlusExp(double eta) {
 }
 
 // Standard dot product of two equal-length vectors.
-double Dot(const Vector& a, const Vector& b) {
+Value Dot(const Vector& a, const Vector& b) {
   assert(a.size() == b.size());
-  double sum = 0.0;
+  Value sum = 0.0;
   for (std::size_t i = 0; i < a.size(); ++i) {
     sum += a[i] * b[i];
   }
@@ -201,9 +213,9 @@ double Dot(const Vector& a, const Vector& b) {
 }
 
 // Infinity norm (maximum absolute component) of a vector.
-double InfNorm(const Vector& v) {
-  double norm = 0.0;
-  for (const double value : v) {
+Value InfNorm(const Vector& v) {
+  Value norm = 0.0;
+  for (const Value value : v) {
     norm = std::max(norm, std::abs(value));
   }
   return norm;
@@ -212,19 +224,19 @@ double InfNorm(const Vector& v) {
 // Finds the conditional mode u_hat = argmax_u g_i(u) for one group, given the
 // fixed effects `beta` and variance `sigma2`. The objective g_i is strictly
 // concave in u, so a damped Newton iteration converges reliably.
-double ConditionalMode(const Group& group, const Vector& beta, double sigma2) {
-  const double inv_sigma2 = 1.0 / sigma2;
-  double u = 0.0;
+Value ConditionalMode(const Group& group, const Vector& beta, Value sigma2) {
+  const Value inv_sigma2 = 1.0 / sigma2;
+  Value u = 0.0;
   for (int iteration = 0; iteration < 100; ++iteration) {
-    double gradient = -u * inv_sigma2;  // Derivative of the Gaussian prior term.
-    double curvature = inv_sigma2;      // A = -g''(u), always positive.
+    Value gradient = -u * inv_sigma2;  // Derivative of the Gaussian prior term.
+    Value curvature = inv_sigma2;      // A = -g''(u), always positive.
     for (std::size_t j = 0; j < group.y.size(); ++j) {
-      const double eta = Dot(group.x[j], beta) + u;
-      const double p = Sigmoid(eta);
+      const Value eta = Dot(group.x[j], beta) + u;
+      const Value p = Sigmoid(eta);
       gradient += group.y[j] - p;  // Random-intercept design entry z = 1.
       curvature += p * (1.0 - p);
     }
-    double step = gradient / curvature;  // Newton step (g'' = -curvature).
+    Value step = gradient / curvature;  // Newton step (g'' = -curvature).
     step = std::max(-kMaxNewtonStep, std::min(kMaxNewtonStep, step));
     u += step;
     if (!std::isfinite(u)) {
@@ -238,15 +250,15 @@ double ConditionalMode(const Group& group, const Vector& beta, double sigma2) {
 }
 
 // Laplace-approximated marginal log-likelihood contribution of a single group.
-double GroupLaplaceLogLik(const Group& group, const Vector& beta, double sigma2) {
-  const double inv_sigma2 = 1.0 / sigma2;
-  const double u_hat = ConditionalMode(group, beta, sigma2);
+Value GroupLaplaceLogLik(const Group& group, const Vector& beta, Value sigma2) {
+  const Value inv_sigma2 = 1.0 / sigma2;
+  const Value u_hat = ConditionalMode(group, beta, sigma2);
 
-  double conditional_log_lik = 0.0;
-  double curvature = inv_sigma2;  // A_i evaluated at the mode.
+  Value conditional_log_lik = 0.0;
+  Value curvature = inv_sigma2;  // A_i evaluated at the mode.
   for (std::size_t j = 0; j < group.y.size(); ++j) {
-    const double eta = Dot(group.x[j], beta) + u_hat;
-    const double p = Sigmoid(eta);
+    const Value eta = Dot(group.x[j], beta) + u_hat;
+    const Value p = Sigmoid(eta);
     conditional_log_lik += group.y[j] * eta - LogOnePlusExp(eta);
     curvature += p * (1.0 - p);
   }
@@ -258,41 +270,41 @@ double GroupLaplaceLogLik(const Group& group, const Vector& beta, double sigma2)
 // Splits a packed parameter vector [beta..., s] into `beta` and sigma^2, where
 // the variance is parameterized as sigma = exp(s) to keep it strictly positive.
 void UnpackParameters(const Vector& params, std::size_t num_fixed, Vector& beta,
-                      double& sigma2) {
+                      Value& sigma2) {
   beta.assign(params.begin(), params.begin() + num_fixed);
-  const double s = params[num_fixed];
+  const Value s = params[num_fixed];
   sigma2 = Exp(2.0 * s);
 }
 
 // Negative marginal log-likelihood over the whole dataset (the BFGS objective).
-double NegMarginalLogLik(const Dataset& data, const Vector& params) {
+Value NegMarginalLogLik(const Dataset& data, const Vector& params) {
   Vector beta;
-  double sigma2 = 0.0;
+  Value sigma2 = 0.0;
   UnpackParameters(params, data.num_fixed, beta, sigma2);
 
-  double total = 0.0;
+  Value total = 0.0;
   for (const Group& group : data.groups) {
     total += GroupLaplaceLogLik(group, beta, sigma2);
   }
   // Reject degenerate trial parameters (overflow / NaN) by reporting a value the
   // minimizer will never accept, so the line search backtracks away from them.
   if (!std::isfinite(total)) {
-    return std::numeric_limits<double>::infinity();
+    return std::numeric_limits<Value>::infinity();
   }
   return -total;
 }
 
 // Central finite-difference gradient of a scalar objective `f` at `x`.
-Vector NumericalGradient(const std::function<double(const Vector&)>& f,
+Vector NumericalGradient(const std::function<Value(const Vector&)>& f,
                          const Vector& x) {
   Vector gradient(x.size(), 0.0);
   Vector perturbed = x;
   for (std::size_t k = 0; k < x.size(); ++k) {
-    const double h = 1e-5 * (1.0 + std::abs(x[k]));
+    const Value h = kNumericalGradientStep * (1.0 + std::abs(x[k]));
     perturbed[k] = x[k] + h;
-    const double f_plus = f(perturbed);
+    const Value f_plus = f(perturbed);
     perturbed[k] = x[k] - h;
-    const double f_minus = f(perturbed);
+    const Value f_minus = f(perturbed);
     perturbed[k] = x[k];
     gradient[k] = (f_plus - f_minus) / (2.0 * h);
   }
@@ -320,7 +332,7 @@ Vector MatVec(const Matrix& m, const Vector& v) {
 // BFGS update of the inverse-Hessian approximation:
 //   H+ = (I - rho s y^T) H (I - rho y s^T) + rho s s^T,   rho = 1 / (y^T s).
 Matrix BfgsInverseUpdate(const Matrix& h_inv, const Vector& s, const Vector& y,
-                         double rho) {
+                         Value rho) {
   const std::size_t n = s.size();
   Matrix left = Identity(n);
   for (std::size_t i = 0; i < n; ++i) {
@@ -333,7 +345,7 @@ Matrix BfgsInverseUpdate(const Matrix& h_inv, const Vector& s, const Vector& y,
   Matrix temp(n, Vector(n, 0.0));
   for (std::size_t i = 0; i < n; ++i) {
     for (std::size_t j = 0; j < n; ++j) {
-      double sum = 0.0;
+      Value sum = 0.0;
       for (std::size_t k = 0; k < n; ++k) {
         sum += left[i][k] * h_inv[k][j];
       }
@@ -345,7 +357,7 @@ Matrix BfgsInverseUpdate(const Matrix& h_inv, const Vector& s, const Vector& y,
   Matrix updated(n, Vector(n, 0.0));
   for (std::size_t i = 0; i < n; ++i) {
     for (std::size_t j = 0; j < n; ++j) {
-      double sum = 0.0;
+      Value sum = 0.0;
       for (std::size_t k = 0; k < n; ++k) {
         sum += temp[i][k] * left[j][k];  // left^T[k][j] == left[j][k]
       }
@@ -357,12 +369,12 @@ Matrix BfgsInverseUpdate(const Matrix& h_inv, const Vector& s, const Vector& y,
 
 // Minimizes `f` starting from `x0` using BFGS with a backtracking (Armijo) line
 // search and numerical gradients.
-OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
+OptResult MinimizeBFGS(const std::function<Value(const Vector&)>& f,
                        const Vector& x0, int max_iterations = 300,
-                       double gradient_tol = 1e-6) {
+             Value gradient_tol = kGradientTolerance) {
   const std::size_t n = x0.size();
   Vector x = x0;
-  double fx = f(x);
+  Value fx = f(x);
   Vector gradient = NumericalGradient(f, x);
   Matrix h_inv = Identity(n);
 
@@ -377,24 +389,24 @@ OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
     // Search direction d = -H_inv * gradient; fall back to steepest descent if
     // it is not a descent direction.
     Vector direction = MatVec(h_inv, gradient);
-    for (double& component : direction) {
+    for (Value& component : direction) {
       component = -component;
     }
-    double directional_derivative = Dot(gradient, direction);
+    Value directional_derivative = Dot(gradient, direction);
     if (directional_derivative >= 0.0) {
       h_inv = Identity(n);
       direction = gradient;
-      for (double& component : direction) {
+      for (Value& component : direction) {
         component = -component;
       }
       directional_derivative = Dot(gradient, direction);
     }
 
     // Backtracking line search satisfying the Armijo sufficient-decrease rule.
-    constexpr double c1 = 1e-4;
-    double alpha = 1.0;
+    constexpr Value c1 = 1e-4;
+    Value alpha = 1.0;
     Vector x_new(n);
-    double fx_new = 0.0;
+    Value fx_new = 0.0;
     while (true) {
       for (std::size_t i = 0; i < n; ++i) {
         x_new[i] = x[i] + alpha * direction[i];
@@ -425,14 +437,14 @@ OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
       gradient_delta[i] = gradient_new[i] - gradient[i];
     }
 
-    const double curvature = Dot(step, gradient_delta);
+    const Value curvature = Dot(step, gradient_delta);
     if (curvature > SmallEpsilon) {
       h_inv = BfgsInverseUpdate(h_inv, step, gradient_delta, 1.0 / curvature);
     }
 
     x = x_new;
     gradient = gradient_new;
-    const double objective_change = std::abs(fx - fx_new);
+    const Value objective_change = std::abs(fx - fx_new);
     fx = fx_new;
 
     std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
@@ -442,7 +454,9 @@ OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
         << "  |step|=" << InfNorm(step)
         << "  d_obj=" << objective_change << std::endl;
 
-    if (InfNorm(step) < SmallEpsilon || objective_change < SmallEpsilon) {
+    const bool precision_limited = InfNorm(step) == 0.0 && objective_change == 0.0;
+    if ((InfNorm(step) < SmallEpsilon && InfNorm(gradient) < gradient_tol) ||
+        precision_limited) {
       result.converged = true;
       break;
     }
@@ -456,12 +470,12 @@ OptResult MinimizeBFGS(const std::function<double(const Vector&)>& f,
 // Generates a synthetic random-intercept logistic dataset with a known ground
 // truth so that the recovered estimates can be validated.
 Dataset GenerateSyntheticData(std::size_t num_groups, std::size_t obs_per_group,
-                              const Vector& true_beta, double true_sigma,
+                              const Vector& true_beta, Value true_sigma,
                               unsigned int seed) {
   std::mt19937 rng(seed);
-  std::normal_distribution<double> covariate_dist(0.0, 1.0);
-  std::normal_distribution<double> random_effect_dist(0.0, true_sigma);
-  std::uniform_real_distribution<double> uniform_dist(0.0, 1.0);
+  std::normal_distribution<Value> covariate_dist(0.0, 1.0);
+  std::normal_distribution<Value> random_effect_dist(0.0, true_sigma);
+  std::uniform_real_distribution<Value> uniform_dist(0.0, 1.0);
 
   const std::size_t num_fixed = true_beta.size();
   Dataset data;
@@ -472,15 +486,15 @@ Dataset GenerateSyntheticData(std::size_t num_groups, std::size_t obs_per_group,
     Group group;
     group.x.reserve(obs_per_group);
     group.y.reserve(obs_per_group);
-    const double u = random_effect_dist(rng);
+    const Value u = random_effect_dist(rng);
     for (std::size_t j = 0; j < obs_per_group; ++j) {
       Vector row(num_fixed, 0.0);
       row[0] = 1.0;  // Intercept column.
       for (std::size_t k = 1; k < num_fixed; ++k) {
         row[k] = covariate_dist(rng);
       }
-      const double eta = Dot(row, true_beta) + u;
-      const double p = Sigmoid(eta);
+      const Value eta = Dot(row, true_beta) + u;
+      const Value p = Sigmoid(eta);
       group.x.push_back(std::move(row));
       group.y.push_back(uniform_dist(rng) < p ? 1.0 : 0.0);
     }
@@ -490,7 +504,7 @@ Dataset GenerateSyntheticData(std::size_t num_groups, std::size_t obs_per_group,
 }
 
 // Prints a labeled fixed-effect estimate alongside its true value.
-void PrintEstimate(const std::string& label, double estimate, double truth) {
+void PrintEstimate(const std::string& label, Value estimate, Value truth) {
   std::cout << "  " << std::left << std::setw(12) << label << std::right
             << std::setw(12) << std::fixed << std::setprecision(4) << estimate
             << std::setw(12) << truth << '\n';
@@ -502,7 +516,7 @@ int main() {
   // Ground truth: intercept plus two covariates and a moderate random-intercept
   // standard deviation.
   const Vector true_beta = {-0.5, 1.0, -0.75, 0.3, -0.5, 1.0, -0.75, 0.3, -0.5, 1.0, -0.75, 0.3};
-  const double true_sigma = 0.7;
+  const Value true_sigma = 0.7;
   constexpr std::size_t num_groups = 300;
   constexpr std::size_t obs_per_group = 25;
   constexpr unsigned int seed = 20260730u;
@@ -517,7 +531,7 @@ int main() {
 
   // Objective: negative Laplace marginal log-likelihood as a function of the
   // packed parameter vector [beta_0, beta_1, beta_2, s] with sigma = exp(s).
-  const std::function<double(const Vector&)> objective =
+  const std::function<Value(const Vector&)> objective =
       [&data](const Vector& params) { return NegMarginalLogLik(data, params); };
 
   // Start fixed effects at 0 and sigma at 1 (s = 0).
@@ -525,10 +539,10 @@ int main() {
   const OptResult fit = MinimizeBFGS(objective, initial_params);
 
   Vector beta_hat;
-  double sigma2_hat = 0.0;
+  Value sigma2_hat = 0.0;
   UnpackParameters(fit.params, data.num_fixed, beta_hat, sigma2_hat);
-  const double sigma_hat = std::sqrt(sigma2_hat);
-  const double final_log_lik = -fit.value;
+  const Value sigma_hat = std::sqrt(sigma2_hat);
+  const Value final_log_lik = -fit.value;
 
   std::cout << "Converged: " << (fit.converged ? "yes" : "no")
             << " in " << fit.iterations << " iterations\n";
