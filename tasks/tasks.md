@@ -6,3 +6,5 @@ Short list of all tasks so far.
 - 0002 — Taylor-series approximations for exp/log/log1p with compile-time toggle — Status: Done — [tasks/0002_taylor-series-math-approximations.md](0002_taylor-series-math-approximations.md)
 - 0003 — Robust conditional-mode Newton + BFGS line search (fix inner-Newton overflow/NaN) — Status: Done — [tasks/0003_robust-conditional-mode-and-line-search.md](0003_robust-conditional-mode-and-line-search.md)
 - 0004 — Factor out logistic-regression value type — Status: Done — [tasks/0004_factor-out-logistic-regression-value-type.md](0004_factor-out-logistic-regression-value-type.md)
+- 0005 — Add a simulated fixed-precision value type — Status: Done — [tasks/0005_simulated-float-value-type.md](0005_simulated-float-value-type.md)
+- 0006 — Make Taylor math compatible with SimulatedFloat — Status: Done — [tasks/0006_simulated-float-taylor-math.md](0006_simulated-float-taylor-math.md)

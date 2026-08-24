@@ -28,13 +28,74 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
+
+#include "simulated_float.h"
+
+#define USE_SIMULATED_FLOAT_VALUE 1
 
 namespace {
 
+#if defined(USE_SIMULATED_FLOAT_VALUE)
+using Value = cdough::SimulatedFloat;
+#elif defined(USE_FLOAT_VALUE)
+using Value = float;
+#else
 using Value = double;
+#endif
 using Vector = std::vector<Value>;
 using Matrix = std::vector<std::vector<Value>>;
+
+template <typename Numeric>
+Value FromDouble(Numeric value) {
+  return Value(static_cast<double>(value));
+}
+
+double ToDouble(Value value) { return static_cast<double>(value); }
+
+Value Abs(Value value) { return FromDouble(std::abs(ToDouble(value))); }
+
+Value Sqrt(Value value) { return FromDouble(std::sqrt(ToDouble(value))); }
+
+Value Cbrt(Value value) { return FromDouble(std::cbrt(ToDouble(value))); }
+
+bool IsFinite(Value value) { return std::isfinite(ToDouble(value)); }
+
+template <typename Numeric>
+Numeric NumericEpsilon() {
+  return std::numeric_limits<Numeric>::epsilon();
+}
+
+template <>
+[[maybe_unused]]
+cdough::SimulatedFloat NumericEpsilon<cdough::SimulatedFloat>() {
+  return cdough::SimulatedFloat(1,
+                                cdough::SimulatedFloat::kDefaultPrecision);
+}
+
+template <typename Numeric>
+[[maybe_unused]]
+Numeric InvalidValue() {
+  return std::numeric_limits<Numeric>::quiet_NaN();
+}
+
+template <>
+[[maybe_unused]]
+cdough::SimulatedFloat InvalidValue<cdough::SimulatedFloat>() {
+  return cdough::SimulatedFloat(std::numeric_limits<std::int64_t>::min(), 0);
+}
+
+template <typename Numeric>
+Numeric RejectedObjective() {
+  return std::numeric_limits<Numeric>::infinity();
+}
+
+template <>
+[[maybe_unused]]
+cdough::SimulatedFloat RejectedObjective<cdough::SimulatedFloat>() {
+  return cdough::SimulatedFloat(std::numeric_limits<std::int64_t>::max(), 0);
+}
 
 // One cluster/group of observations sharing a common random intercept.
 struct Group {
@@ -68,7 +129,7 @@ struct OptResult {
 // secure (MPC) port, where transcendental primitives are unavailable and must be
 // approximated by polynomial series.
 // ---------------------------------------------------------------------------
-#define USE_TAYLOR_MATH 0
+#define USE_TAYLOR_MATH 1
 #ifndef USE_TAYLOR_MATH
 #define USE_TAYLOR_MATH 0
 #endif
@@ -78,7 +139,7 @@ struct OptResult {
 // 0; without a cap the undamped Newton step overshoots into overflow and then
 // oscillates. Capping keeps every iterate finite while leaving normal steps
 // (well under the cap) unaffected.
-constexpr Value kMaxNewtonStep = 4.0;
+const Value kMaxNewtonStep = 4.0;
 
 #if USE_TAYLOR_MATH
 
@@ -87,15 +148,15 @@ constexpr Value kMaxNewtonStep = 4.0;
 // constexpr Value kSqrt2 = 1.4142135623730950488016887242097;
 // constexpr Value kSqrt1_2 = 0.7071067811865475244008443621048;
 
-constexpr Value kLn2 = 0.693;
-constexpr Value kSqrt2 = 1.414;
-constexpr Value kSqrt1_2 = 0.707;
+const Value kLn2 = 0.6931;
+const Value kSqrt2 = 1.4142;
+const Value kSqrt1_2 = 0.7071;
 
-constexpr Value SmallEpsilon = 0.0001;
+const Value SmallEpsilon = 0.0001;
 
 // Number of significant terms is bounded because all series arguments are small
 // after range reduction; the loops break early on negligible terms.
-constexpr Value kSeriesTolerance = 0.0001;   // constexpr Value kSeriesTolerance = 1e-18;
+const Value kSeriesTolerance = 0.0001;   // constexpr Value kSeriesTolerance = 1e-18;
 constexpr int kMaxSeriesTerms = 3; // Maximum number of terms in the Taylor series (best 60)
 
 // exp(x) via range reduction x = k*ln2 + r with |r| <= ln2/2, then the Maclaurin
@@ -103,8 +164,10 @@ constexpr int kMaxSeriesTerms = 3; // Maximum number of terms in the Taylor seri
 // repeated doubling/halving (no libm, no std::round).
 Value Exp(Value x) {
   const Value quotient = x / kLn2;
+  const double quotient_value = ToDouble(quotient);
   const long k =
-      static_cast<long>(quotient >= 0.0 ? quotient + 0.5 : quotient - 0.5);
+      static_cast<long>(quotient_value >= 0.0 ? quotient_value + 0.5
+                                              : quotient_value - 0.5);
   const Value r = x - static_cast<Value>(k) * kLn2;
 
   Value term = 1.0;
@@ -132,8 +195,8 @@ Value Exp(Value x) {
 // log(m) = 2 * sum_{n odd} w^n / n with w = (m - 1) / (m + 1) (the Taylor series
 // of log). Centering m keeps |w| <= 0.172, so the series converges quickly.
 Value Log(Value x) {
-  if (!(x > 0.0) || !std::isfinite(x)) {
-    return std::numeric_limits<Value>::quiet_NaN();
+  if (!(x > 0.0) || !IsFinite(x)) {
+    return InvalidValue<Value>();
   }
 
   Value m = x;
@@ -170,19 +233,19 @@ Value Log1p(Value x) { return Log(1.0 + x); }
 
 #else  // USE_TAYLOR_MATH
 
-Value Exp(Value x) { return std::exp(x); }
-Value Log(Value x) { return std::log(x); }
-Value Log1p(Value x) { return std::log1p(x); }
+Value Exp(Value x) { return FromDouble(std::exp(ToDouble(x))); }
+Value Log(Value x) { return FromDouble(std::log(ToDouble(x))); }
+Value Log1p(Value x) { return FromDouble(std::log1p(ToDouble(x))); }
 
 const Value SmallEpsilon = static_cast<Value>(
-    std::sqrt(std::numeric_limits<Value>::epsilon()));
+  Sqrt(NumericEpsilon<Value>()));
 
 #endif  // USE_TAYLOR_MATH
 
 const Value kNumericalGradientStep = static_cast<Value>(
-    std::cbrt(std::numeric_limits<Value>::epsilon()));
+    Cbrt(NumericEpsilon<Value>()));
 const Value kGradientTolerance = static_cast<Value>(
-  10.0 * std::sqrt(std::numeric_limits<Value>::epsilon()));
+  10.0 * Sqrt(NumericEpsilon<Value>()));
 
 // Numerically stable logistic function 1 / (1 + exp(-eta)).
 Value Sigmoid(Value eta) {
@@ -216,7 +279,7 @@ Value Dot(const Vector& a, const Vector& b) {
 Value InfNorm(const Vector& v) {
   Value norm = 0.0;
   for (const Value value : v) {
-    norm = std::max(norm, std::abs(value));
+    norm = std::max(norm, Abs(value));
   }
   return norm;
 }
@@ -239,10 +302,10 @@ Value ConditionalMode(const Group& group, const Vector& beta, Value sigma2) {
     Value step = gradient / curvature;  // Newton step (g'' = -curvature).
     step = std::max(-kMaxNewtonStep, std::min(kMaxNewtonStep, step));
     u += step;
-    if (!std::isfinite(u)) {
+    if (!IsFinite(u)) {
       break;  // Degenerate trial; caller rejects it via the finiteness guard.
     }
-    if (std::abs(step) < SmallEpsilon) {
+    if (Abs(step) < SmallEpsilon) {
       break;
     }
   }
@@ -288,8 +351,8 @@ Value NegMarginalLogLik(const Dataset& data, const Vector& params) {
   }
   // Reject degenerate trial parameters (overflow / NaN) by reporting a value the
   // minimizer will never accept, so the line search backtracks away from them.
-  if (!std::isfinite(total)) {
-    return std::numeric_limits<Value>::infinity();
+  if (!IsFinite(total)) {
+    return RejectedObjective<Value>();
   }
   return -total;
 }
@@ -300,7 +363,7 @@ Vector NumericalGradient(const std::function<Value(const Vector&)>& f,
   Vector gradient(x.size(), 0.0);
   Vector perturbed = x;
   for (std::size_t k = 0; k < x.size(); ++k) {
-    const Value h = kNumericalGradientStep * (1.0 + std::abs(x[k]));
+    const Value h = kNumericalGradientStep * (1.0 + Abs(x[k]));
     perturbed[k] = x[k] + h;
     const Value f_plus = f(perturbed);
     perturbed[k] = x[k] - h;
@@ -403,7 +466,7 @@ OptResult MinimizeBFGS(const std::function<Value(const Vector&)>& f,
     }
 
     // Backtracking line search satisfying the Armijo sufficient-decrease rule.
-    constexpr Value c1 = 1e-4;
+    const Value c1 = 1e-4;
     Value alpha = 1.0;
     Vector x_new(n);
     Value fx_new = 0.0;
@@ -413,12 +476,12 @@ OptResult MinimizeBFGS(const std::function<Value(const Vector&)>& f,
       }
       fx_new = f(x_new);
       // Only accept a finite objective that meets the sufficient-decrease rule.
-      if (std::isfinite(fx_new) &&
+      if (IsFinite(fx_new) &&
           fx_new <= fx + c1 * alpha * directional_derivative) {
         break;
       }
       alpha *= 0.5;
-      if (alpha < SmallEpsilon) {
+      if (alpha < NumericEpsilon<Value>()) {
         // Line search stalled; reject the step and keep the current point rather
         // than accepting a poisoned (non-finite or non-decreasing) trial.
         x_new = x;
@@ -444,7 +507,7 @@ OptResult MinimizeBFGS(const std::function<Value(const Vector&)>& f,
 
     x = x_new;
     gradient = gradient_new;
-    const Value objective_change = std::abs(fx - fx_new);
+    const Value objective_change = Abs(fx - fx_new);
     fx = fx_new;
 
     std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
@@ -473,9 +536,10 @@ Dataset GenerateSyntheticData(std::size_t num_groups, std::size_t obs_per_group,
                               const Vector& true_beta, Value true_sigma,
                               unsigned int seed) {
   std::mt19937 rng(seed);
-  std::normal_distribution<Value> covariate_dist(0.0, 1.0);
-  std::normal_distribution<Value> random_effect_dist(0.0, true_sigma);
-  std::uniform_real_distribution<Value> uniform_dist(0.0, 1.0);
+  std::normal_distribution<double> covariate_dist(0.0, 1.0);
+  std::normal_distribution<double> random_effect_dist(0.0,
+                                                       ToDouble(true_sigma));
+  std::uniform_real_distribution<double> uniform_dist(0.0, 1.0);
 
   const std::size_t num_fixed = true_beta.size();
   Dataset data;
@@ -486,17 +550,17 @@ Dataset GenerateSyntheticData(std::size_t num_groups, std::size_t obs_per_group,
     Group group;
     group.x.reserve(obs_per_group);
     group.y.reserve(obs_per_group);
-    const Value u = random_effect_dist(rng);
+    const Value u = FromDouble(random_effect_dist(rng));
     for (std::size_t j = 0; j < obs_per_group; ++j) {
       Vector row(num_fixed, 0.0);
       row[0] = 1.0;  // Intercept column.
       for (std::size_t k = 1; k < num_fixed; ++k) {
-        row[k] = covariate_dist(rng);
+        row[k] = FromDouble(covariate_dist(rng));
       }
       const Value eta = Dot(row, true_beta) + u;
       const Value p = Sigmoid(eta);
       group.x.push_back(std::move(row));
-      group.y.push_back(uniform_dist(rng) < p ? 1.0 : 0.0);
+      group.y.push_back(uniform_dist(rng) < ToDouble(p) ? 1.0 : 0.0);
     }
     data.groups.push_back(std::move(group));
   }
@@ -541,7 +605,7 @@ int main() {
   Vector beta_hat;
   Value sigma2_hat = 0.0;
   UnpackParameters(fit.params, data.num_fixed, beta_hat, sigma2_hat);
-  const Value sigma_hat = std::sqrt(sigma2_hat);
+  const Value sigma_hat = Sqrt(sigma2_hat);
   const Value final_log_lik = -fit.value;
 
   std::cout << "Converged: " << (fit.converged ? "yes" : "no")
@@ -561,10 +625,9 @@ int main() {
   // land close to the ground truth.
   assert(fit.converged && "BFGS optimization failed to converge");
   for (std::size_t k = 0; k < data.num_fixed; ++k) {
-    assert(std::abs(beta_hat[k] - true_beta[k]) < 0.25);
+    assert(Abs(beta_hat[k] - true_beta[k]) < 0.25);
   }
-  assert(std::abs(sigma_hat - true_sigma) < 0.25);
-  assert(std::abs(sigma_hat - true_sigma) < 0.25);
+  assert(Abs(sigma_hat - true_sigma) < 0.25);
 
   return 0;
 }
