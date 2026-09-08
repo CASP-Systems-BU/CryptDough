@@ -143,8 +143,8 @@ public:
         std::vector<BSharedVector> result;
         for (auto& r : res) {
             result.push_back(BSharedVector(r, this->engine));
+            result.back().setPrecision(this->getPrecision());
         }
-        result->setPrecision(this->getPrecision());
         return result;
     }
 
