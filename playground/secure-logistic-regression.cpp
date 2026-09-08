@@ -94,6 +94,111 @@ AV Exp (const AV& x) {
     return result;
 }
 
+// Requires positive numbers.
+AV Log(AV x) {
+    AV x_(x.size(), x.engine);
+    x_ = x;
+    x_.setPrecision(0);
+
+    AV m(x.size(), x.engine);
+    m = x;
+    AV e(x.size(), x.engine); // e starts at 0
+
+    // Range reduction: we want m in [sqrt(1/2), sqrt(2)) ~ [0.7071, 1.4142]
+    // 1. High steps: while m >= sqrt(2) * 2^step, divide m by 2^step, e += step
+    // Using powers of 2 for step = 8, 4, 2, 1
+    const int steps[] = {8, 4, 2, 1};
+    for (int step : steps) {
+        DataType threshold = static_cast<DataType>(kSqrt2 * (1 << step) * scale);
+        // cond = (m - threshold) >= 0
+        AV diff = m - threshold;
+        AV cond_a = diff.gtez(); // 1 if m >= threshold, 0 otherwise
+
+        // If cond_a == 1, m = m / (2^step) => m_new = m - cond_a * (m - m / 2^step)
+        // Or m_diff = m - m / (1 << step) = m * (1 - 1/(2^step))
+        AV m_reduced = *(m / (DataType(1) << step));
+        AV m_delta = m - m_reduced;
+        m -= *(cond_a * m_delta);
+
+        // e += cond_a * step
+        e += *(cond_a * static_cast<DataType>(step));
+    }
+
+    // Single step check for m >= sqrt(2)
+    {
+        AV diff = m - kSqrt2_scaled;
+        AV cond_a = diff.gtez();
+        AV m_reduced = *(m / DataType(2));
+        AV m_delta = m - m_reduced;
+        m -= *(cond_a * m_delta);
+        e += *(cond_a * static_cast<DataType>(1));
+    }
+
+    // 2. Low steps: while m < sqrt(1/2) / 2^step, multiply m by 2^step, e -= step
+    for (int step : steps) {
+        // threshold = (kSqrt1_2 / 2^step) * scale
+        DataType threshold = static_cast<DataType>((kSqrt1_2 / (1 << step)) * scale);
+        // cond: m < threshold <=> -(m - (threshold - 1)) >= 0 <=> (m - (threshold - 1)) < 0
+        // Or AV neg_m = -m; neg_m + (threshold - 1)
+        AV diff = -m;
+        diff += (threshold - 1);
+        AV cond_a = diff.gtez(); // 1 if m < threshold, 0 otherwise
+
+        AV m_scaled = *(m * (DataType(1) << step));
+        AV m_delta = m_scaled - m;
+        m += *(cond_a * m_delta);
+
+        e -= *(cond_a * static_cast<DataType>(step));
+    }
+
+    // Single step check for m < sqrt(1/2)
+    {
+        AV diff = -m;
+        diff += (kSqrt1_2_scaled - 1);
+        AV cond_a = diff.gtez();
+        AV m_scaled = *(m * DataType(2));
+        AV m_delta = m_scaled - m;
+        m += *(cond_a * m_delta);
+        e -= *(cond_a * static_cast<DataType>(1));
+    }
+
+    // Now m in [sqrt(1/2), sqrt(2)]
+    // Compute w = (m - 1) / (m + 1)
+    // Numerator: (m - 1.0) scaled by scale => m - scale
+    // Denominator: (m + 1.0) scaled by scale => m + scale
+    // To maintain fixed-point precision in w = num / den, we scale num by 2^precision:
+    // num_fixed = (m - scale) << precision
+    // w_b = num_fixed_b / den_b
+    AV num = m - scale;
+    AV den = m + scale;
+
+    auto num_b = (*(num * scale)).a2b();
+    auto den_b = den.a2b();
+
+    auto w_b = (*num_b) / (*den_b);
+    AV w = *(w_b->b2a());
+    w.setPrecision(0);
+
+    // Compute series: 2 * (w + w^3/3 + w^5/5)
+    AV w_squared = (*(w * w)) / scale;
+    AV power = w;
+    AV series(x.size(), x.engine);
+
+    for (int i = 0; i < kMaxSeriesTerms; ++i) {
+        DataType divisor = 2 * i + 1;
+        AV term = *(power / divisor);
+        series += term;
+        power = (*(power * w_squared)) / scale;
+    }
+
+    AV log_m = *(series * DataType(2));
+    AV e_ln2 = (*(e * kLn2_scaled));
+
+    AV result = e_ln2 + log_m;
+    result.setPrecision(precision);
+    return result;
+}
+
 
 int main(int argc, char** argv) {
     EngineRef engine = cdough_init(argc, argv);
@@ -130,6 +235,35 @@ int main(int argc, char** argv) {
             double actual = static_cast<double>(opened_exp[i]) / scale;
             double error = std::abs(expected - actual);
             std::cout << std::left << std::setw(10) << test_inputs[i]
+                      << std::setw(16) << expected
+                      << std::setw(16) << actual
+                      << std::setw(12) << error << std::endl;
+        }
+    }
+
+    // Test values for Log
+    std::vector<double> test_log_inputs = {0.1, 0.25, 0.5, 0.7071, 1.0, 1.4142, 2.0, 4.0, 10.0, 20.0};
+    cdough::Vector<DataType> plain_log_x(test_log_inputs.size(), precision);
+    for (size_t i = 0; i < test_log_inputs.size(); ++i) {
+        plain_log_x[i] = static_cast<DataType>(test_log_inputs[i] * scale);
+    }
+
+    AV secure_log_x = engine.secret_share_a(plain_log_x, 0, precision);
+    AV secure_log = Log(secure_log_x);
+
+    auto opened_log = secure_log.open();
+
+    if (pID == 0) {
+        std::cout << "\n--- Oblivious Log Function Test Results ---" << std::endl;
+        std::cout << std::left << std::setw(10) << "Input (x)"
+                  << std::setw(16) << "Plaintext log"
+                  << std::setw(16) << "MPC log"
+                  << std::setw(12) << "Abs Error" << std::endl;
+        for (size_t i = 0; i < test_log_inputs.size(); ++i) {
+            double expected = std::log(test_log_inputs[i]);
+            double actual = static_cast<double>(opened_log[i]) / scale;
+            double error = std::abs(expected - actual);
+            std::cout << std::left << std::setw(10) << test_log_inputs[i]
                       << std::setw(16) << expected
                       << std::setw(16) << actual
                       << std::setw(12) << error << std::endl;
