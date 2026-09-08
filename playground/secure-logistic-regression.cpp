@@ -1,4 +1,6 @@
 #include <numeric>
+#include <vector>
+#include <functional>
 
 #include "cdough.h"
 
@@ -22,6 +24,7 @@ const float kSqrt2 = 1.4142;
 const float kSqrt1_2 = 0.7071;
 const float kSmallEpsilon = 0.0001;
 const float kSeriesTolerance = 0.0001;
+const float kNumericalGradientStep = 0.001;
 
 const DataType kLn2_scaled = (kLn2 * scale);
 const DataType kLn2_inv_scaled = (kLn2_inv * scale);
@@ -29,9 +32,28 @@ const DataType kSqrt2_scaled = (kSqrt2 * scale);
 const DataType kSqrt1_2_scaled = (kSqrt1_2 * scale);
 const DataType kSmallEpsilon_scaled = (kSmallEpsilon * scale);
 const DataType kSeriesTolerance_scaled = (kSeriesTolerance * scale);
+const DataType kHalf_scaled = (0.5 * scale);
+const DataType kMaxNewtonStep_scaled = (4.0 * scale);
 
 constexpr int kMaxSeriesTerms = 3;
 constexpr int kMaxNewtonStep = 4;
+constexpr int kNewtonIterations = 5;
+
+// Data structures for secure mixed-effects logistic regression
+struct ClusterGroup {
+    AV y;                   // Binary outcomes (0/1), length N (group size)
+    std::vector<AV> x_cols; // num_fixed columns, each of size N
+
+    ClusterGroup(AV y_in, std::vector<AV> x_cols_in)
+        : y(std::move(y_in)), x_cols(std::move(x_cols_in)) {}
+
+    size_t size() const { return y.size(); }
+};
+
+struct Dataset {
+    std::vector<ClusterGroup> groups;
+    size_t num_fixed = 0;
+};
 
 AV Exp (const AV& x) {
     AV x_ = x;
@@ -199,6 +221,98 @@ AV Log(AV x) {
     return result;
 }
 
+// log(1 + x) routed through Log
+AV Log1p(const AV& x) {
+    AV one_plus_x(x.size(), x.engine);
+    one_plus_x = x;
+
+    one_plus_x.setPrecision(0);
+    one_plus_x = one_plus_x + scale;
+
+    one_plus_x.setPrecision(precision);
+    return Log(one_plus_x);
+}
+
+// Numerically stable logistic function: Sigmoid(eta)
+// For positive eta: z = exp(-eta), return 1 / (1 + z)
+// For negative eta: z = exp(eta), return z / (1 + z)
+// Oblivious formulation:
+// mask = (eta >= 0)
+// abs_eta = mask ? eta : -eta = (2*mask - 1) * eta
+// z = exp(-abs_eta)  (since abs_eta >= 0, z in (0, 1])
+// num = mask + (1 - mask) * z = mask * (1 - z) + z
+// den = 1 + z
+// sigmoid = num / den
+AV Sigmoid(const AV& eta) {
+    AV eta_copy(eta.size(), eta.engine);
+    eta_copy = eta;
+
+    AV mask = *(eta_copy.gtez()); // 1 if eta >= 0, 0 if eta < 0
+
+    // abs_eta = (2*mask - 1) * eta
+    AV two_mask = *(mask * DataType(2));
+    two_mask -= DataType(1);
+    AV abs_eta = *(two_mask * eta_copy);
+
+    AV neg_abs_eta = -abs_eta;
+    neg_abs_eta.setPrecision(precision);
+    AV z = Exp(neg_abs_eta); // z = exp(-|eta|) <= 1.0
+    z.setPrecision(0);
+
+    // num = mask * (scale - z) + z
+    AV one_minus_z = -z;
+    one_minus_z += scale;
+    AV num = *(mask * one_minus_z);
+    num += z;
+
+    AV den = z;
+    den += scale;
+
+    // Secure division: num / den with fixed-point precision
+    auto num_b = (*(num * scale)).a2b();
+    auto den_b = den.a2b();
+    auto res_b = (*num_b) / (*den_b);
+    AV res = *(res_b->b2a());
+    res.setPrecision(precision);
+    return res;
+}
+
+// Numerically stable log(1 + exp(eta)) (softplus function)
+// If eta > 0: eta + log1p(exp(-eta))
+// Else: log1p(exp(eta))
+// Oblivious formulation:
+// mask = (eta >= 0)
+// abs_eta = mask ? eta : -eta
+// z = exp(-abs_eta)
+// softplus = mask * eta + log1p(z)
+AV LogOnePlusExp(const AV& eta) {
+    AV eta_copy(eta.size(), eta.engine);
+    eta_copy = eta;
+    eta_copy.setPrecision(0);
+
+    AV mask = *(eta_copy.gtez()); // 1 if eta >= 0, 0 if eta < 0
+    AV two_mask = *(mask * DataType(2));
+    two_mask -= DataType(1);
+    AV abs_eta = *(two_mask * eta_copy);
+
+    AV neg_abs_eta = -abs_eta;
+    AV z = Exp(neg_abs_eta);
+    AV log1p_z = Log1p(z);
+
+    AV pos_term = *(mask * eta_copy);
+    pos_term.setPrecision(precision);
+    AV result = pos_term + log1p_z;
+
+    return result;
+}
+
+// Sum of all elements in an AV vector, returning a 1-element AV
+AV Sum(const AV& v) {
+    AV res = v.chunkedSum(v.size());
+    res.setPrecision(precision);
+    return res;
+}
+
 
 int main(int argc, char** argv) {
     EngineRef engine = cdough_init(argc, argv);
@@ -269,6 +383,113 @@ int main(int argc, char** argv) {
                       << std::setw(12) << error << std::endl;
         }
     }
+
+    // =========================================================================
+    // Validation for Log1p, Sigmoid, LogOnePlusExp, Sum
+    // =========================================================================
+    // Test values for Log1p
+    std::vector<double> test_log1p_inputs = {-0.5, -0.2, 0.0, 0.2, 0.5, 1.0, 2.0, 5.0};
+    cdough::Vector<DataType> plain_log1p_x(test_log1p_inputs.size(), precision);
+    for (size_t i = 0; i < test_log1p_inputs.size(); ++i) {
+        plain_log1p_x[i] = static_cast<DataType>(test_log1p_inputs[i] * scale);
+    }
+    AV secure_log1p_x = engine.secret_share_a(plain_log1p_x, 0, precision);
+    AV secure_log1p = Log1p(secure_log1p_x);
+    auto opened_log1p = secure_log1p.open();
+
+    if (pID == 0) {
+        std::cout << "\n--- Oblivious Log1p Function Test Results ---" << std::endl;
+        std::cout << std::left << std::setw(10) << "Input (x)"
+                  << std::setw(16) << "Plaintext log1p"
+                  << std::setw(16) << "MPC log1p"
+                  << std::setw(12) << "Abs Error" << std::endl;
+        for (size_t i = 0; i < test_log1p_inputs.size(); ++i) {
+            double expected = std::log1p(test_log1p_inputs[i]);
+            double actual = static_cast<double>(opened_log1p[i]) / scale;
+            double error = std::abs(expected - actual);
+            std::cout << std::left << std::setw(10) << test_log1p_inputs[i]
+                      << std::setw(16) << expected
+                      << std::setw(16) << actual
+                      << std::setw(12) << error << std::endl;
+        }
+    }
+
+    // Test values for Sigmoid
+    std::vector<double> test_sigmoid_inputs = {-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0};
+    cdough::Vector<DataType> plain_sigmoid_x(test_sigmoid_inputs.size(), precision);
+    for (size_t i = 0; i < test_sigmoid_inputs.size(); ++i) {
+        plain_sigmoid_x[i] = static_cast<DataType>(test_sigmoid_inputs[i] * scale);
+    }
+    AV secure_sigmoid_x = engine.secret_share_a(plain_sigmoid_x, 0, precision);
+    AV secure_sigmoid = Sigmoid(secure_sigmoid_x);
+    auto opened_sigmoid = secure_sigmoid.open();
+
+    if (pID == 0) {
+        std::cout << "\n--- Oblivious Sigmoid Function Test Results ---" << std::endl;
+        std::cout << std::left << std::setw(10) << "Input (x)"
+                  << std::setw(16) << "Plaintext sigm"
+                  << std::setw(16) << "MPC sigm"
+                  << std::setw(12) << "Abs Error" << std::endl;
+        for (size_t i = 0; i < test_sigmoid_inputs.size(); ++i) {
+            double expected = 1.0 / (1.0 + std::exp(-test_sigmoid_inputs[i]));
+            double actual = static_cast<double>(opened_sigmoid[i]) / scale;
+            double error = std::abs(expected - actual);
+            std::cout << std::left << std::setw(10) << test_sigmoid_inputs[i]
+                      << std::setw(16) << expected
+                      << std::setw(16) << actual
+                      << std::setw(12) << error << std::endl;
+        }
+    }
+
+    // Test values for LogOnePlusExp
+    std::vector<double> test_softplus_inputs = {-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0};
+    cdough::Vector<DataType> plain_softplus_x(test_softplus_inputs.size(), precision);
+    for (size_t i = 0; i < test_softplus_inputs.size(); ++i) {
+        plain_softplus_x[i] = static_cast<DataType>(test_softplus_inputs[i] * scale);
+    }
+    AV secure_softplus_x = engine.secret_share_a(plain_softplus_x, 0, precision);
+    AV secure_softplus = LogOnePlusExp(secure_softplus_x);
+    auto opened_softplus = secure_softplus.open();
+
+    if (pID == 0) {
+        std::cout << "\n--- Oblivious LogOnePlusExp Function Test Results ---" << std::endl;
+        std::cout << std::left << std::setw(10) << "Input (x)"
+                  << std::setw(16) << "Plaintext softp"
+                  << std::setw(16) << "MPC softp"
+                  << std::setw(12) << "Abs Error" << std::endl;
+        for (size_t i = 0; i < test_softplus_inputs.size(); ++i) {
+            double expected = std::log1p(std::exp(-std::abs(test_softplus_inputs[i]))) + (test_softplus_inputs[i] > 0 ? test_softplus_inputs[i] : 0.0);
+            double actual = static_cast<double>(opened_softplus[i]) / scale;
+            double error = std::abs(expected - actual);
+            std::cout << std::left << std::setw(10) << test_softplus_inputs[i]
+                      << std::setw(16) << expected
+                      << std::setw(16) << actual
+                      << std::setw(12) << error << std::endl;
+        }
+    }
+
+    // Test values for Sum
+    std::vector<double> test_sum_inputs = {1.5, -2.25, 3.125, 0.5, -1.0, 4.0};
+    cdough::Vector<DataType> plain_sum_x(test_sum_inputs.size(), precision);
+    double expected_sum = 0.0;
+    for (size_t i = 0; i < test_sum_inputs.size(); ++i) {
+        plain_sum_x[i] = static_cast<DataType>(test_sum_inputs[i] * scale);
+        expected_sum += test_sum_inputs[i];
+    }
+    AV secure_sum_x = engine.secret_share_a(plain_sum_x, 0, precision);
+    AV secure_sum = Sum(secure_sum_x);
+    auto opened_sum = secure_sum.open();
+
+    if (pID == 0) {
+        std::cout << "\n--- Oblivious Sum Function Test Results ---" << std::endl;
+        double actual_sum = static_cast<double>(opened_sum[0]) / scale;
+        double error = std::abs(expected_sum - actual_sum);
+        std::cout << "Vector elements: [1.5, -2.25, 3.125, 0.5, -1.0, 4.0]" << std::endl;
+        std::cout << "Plaintext sum: " << expected_sum << std::endl;
+        std::cout << "MPC sum:       " << actual_sum << std::endl;
+        std::cout << "Abs Error:     " << error << std::endl;
+    }
+
 
     return 0;
 }
