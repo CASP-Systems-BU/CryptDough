@@ -75,13 +75,11 @@ AV Exp (const AV& x) {
 
     // Multiply by 2^(b_i * 2^i) obliviously: factor = 1 + b_i * (2^(2^i) - 1)
     AV result = series;
-    BV packed_bit(cdough::math::div_ceil(x.size(), BV::MAX_BITS_NUMBER), x.engine);
-    BV unpacked_bit(x.size(), x.engine);
+    BV current_bit(x.size(), x.engine);
     for (size_t i = 0; i < 4; ++i) { // 4 bits cover offset range [0, 15]
-        packed_bit.pack_from(*k_b, i);
-        unpacked_bit.zero();
-        unpacked_bit.unpack_from(packed_bit, 0);
-        AV bit_a = *unpacked_bit.b2a_bit();
+        current_bit.bit_logical_right_shift(*k_b, i);
+        current_bit.mask(1);
+        AV bit_a = *current_bit.b2a_bit();
         DataType multiplier = (DataType(1) << (1 << i)) - 1;
         AV factor(x.size(), x.engine);
         factor += scale;
