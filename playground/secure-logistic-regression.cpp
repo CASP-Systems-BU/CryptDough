@@ -313,6 +313,32 @@ AV Sum(const AV& v) {
     return res;
 }
 
+// Secure clamping to [-kMaxNewtonStep, kMaxNewtonStep]
+AV ClampNewtonStep(const AV& step) {
+    AV step_ = step;
+    step_.setPrecision(0);
+
+    // 1. step > kMaxNewtonStep_scaled <=> step - kMaxNewtonStep_scaled > 0
+    AV diff_high = step_ - kMaxNewtonStep_scaled;
+    AV cond_high = *(diff_high.gtez()); // 1 if step >= kMaxNewtonStep, 0 otherwise
+    AV delta_high = step_ - kMaxNewtonStep_scaled;
+    AV sub_high = *(cond_high * delta_high);
+    step_ -= sub_high;
+
+    // 2. step < -kMaxNewtonStep_scaled <=> -kMaxNewtonStep_scaled - step > 0
+    AV diff_low = -step_;
+    diff_low -= (kMaxNewtonStep_scaled + 1);
+    AV cond_low = *(diff_low.gtez()); // 1 if step <= -kMaxNewtonStep
+    AV delta_low = -step_;
+    delta_low -= kMaxNewtonStep_scaled; // -kMaxNewtonStep_scaled - step_
+    AV add_low = *(cond_low * delta_low);
+    step_ += add_low;
+
+    step_.setPrecision(precision);
+    return step_;
+}
+
+
 
 int main(int argc, char** argv) {
     EngineRef engine = cdough_init(argc, argv);
@@ -488,6 +514,35 @@ int main(int argc, char** argv) {
         std::cout << "Plaintext sum: " << expected_sum << std::endl;
         std::cout << "MPC sum:       " << actual_sum << std::endl;
         std::cout << "Abs Error:     " << error << std::endl;
+    }
+
+    // =========================================================================
+    // Validation for ClampNewtonStep
+    // =========================================================================
+    std::vector<double> test_clamp_inputs = {-10.0, -5.0, -4.0, -2.5, 0.0, 1.5, 4.0, 6.0, 12.0};
+    cdough::Vector<DataType> plain_clamp_x(test_clamp_inputs.size(), precision);
+    for (size_t i = 0; i < test_clamp_inputs.size(); ++i) {
+        plain_clamp_x[i] = static_cast<DataType>(test_clamp_inputs[i] * scale);
+    }
+    AV secure_clamp_x = engine.secret_share_a(plain_clamp_x, 0, precision);
+    AV secure_clamp = ClampNewtonStep(secure_clamp_x);
+    auto opened_clamp = secure_clamp.open();
+
+    if (pID == 0) {
+        std::cout << "\n--- Oblivious ClampNewtonStep Function Test Results ---" << std::endl;
+        std::cout << std::left << std::setw(10) << "Input (x)"
+                  << std::setw(16) << "Plaintext clamp"
+                  << std::setw(16) << "MPC clamp"
+                  << std::setw(12) << "Abs Error" << std::endl;
+        for (size_t i = 0; i < test_clamp_inputs.size(); ++i) {
+            double expected = std::max(-4.0, std::min(4.0, test_clamp_inputs[i]));
+            double actual = static_cast<double>(opened_clamp[i]) / scale;
+            double error = std::abs(expected - actual);
+            std::cout << std::left << std::setw(10) << test_clamp_inputs[i]
+                      << std::setw(16) << expected
+                      << std::setw(16) << actual
+                      << std::setw(12) << error << std::endl;
+        }
     }
 
 
