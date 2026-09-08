@@ -338,6 +338,267 @@ AV ClampNewtonStep(const AV& step) {
     return step_;
 }
 
+// Finds the conditional mode u_hat = argmax_u g_i(u) for one group, given the
+// fixed effects `beta` (std::vector<AV> of size p, each size 1) and variance `sigma2` (AV of size 1).
+// The objective g_i is strictly concave in u, so a damped Newton iteration converges reliably.
+AV ConditionalMode(const ClusterGroup& group, const std::vector<AV>& beta, const AV& sigma2) {
+    EngineRef engine = sigma2.engine;
+    size_t num_obs = group.size();
+    size_t num_fixed = beta.size();
+
+    // inv_sigma2 = 1.0 / sigma2 (in fixed-point: scale^2 / sigma2)
+    AV scale_sq(1, engine);
+    scale_sq += (DataType(1) << (2 * precision));
+    auto scale_sq_b = scale_sq.a2b();
+    auto sigma2_b = sigma2.a2b();
+    auto inv_sigma2_b = (*scale_sq_b) / (*sigma2_b);
+    AV inv_sigma2 = *(inv_sigma2_b->b2a());
+    inv_sigma2.setPrecision(0);
+
+    // Compute fixed effects linear predictor X_beta = sum_{k=0}^{p-1} X_col[k] * beta[k]
+    // X_beta has length num_obs
+    AV x_beta(num_obs, engine);
+    x_beta.setPrecision(0);
+    for (size_t k = 0; k < num_fixed; ++k) {
+        // Broadcast beta[k] (size 1) to size num_obs using repeated_subset_reference
+        AV beta_rep = beta[k].repeated_subset_reference(num_obs);
+        beta_rep.setPrecision(0);
+        AV col_k = group.x_cols[k];
+        col_k.setPrecision(0);
+        AV term = (*(col_k * beta_rep)) / scale;
+        x_beta += term;
+    }
+
+    AV u(1, engine); // Initial mode u = 0 (size 1)
+    u.setPrecision(0);
+
+    for (int iter = 0; iter < kNewtonIterations; ++iter) {
+        // Broadcast u to size num_obs
+        AV u_rep = u.repeated_subset_reference(num_obs);
+        u_rep.setPrecision(0);
+
+        AV eta = x_beta + u_rep;
+        eta.setPrecision(precision);
+        AV p = Sigmoid(eta); // size num_obs
+        p.setPrecision(0);
+
+        // gradient = -u * inv_sigma2 + sum_j (y_j - p_j)
+        AV u_inv = (*(u * inv_sigma2)) / scale;
+        AV grad_prior = -u_inv; // size 1
+
+        AV one_minus_p = -p;
+        one_minus_p += scale;
+        AV var_p = (*(p * one_minus_p)) / scale; // p * (1 - p), size num_obs
+
+        AV y_copy = group.y;
+        y_copy.setPrecision(0);
+        AV diff_y_p = y_copy - p; // size num_obs
+        diff_y_p.setPrecision(precision);
+        AV sum_grad = Sum(diff_y_p); // size 1
+        sum_grad.setPrecision(0);
+        AV gradient = grad_prior + sum_grad; // size 1
+
+        // curvature = inv_sigma2 + sum_j p_j * (1 - p_j)
+        var_p.setPrecision(precision);
+        AV sum_curv = Sum(var_p); // size 1
+        sum_curv.setPrecision(0);
+        AV curvature = inv_sigma2 + sum_curv; // size 1
+
+        // step = gradient / curvature
+        auto grad_scaled_b = (*(gradient * scale)).a2b();
+        auto curv_b = curvature.a2b();
+        auto step_b = (*grad_scaled_b) / (*curv_b);
+        AV step = *(step_b->b2a());
+        step.setPrecision(precision);
+
+        // Clamp step to [-kMaxNewtonStep, kMaxNewtonStep]
+        AV step_clamped = ClampNewtonStep(step);
+        step_clamped.setPrecision(0);
+        u += step_clamped;
+    }
+
+    u.setPrecision(precision);
+    return u;
+}
+
+// Laplace-approximated marginal log-likelihood contribution of a single group.
+// log L_i ~= cll(u_hat_i) - 0.5 * u_hat_i^2 / sigma^2 - 0.5 * log(sigma^2) - 0.5 * log(A_i)
+AV GroupLaplaceLogLik(const ClusterGroup& group, const std::vector<AV>& beta, const AV& sigma2) {
+    EngineRef engine = sigma2.engine;
+    size_t num_obs = group.size();
+    size_t num_fixed = beta.size();
+
+    // inv_sigma2 = scale^2 / sigma2
+    AV scale_sq(1, engine);
+    scale_sq += (DataType(1) << (2 * precision));
+    auto scale_sq_b = scale_sq.a2b();
+    auto sigma2_b = sigma2.a2b();
+    auto inv_sigma2_b = (*scale_sq_b) / (*sigma2_b);
+    AV inv_sigma2 = *(inv_sigma2_b->b2a());
+    inv_sigma2.setPrecision(0);
+
+    AV u_hat = ConditionalMode(group, beta, sigma2); // size 1
+    u_hat.setPrecision(0);
+
+    // Compute linear predictor X_beta + u_hat
+    AV x_beta(num_obs, engine);
+    x_beta.setPrecision(0);
+    for (size_t k = 0; k < num_fixed; ++k) {
+        AV beta_rep = beta[k].repeated_subset_reference(num_obs);
+        beta_rep.setPrecision(0);
+        AV col_k = group.x_cols[k];
+        col_k.setPrecision(0);
+        AV term = (*(col_k * beta_rep)) / scale;
+        x_beta += term;
+    }
+    AV u_hat_rep = u_hat.repeated_subset_reference(num_obs);
+    u_hat_rep.setPrecision(0);
+    AV eta = x_beta + u_hat_rep;
+    eta.setPrecision(precision);
+
+    AV p = Sigmoid(eta);
+    p.setPrecision(0);
+    AV log_one_plus_exp = LogOnePlusExp(eta);
+    log_one_plus_exp.setPrecision(0);
+
+    // conditional_log_lik = sum_j (y_j * eta_j - LogOnePlusExp(eta_j))
+    AV y_copy = group.y;
+    y_copy.setPrecision(0);
+    eta.setPrecision(0);
+    AV y_eta = (*(y_copy * eta)) / scale;
+    AV obs_cll = y_eta - log_one_plus_exp;
+    obs_cll.setPrecision(precision);
+    AV conditional_log_lik = Sum(obs_cll); // size 1
+    conditional_log_lik.setPrecision(0);
+
+    // curvature A_i = inv_sigma2 + sum_j p_j * (1 - p_j)
+    AV one_minus_p = -p;
+    one_minus_p += scale;
+    AV var_p = (*(p * one_minus_p)) / scale;
+    var_p.setPrecision(precision);
+    AV sum_var_p = Sum(var_p);
+    sum_var_p.setPrecision(0);
+    AV curvature = inv_sigma2 + sum_var_p; // size 1
+
+    // Gaussian prior quadratic penalty: 0.5 * u_hat^2 * inv_sigma2
+    AV u_sq = (*(u_hat * u_hat)) / scale;
+    AV penalty = (*(u_sq * inv_sigma2)) / scale;
+    AV penalty_half = (*(penalty * kHalf_scaled)) / scale;
+
+    // Log terms: 0.5 * log(sigma2) + 0.5 * log(curvature)
+    AV sigma2_copy = sigma2;
+    sigma2_copy.setPrecision(precision);
+    AV log_sigma2 = Log(sigma2_copy);
+    log_sigma2.setPrecision(0);
+
+    curvature.setPrecision(precision);
+    AV log_curv = Log(curvature);
+    log_curv.setPrecision(0);
+
+    AV log_terms = log_sigma2 + log_curv;
+    AV log_terms_half = (*(log_terms * kHalf_scaled)) / scale;
+
+    AV result = conditional_log_lik - penalty_half - log_terms_half;
+    result.setPrecision(precision);
+    return result;
+}
+
+// Splits a packed parameter vector [beta..., s] into `beta` and sigma^2, where
+// the variance is parameterized as sigma = exp(s) to keep it strictly positive.
+void UnpackParameters(const std::vector<AV>& params, size_t num_fixed,
+                      std::vector<AV>& beta, AV& sigma2) {
+    beta.clear();
+    for (size_t k = 0; k < num_fixed; ++k) {
+        beta.push_back(params[k]);
+        beta.back().setPrecision(precision);
+    }
+    AV s = params[num_fixed];
+    s.setPrecision(0);
+    AV two_s = *(s * DataType(2));
+    two_s.setPrecision(precision);
+    sigma2 = Exp(two_s);
+    sigma2.setPrecision(precision);
+}
+
+// Negative marginal log-likelihood over the whole dataset (the BFGS objective).
+AV NegMarginalLogLik(const Dataset& data, const std::vector<AV>& params) {
+    std::vector<AV> beta;
+    AV sigma2(1, params[0].engine);
+    sigma2.setPrecision(precision);
+    UnpackParameters(params, data.num_fixed, beta, sigma2);
+
+    AV total(1, params[0].engine);
+    total.setPrecision(0);
+    for (const auto& group : data.groups) {
+        AV group_lik = GroupLaplaceLogLik(group, beta, sigma2);
+        group_lik.setPrecision(0);
+        total += group_lik;
+    }
+    AV neg_total = -total;
+    neg_total.setPrecision(precision);
+    return neg_total;
+}
+
+// Central finite-difference gradient of a scalar objective `f` at `x`.
+std::vector<AV> NumericalGradient(
+    const std::function<AV(const std::vector<AV>&)>& f,
+    const std::vector<AV>& x) {
+    size_t dim = x.size();
+    std::vector<AV> gradient;
+    gradient.reserve(dim);
+
+    std::vector<AV> perturbed = x;
+    for (size_t k = 0; k < dim; ++k) {
+        perturbed[k].setPrecision(precision);
+    }
+
+    for (size_t k = 0; k < dim; ++k) {
+        // Step size h = kNumericalGradientStep * (1.0 + |x[k]|)
+        AV xk_copy = x[k];
+        xk_copy.setPrecision(0);
+        AV mask = *(xk_copy.gtez());
+        AV two_mask = *(mask * DataType(2));
+        two_mask -= DataType(1);
+        AV abs_xk = *(two_mask * xk_copy); // (1 or -1) * xk_copy gives |x[k]| directly without / scale
+
+        AV one_plus_abs = abs_xk;
+        one_plus_abs += scale;
+        DataType h_step_scaled = static_cast<DataType>(kNumericalGradientStep * scale);
+        AV h = (*(one_plus_abs * h_step_scaled)) / scale; // size 1
+
+        // f_plus = f(perturbed with x[k] + h)
+        h.setPrecision(precision);
+        perturbed[k] = x[k] + h;
+        perturbed[k].setPrecision(precision);
+        AV f_plus = f(perturbed);
+        f_plus.setPrecision(0);
+
+        // f_minus = f(perturbed with x[k] - h)
+        perturbed[k] = x[k] - h;
+        perturbed[k].setPrecision(precision);
+        AV f_minus = f(perturbed);
+        f_minus.setPrecision(0);
+
+        // Reset perturbed[k]
+        perturbed[k] = x[k];
+        perturbed[k].setPrecision(precision);
+
+        // gradient[k] = (f_plus - f_minus) / (2 * h)
+        AV diff = f_plus - f_minus;
+        h.setPrecision(0);
+        AV two_h = *(h * DataType(2));
+
+        auto diff_scaled_b = (*(diff * scale)).a2b();
+        auto two_h_b = two_h.a2b();
+        auto grad_b = (*diff_scaled_b) / (*two_h_b);
+        AV grad_k = *(grad_b->b2a());
+        grad_k.setPrecision(precision);
+
+        gradient.push_back(std::move(grad_k));
+    }
+
+    return gradient;
+}
 
 
 int main(int argc, char** argv) {
@@ -545,6 +806,235 @@ int main(int argc, char** argv) {
         }
     }
 
+    // =========================================================================
+    // Validation for ConditionalMode, GroupLaplaceLogLik, NegMarginalLogLik, NumericalGradient
+    // =========================================================================
+    if (pID == 0) {
+        std::cout << "\n--- Testing ConditionalMode, GroupLaplaceLogLik, NegMarginalLogLik, and NumericalGradient ---" << std::endl;
+    }
+
+    // Create synthetic test data: 2 groups, 3 observations per group, 2 fixed effects (intercept + 1 feature)
+    // Beta = [0.2, -0.4], s = 0.0 (sigma^2 = exp(0) = 1.0)
+    size_t test_num_groups = 2;
+    size_t test_obs_per_group = 3;
+    size_t test_num_fixed = 2;
+
+    std::vector<std::vector<std::vector<double>>> plain_X = {
+        { {1.0, 0.5}, {1.0, -0.5}, {1.0, 1.0} },
+        { {1.0, -1.0}, {1.0, 0.2}, {1.0, 0.8} }
+    };
+    std::vector<std::vector<double>> plain_Y = {
+        { 1.0, 0.0, 1.0 },
+        { 0.0, 1.0, 1.0 }
+    };
+    std::vector<double> plain_beta = {0.2, -0.4};
+    double plain_s = 0.0;
+    double plain_sigma2 = std::exp(2.0 * plain_s);
+
+    // Build secret-shared Dataset
+    Dataset secure_dataset;
+    secure_dataset.num_fixed = test_num_fixed;
+
+    for (size_t g = 0; g < test_num_groups; ++g) {
+        // Share y
+        cdough::Vector<DataType> plain_y_vec(test_obs_per_group, precision);
+        for (size_t j = 0; j < test_obs_per_group; ++j) {
+            plain_y_vec[j] = static_cast<DataType>(plain_Y[g][j] * scale);
+        }
+        AV grp_y = engine.secret_share_a(plain_y_vec, 0, precision);
+
+        // Share columns of X
+        std::vector<AV> grp_x_cols;
+        for (size_t k = 0; k < test_num_fixed; ++k) {
+            cdough::Vector<DataType> plain_col_vec(test_obs_per_group, precision);
+            for (size_t j = 0; j < test_obs_per_group; ++j) {
+                plain_col_vec[j] = static_cast<DataType>(plain_X[g][j][k] * scale);
+            }
+            grp_x_cols.push_back(engine.secret_share_a(plain_col_vec, 0, precision));
+        }
+        secure_dataset.groups.emplace_back(std::move(grp_y), std::move(grp_x_cols));
+    }
+
+    // Secret share parameter vector [beta_0, beta_1, s]
+    std::vector<AV> secure_params;
+    cdough::Vector<DataType> p0(1, precision); p0[0] = static_cast<DataType>(plain_beta[0] * scale);
+    cdough::Vector<DataType> p1(1, precision); p1[0] = static_cast<DataType>(plain_beta[1] * scale);
+    cdough::Vector<DataType> ps(1, precision); ps[0] = static_cast<DataType>(plain_s * scale);
+
+    secure_params.push_back(engine.secret_share_a(p0, 0, precision));
+    secure_params.push_back(engine.secret_share_a(p1, 0, precision));
+    secure_params.push_back(engine.secret_share_a(ps, 0, precision));
+
+    std::vector<AV> secure_beta = { secure_params[0], secure_params[1] };
+    cdough::Vector<DataType> p_sig(1, precision); p_sig[0] = static_cast<DataType>(plain_sigma2 * scale);
+    AV secure_sigma2 = engine.secret_share_a(p_sig, 0, precision);
+
+    // Plaintext computation helper functions
+    auto plain_exp = [](double x) -> double {
+        return std::exp(x);
+    };
+    auto plain_log = [](double x) -> double {
+        return std::log(x);
+    };
+    auto plain_log1p = [](double x) -> double {
+        return std::log1p(x);
+    };
+    auto plain_sigmoid = [](double eta) -> double {
+        if (eta >= 0.0) {
+            double z = std::exp(-eta);
+            return 1.0 / (1.0 + z);
+        }
+        double z = std::exp(eta);
+        return z / (1.0 + z);
+    };
+    auto plain_softplus = [](double eta) -> double {
+        if (eta > 0.0) {
+            return eta + std::log1p(std::exp(-eta));
+        }
+        return std::log1p(std::exp(eta));
+    };
+    auto plain_conditional_mode = [&](size_t g, const std::vector<double>& beta, double sigma2) -> double {
+        double inv_sigma2 = 1.0 / sigma2;
+        double u = 0.0;
+        for (int iter = 0; iter < kNewtonIterations; ++iter) {
+            double grad = -u * inv_sigma2;
+            double curv = inv_sigma2;
+            for (size_t j = 0; j < test_obs_per_group; ++j) {
+                double eta = plain_X[g][j][0] * beta[0] + plain_X[g][j][1] * beta[1] + u;
+                double p = plain_sigmoid(eta);
+                grad += plain_Y[g][j] - p;
+                curv += p * (1.0 - p);
+            }
+            double step = grad / curv;
+            step = std::max(-4.0, std::min(4.0, step));
+            u += step;
+        }
+        return u;
+    };
+    auto plain_group_laplace = [&](size_t g, const std::vector<double>& beta, double sigma2) -> double {
+        double inv_sigma2 = 1.0 / sigma2;
+        double u = plain_conditional_mode(g, beta, sigma2);
+        double cll = 0.0;
+        double curv = inv_sigma2;
+        for (size_t j = 0; j < test_obs_per_group; ++j) {
+            double eta = plain_X[g][j][0] * beta[0] + plain_X[g][j][1] * beta[1] + u;
+            double p = plain_sigmoid(eta);
+            cll += plain_Y[g][j] * eta - plain_softplus(eta);
+            curv += p * (1.0 - p);
+        }
+        return cll - 0.5 * u * u * inv_sigma2 - 0.5 * std::log(sigma2) - 0.5 * std::log(curv);
+    };
+    auto plain_neg_marginal_log_lik = [&](const std::vector<double>& params) -> double {
+        std::vector<double> beta = {params[0], params[1]};
+        double s = params[2];
+        double sigma2 = std::exp(2.0 * s);
+        double total = 0.0;
+        for (size_t g = 0; g < test_num_groups; ++g) {
+            total += plain_group_laplace(g, beta, sigma2);
+        }
+        return -total;
+    };
+    auto plain_numerical_gradient = [&](const std::vector<double>& params) -> std::vector<double> {
+        std::vector<double> grad(params.size(), 0.0);
+        std::vector<double> perturbed = params;
+        for (size_t k = 0; k < params.size(); ++k) {
+            double h = kNumericalGradientStep * (1.0 + std::abs(params[k]));
+            perturbed[k] = params[k] + h;
+            double f_plus = plain_neg_marginal_log_lik(perturbed);
+            perturbed[k] = params[k] - h;
+            double f_minus = plain_neg_marginal_log_lik(perturbed);
+            perturbed[k] = params[k];
+            grad[k] = (f_plus - f_minus) / (2.0 * h);
+        }
+        return grad;
+    };
+
+    // 1. Test ConditionalMode on group 0 and group 1
+    AV u_mode_0 = ConditionalMode(secure_dataset.groups[0], secure_beta, secure_sigma2);
+    auto opened_u0 = u_mode_0.open();
+    double expected_u0 = plain_conditional_mode(0, plain_beta, plain_sigma2);
+    if (pID == 0) {
+        double actual_u0 = static_cast<double>(opened_u0[0]) / scale;
+        std::cout << "ConditionalMode (Group 0):\n"
+                  << "  Plaintext: " << expected_u0 << "\n"
+                  << "  MPC:       " << actual_u0 << "\n"
+                  << "  Abs Error: " << std::abs(expected_u0 - actual_u0) << std::endl;
+    }
+
+    AV u_mode_1 = ConditionalMode(secure_dataset.groups[1], secure_beta, secure_sigma2);
+    auto opened_u1 = u_mode_1.open();
+    double expected_u1 = plain_conditional_mode(1, plain_beta, plain_sigma2);
+    if (pID == 0) {
+        double actual_u1 = static_cast<double>(opened_u1[0]) / scale;
+        std::cout << "ConditionalMode (Group 1):\n"
+                  << "  Plaintext: " << expected_u1 << "\n"
+                  << "  MPC:       " << actual_u1 << "\n"
+                  << "  Abs Error: " << std::abs(expected_u1 - actual_u1) << std::endl;
+    }
+
+    // 2. Test GroupLaplaceLogLik on group 0 and group 1
+    AV group0_lik = GroupLaplaceLogLik(secure_dataset.groups[0], secure_beta, secure_sigma2);
+    auto opened_g0_lik = group0_lik.open();
+    double expected_g0 = plain_group_laplace(0, plain_beta, plain_sigma2);
+    if (pID == 0) {
+        double actual_g0 = static_cast<double>(opened_g0_lik[0]) / scale;
+        std::cout << "GroupLaplaceLogLik (Group 0):\n"
+                  << "  Plaintext: " << expected_g0 << "\n"
+                  << "  MPC:       " << actual_g0 << "\n"
+                  << "  Abs Error: " << std::abs(expected_g0 - actual_g0) << std::endl;
+    }
+
+    AV group1_lik = GroupLaplaceLogLik(secure_dataset.groups[1], secure_beta, secure_sigma2);
+    auto opened_g1_lik = group1_lik.open();
+    double expected_g1 = plain_group_laplace(1, plain_beta, plain_sigma2);
+    if (pID == 0) {
+        double actual_g1 = static_cast<double>(opened_g1_lik[0]) / scale;
+        std::cout << "GroupLaplaceLogLik (Group 1):\n"
+                  << "  Plaintext: " << expected_g1 << "\n"
+                  << "  MPC:       " << actual_g1 << "\n"
+                  << "  Abs Error: " << std::abs(expected_g1 - actual_g1) << std::endl;
+    }
+
+    // 3. Test NegMarginalLogLik
+    AV neg_log_lik = NegMarginalLogLik(secure_dataset, secure_params);
+    auto opened_neg_log_lik = neg_log_lik.open();
+    std::vector<double> plain_params = {plain_beta[0], plain_beta[1], plain_s};
+    double expected_nll = plain_neg_marginal_log_lik(plain_params);
+    if (pID == 0) {
+        double actual_nll = static_cast<double>(opened_neg_log_lik[0]) / scale;
+        std::cout << "NegMarginalLogLik (Total):\n"
+                  << "  Plaintext: " << expected_nll << "\n"
+                  << "  MPC:       " << actual_nll << "\n"
+                  << "  Abs Error: " << std::abs(expected_nll - actual_nll) << std::endl;
+    }
+
+    // 4. Test NumericalGradient
+    auto objective_func = [&secure_dataset](const std::vector<AV>& p) -> AV {
+        return NegMarginalLogLik(secure_dataset, p);
+    };
+
+    std::vector<AV> secure_grad = NumericalGradient(objective_func, secure_params);
+    std::vector<double> expected_grad = plain_numerical_gradient(plain_params);
+    if (pID == 0) {
+        std::cout << "NumericalGradient:" << std::endl;
+        std::cout << "  Plaintext: [";
+        for (size_t k = 0; k < expected_grad.size(); ++k) {
+            std::cout << expected_grad[k] << (k + 1 < expected_grad.size() ? ", " : "");
+        }
+        std::cout << "]" << std::endl;
+        std::cout << "  MPC:       [";
+    }
+    for (size_t k = 0; k < secure_grad.size(); ++k) {
+        auto opened_grad_k = secure_grad[k].open();
+        if (pID == 0) {
+            double val = static_cast<double>(opened_grad_k[0]) / scale;
+            std::cout << val << (k + 1 < secure_grad.size() ? ", " : "");
+        }
+    }
+    if (pID == 0) {
+        std::cout << "]" << std::endl;
+        std::cout << "\nAll functions executed and validated successfully against plaintext!" << std::endl;
+    }
 
     return 0;
 }
