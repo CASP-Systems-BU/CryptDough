@@ -14,6 +14,8 @@ using DataType = int64_t;
 using HW = cdough::matrix::HeightWidth;
 using AV = ASharedVector<DataType>;
 using BV = BSharedVector<DataType>;
+using SMatrix = SecureMatrix<DataType>;
+using PMatrix = PlainMatrix<DataType>;
 
 const int precision = 16;
 const DataType scale = 1 << precision;
@@ -600,6 +602,351 @@ std::vector<AV> NumericalGradient(
     return gradient;
 }
 
+// =============================================================================
+// BFGS Optimization & Secure Linear Algebra Helpers
+// =============================================================================
+
+// Generates an n x n identity SecureMatrix in MPC (row-major).
+SMatrix Identity(size_t n, EngineRef engine) {
+    cdough::Vector<DataType> eye(n * n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        eye[i * n + i] = scale;
+    }
+    PMatrix plain_eye(eye, n, n, false);
+    auto sec_eye = engine.secret_share_matrix(plain_eye, 0);
+    sec_eye.setPrecision(precision);
+    return sec_eye;
+}
+
+// Matrix-vector product m * v where m is SecureMatrix (n x n) and v is std::vector<AV> (length n).
+std::vector<AV> MatVec(const SMatrix& m, const std::vector<AV>& v) {
+    size_t n = v.size();
+    assert(m.rows() == n && m.cols() == n);
+    EngineRef engine = v[0].engine;
+
+    // m is stored row-major: element (i, j) is at data_[i * n + j]
+    AV m_data = m.data();
+    m_data.setPrecision(0);
+
+    std::vector<AV> result;
+    result.reserve(n);
+
+    for (size_t i = 0; i < n; ++i) {
+        AV row_sum(1, engine);
+        row_sum.setPrecision(0);
+        for (size_t j = 0; j < n; ++j) {
+            // Slice element at index (i * n + j)
+            AV m_ij = m_data.slice(i * n + j, i * n + j + 1);
+            m_ij.setPrecision(0);
+            AV vj = v[j];
+            vj.setPrecision(0);
+            AV prod = (*(m_ij * vj)) / scale;
+            row_sum += prod;
+        }
+        row_sum.setPrecision(precision);
+        result.push_back(std::move(row_sum));
+    }
+    return result;
+}
+
+// Standard inner product between two secure vectors.
+AV Dot(const std::vector<AV>& a, const std::vector<AV>& b) {
+    assert(a.size() == b.size());
+    size_t n = a.size();
+    EngineRef engine = a[0].engine;
+
+    AV sum(1, engine);
+    sum.setPrecision(0);
+    for (size_t i = 0; i < n; ++i) {
+        AV ai = a[i];
+        AV bi = b[i];
+        ai.setPrecision(0);
+        bi.setPrecision(0);
+        AV prod = (*(ai * bi)) / scale;
+        sum += prod;
+    }
+    sum.setPrecision(precision);
+    return sum;
+}
+
+// BFGS update of the inverse-Hessian approximation:
+//   H+ = (I - rho s y^T) H (I - rho y s^T) + rho s s^T,   rho = 1 / (y^T s).
+SMatrix BfgsInverseUpdate(const SMatrix& h_inv, const std::vector<AV>& s,
+                         const std::vector<AV>& y, const AV& rho) {
+    size_t n = s.size();
+    assert(h_inv.rows() == n && h_inv.cols() == n);
+    assert(y.size() == n);
+    EngineRef engine = s[0].engine;
+
+    // We extract h_inv elements into an n x n 2D array of 1-element AVs
+    std::vector<std::vector<AV>> h_elements(n, std::vector<AV>(n, AV(1, engine)));
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            h_elements[i][j] = h_inv.data().slice(i * n + j, i * n + j + 1);
+            h_elements[i][j].setPrecision(0);
+        }
+    }
+
+    AV rho_copy = rho;
+    rho_copy.setPrecision(0);
+
+    // Compute left = I - rho * s * y^T as an n x n matrix in std::vector<std::vector<AV>>
+    // In fixed point: (s_i * y_j) / scale, then (* rho) / scale
+    std::vector<std::vector<AV>> left(n, std::vector<AV>(n, AV(1, engine)));
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            AV si = s[i];
+            AV yj = y[j];
+            si.setPrecision(0);
+            yj.setPrecision(0);
+            AV s_y = (*(si * yj)) / scale;
+            AV rho_s_y = (*(rho_copy * s_y)) / scale;
+
+            AV elem(1, engine);
+            elem.setPrecision(0);
+            if (i == j) {
+                elem += scale;
+            }
+            elem -= rho_s_y;
+            left[i][j] = elem;
+        }
+    }
+
+    // temp = left * h_inv
+    // temp[i][j] = sum_k (left[i][k] * h_inv[k][j]) / scale
+    std::vector<std::vector<AV>> temp(n, std::vector<AV>(n, AV(1, engine)));
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            AV sum(1, engine);
+            sum.setPrecision(0);
+            for (size_t k = 0; k < n; ++k) {
+                AV h_kj = h_elements[k][j];
+                AV left_ik = left[i][k];
+                left_ik.setPrecision(0);
+                h_kj.setPrecision(0);
+                AV prod = (*(left_ik * h_kj)) / scale;
+                sum += prod;
+            }
+            temp[i][j] = sum;
+        }
+    }
+
+    // updated = temp * left^T + rho * s * s^T
+    // Flatten result into a single AV of size n * n to construct SecureMatrix
+    cdough::Vector<DataType> dummy_init(n * n, 0);
+    AV updated_data = engine.secret_share_a(dummy_init, 0, 0);
+    updated_data.setPrecision(0);
+
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            AV sum(1, engine);
+            sum.setPrecision(0);
+            for (size_t k = 0; k < n; ++k) {
+                AV temp_ik = temp[i][k];
+                AV left_jk = left[j][k];
+                temp_ik.setPrecision(0);
+                left_jk.setPrecision(0);
+                AV prod = (*(temp_ik * left_jk)) / scale;
+                sum += prod;
+            }
+            AV si = s[i];
+            AV sj = s[j];
+            si.setPrecision(0);
+            sj.setPrecision(0);
+            AV s_s = (*(si * sj)) / scale;
+            AV rho_s_s = (*(rho_copy * s_s)) / scale;
+            sum += rho_s_s;
+
+            // Place into updated_data at index i * n + j
+            AV sum_rep = sum.repeated_subset_reference(n * n);
+            sum_rep.setPrecision(0);
+            cdough::Vector<DataType> mask_vec(n * n, 0);
+            mask_vec[i * n + j] = scale; // Use scale (1.0 in fixed-point)
+            AV mask_elem = engine.secret_share_a(mask_vec, 0, 0);
+            mask_elem.setPrecision(0);
+            AV placed = (*(sum_rep * mask_elem)) / scale;
+            placed.setPrecision(0);
+            updated_data += placed;
+        }
+    }
+
+    updated_data.setPrecision(precision);
+    SMatrix updated(updated_data, n, n, false);
+    updated.setPrecision(precision);
+    return updated;
+}
+
+// Result of the outer quasi-Newton optimization.
+struct OptResult {
+    std::vector<AV> params;
+    AV value;
+    int iterations = 0;
+    bool converged = false;
+
+    OptResult(std::vector<AV> p, AV v, int it = 0, bool conv = false)
+        : params(std::move(p)), value(std::move(v)), iterations(it), converged(conv) {}
+};
+
+// Minimizes `f` starting from `x0` using BFGS with a backtracking (Armijo) line
+// search and numerical gradients.
+OptResult MinimizeBFGS(
+    const std::function<AV(const std::vector<AV>&)>& f,
+    const std::vector<AV>& x0,
+    int max_iterations = 20) {
+    size_t n = x0.size();
+    EngineRef engine = x0[0].engine;
+
+    std::vector<AV> x = x0;
+    for (size_t i = 0; i < n; ++i) {
+        x[i].setPrecision(precision);
+    }
+    AV fx = f(x);
+    fx.setPrecision(precision);
+
+    std::vector<AV> gradient = NumericalGradient(f, x);
+    SMatrix h_inv = Identity(n, engine);
+
+    OptResult result(x, fx, 0, false);
+
+    for (int iteration = 0; iteration < max_iterations; ++iteration) {
+        result.iterations = iteration + 1;
+
+        // Check gradient convergence in plaintext after opening
+        double max_grad = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            auto opened_g = gradient[i].open();
+            double val = std::abs(static_cast<double>(opened_g[0]) / scale);
+            if (val > max_grad) max_grad = val;
+        }
+
+        if (max_grad < kSmallEpsilon) {
+            result.converged = true;
+            break;
+        }
+
+        // Search direction d = -H_inv * gradient
+        std::vector<AV> direction = MatVec(h_inv, gradient);
+        for (size_t i = 0; i < n; ++i) {
+            direction[i] = -direction[i];
+            direction[i].setPrecision(precision);
+        }
+
+        AV directional_derivative = Dot(gradient, direction);
+        directional_derivative.setPrecision(precision);
+
+        // Check if descent direction: directional_derivative < 0
+        auto opened_dd = directional_derivative.open();
+        double dd_val = static_cast<double>(opened_dd[0]) / scale;
+        if (dd_val >= 0.0) {
+            h_inv = Identity(n, engine);
+            for (size_t i = 0; i < n; ++i) {
+                direction[i] = -gradient[i];
+                direction[i].setPrecision(precision);
+            }
+            directional_derivative = Dot(gradient, direction);
+            directional_derivative.setPrecision(precision);
+            auto opened_dd2 = directional_derivative.open();
+            dd_val = static_cast<double>(opened_dd2[0]) / scale;
+        }
+
+        // Backtracking line search satisfying the Armijo sufficient-decrease rule
+        const double c1 = 1e-4;
+        double alpha = 1.0;
+        std::vector<AV> x_new = x;
+        AV fx_new = fx;
+
+        auto opened_fx = fx.open();
+        double fx_val = static_cast<double>(opened_fx[0]) / scale;
+
+        while (true) {
+            for (size_t i = 0; i < n; ++i) {
+                AV alpha_dir = direction[i];
+                alpha_dir.setPrecision(0);
+                alpha_dir = (*(alpha_dir * static_cast<DataType>(alpha * scale))) / scale;
+                x_new[i] = x[i] + alpha_dir;
+                x_new[i].setPrecision(precision);
+            }
+            fx_new = f(x_new);
+            fx_new.setPrecision(precision);
+
+            auto opened_fx_new = fx_new.open();
+            double fx_new_val = static_cast<double>(opened_fx_new[0]) / scale;
+
+            if (std::isfinite(fx_new_val) &&
+                fx_new_val <= fx_val + c1 * alpha * dd_val) {
+                break;
+            }
+            alpha *= 0.5;
+            if (alpha < 1e-5) {
+                x_new = x;
+                fx_new = fx;
+                break;
+            }
+        }
+
+        // Step = x_new - x
+        std::vector<AV> step(n, AV(1, engine));
+        double max_step = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            step[i] = x_new[i] - x[i];
+            step[i].setPrecision(precision);
+            auto opened_s = step[i].open();
+            double val = std::abs(static_cast<double>(opened_s[0]) / scale);
+            if (val > max_step) max_step = val;
+        }
+
+        std::vector<AV> gradient_new = NumericalGradient(f, x_new);
+        std::vector<AV> gradient_delta(n, AV(1, engine));
+        for (size_t i = 0; i < n; ++i) {
+            gradient_delta[i] = gradient_new[i] - gradient[i];
+            gradient_delta[i].setPrecision(precision);
+        }
+
+        AV curvature = Dot(step, gradient_delta);
+        curvature.setPrecision(precision);
+        auto opened_curv = curvature.open();
+        double curv_val = static_cast<double>(opened_curv[0]) / scale;
+
+        if (curv_val > kSmallEpsilon) {
+            // rho = 1.0 / curvature
+            AV scale_sq(1, engine);
+            scale_sq += (DataType(1) << (2 * precision));
+            auto scale_sq_b = scale_sq.a2b();
+            auto curv_b = curvature.a2b();
+            auto rho_b = (*scale_sq_b) / (*curv_b);
+            AV rho = *(rho_b->b2a());
+            rho.setPrecision(precision);
+
+            h_inv = BfgsInverseUpdate(h_inv, step, gradient_delta, rho);
+            h_inv.setPrecision(precision);
+        }
+
+        x = x_new;
+        gradient = gradient_new;
+        auto opened_new_fx = fx_new.open();
+        double obj_change = std::abs(fx_val - static_cast<double>(opened_new_fx[0]) / scale);
+        fx = fx_new;
+
+        if (engine.getPartyID() == 0) {
+            std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
+                      << "  neg_log_lik=" << std::fixed << std::setprecision(6) << static_cast<double>(opened_new_fx[0]) / scale
+                      << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
+                      << "  alpha=" << std::fixed << std::setprecision(4) << alpha
+                      << "  |step|=" << std::scientific << std::setprecision(3) << max_step
+                      << "  d_obj=" << obj_change << std::endl;
+        }
+
+        if (max_step < kSmallEpsilon && max_grad < kSmallEpsilon) {
+            result.converged = true;
+            break;
+        }
+    }
+
+    result.params = x;
+    result.value = fx;
+    return result;
+}
+
 
 int main(int argc, char** argv) {
     EngineRef engine = cdough_init(argc, argv);
@@ -1032,6 +1379,160 @@ int main(int argc, char** argv) {
         }
     }
     if (pID == 0) {
+        std::cout << "]" << std::endl;
+    }
+
+    // =========================================================================
+    // Validation for Identity, MatVec, Dot, BfgsInverseUpdate, and MinimizeBFGS
+    // =========================================================================
+    if (pID == 0) {
+        std::cout << "\n--- Testing Identity, MatVec, Dot, BfgsInverseUpdate, and MinimizeBFGS ---" << std::endl;
+    }
+
+    // 1. Test Identity
+    size_t dim = 3;
+    SMatrix sec_I = Identity(dim, engine);
+    auto opened_I = sec_I.open();
+    if (pID == 0) {
+        std::cout << "Secure Identity (3x3):" << std::endl;
+        for (size_t i = 0; i < dim; ++i) {
+            std::cout << "  [";
+            for (size_t j = 0; j < dim; ++j) {
+                double val = static_cast<double>(opened_I.data()[i * dim + j]) / scale;
+                std::cout << std::setw(6) << val << (j + 1 < dim ? ", " : "");
+            }
+            std::cout << "]" << std::endl;
+        }
+    }
+
+    // 2. Test Dot
+    std::vector<double> v1_plain = {1.5, -2.0, 3.0};
+    std::vector<double> v2_plain = {0.5, 4.0, -1.0};
+    double expected_dot = 1.5 * 0.5 + (-2.0) * 4.0 + 3.0 * (-1.0); // 0.75 - 8.0 - 3.0 = -10.25
+
+    std::vector<AV> v1_sec, v2_sec;
+    for (size_t i = 0; i < dim; ++i) {
+        cdough::Vector<DataType> p1(1, precision); p1[0] = static_cast<DataType>(v1_plain[i] * scale);
+        cdough::Vector<DataType> p2(1, precision); p2[0] = static_cast<DataType>(v2_plain[i] * scale);
+        v1_sec.push_back(engine.secret_share_a(p1, 0, precision));
+        v2_sec.push_back(engine.secret_share_a(p2, 0, precision));
+    }
+    AV sec_dot = Dot(v1_sec, v2_sec);
+    auto opened_dot = sec_dot.open();
+    if (pID == 0) {
+        double actual_dot = static_cast<double>(opened_dot[0]) / scale;
+        std::cout << "Dot Product:\n"
+                  << "  Plaintext: " << expected_dot << "\n"
+                  << "  MPC:       " << actual_dot << "\n"
+                  << "  Abs Error: " << std::abs(expected_dot - actual_dot) << std::endl;
+    }
+
+    // 3. Test MatVec with Identity: I * v1 == v1
+    std::vector<AV> sec_matvec = MatVec(sec_I, v1_sec);
+    std::vector<double> opened_matvec_vals;
+    for (size_t i = 0; i < dim; ++i) {
+        auto op_mv = sec_matvec[i].open();
+        opened_matvec_vals.push_back(static_cast<double>(op_mv[0]) / scale);
+    }
+    if (pID == 0) {
+        std::cout << "MatVec (I * v1):" << std::endl;
+        std::cout << "  Expected: [1.5, -2.0, 3.0]\n  MPC:      [";
+        for (size_t i = 0; i < dim; ++i) {
+            std::cout << opened_matvec_vals[i] << (i + 1 < dim ? ", " : "");
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    // 4. Test BfgsInverseUpdate
+    // s = [0.1, -0.2, 0.05], y = [0.2, -0.1, 0.1]
+    // rho = 1.0 / (y^T s) = 1.0 / (0.02 + 0.02 + 0.005) = 1.0 / 0.045 = 22.2222
+    std::vector<double> s_plain = {0.1, -0.2, 0.05};
+    std::vector<double> y_plain = {0.2, -0.1, 0.1};
+    double ys = 0.1 * 0.2 + (-0.2) * (-0.1) + 0.05 * 0.1; // 0.045
+    double rho_plain = 1.0 / ys;
+
+    std::vector<AV> s_sec, y_sec;
+    for (size_t i = 0; i < dim; ++i) {
+        cdough::Vector<DataType> ps(1, precision); ps[0] = static_cast<DataType>(s_plain[i] * scale);
+        cdough::Vector<DataType> py(1, precision); py[0] = static_cast<DataType>(y_plain[i] * scale);
+        s_sec.push_back(engine.secret_share_a(ps, 0, precision));
+        y_sec.push_back(engine.secret_share_a(py, 0, precision));
+    }
+    cdough::Vector<DataType> prho(1, precision); prho[0] = static_cast<DataType>(rho_plain * scale);
+    AV rho_sec = engine.secret_share_a(prho, 0, precision);
+
+    SMatrix sec_h_updated = BfgsInverseUpdate(sec_I, s_sec, y_sec, rho_sec);
+    auto opened_h_up = sec_h_updated.open();
+
+    // Plaintext computation of BfgsInverseUpdate from Identity
+    // left = I - rho * s * y^T
+    std::vector<std::vector<double>> left_plain(dim, std::vector<double>(dim, 0.0));
+    for (size_t i = 0; i < dim; ++i) {
+        for (size_t j = 0; j < dim; ++j) {
+            left_plain[i][j] = (i == j ? 1.0 : 0.0) - rho_plain * s_plain[i] * y_plain[j];
+        }
+    }
+    // updated = left * I * left^T + rho * s * s^T = left * left^T + rho * s * s^T
+    std::vector<std::vector<double>> expected_H(dim, std::vector<double>(dim, 0.0));
+    for (size_t i = 0; i < dim; ++i) {
+        for (size_t j = 0; j < dim; ++j) {
+            double sum = 0.0;
+            for (size_t k = 0; k < dim; ++k) {
+                sum += left_plain[i][k] * left_plain[j][k];
+            }
+            expected_H[i][j] = sum + rho_plain * s_plain[i] * s_plain[j];
+        }
+    }
+
+    if (pID == 0) {
+        std::cout << "BfgsInverseUpdate (from I):\n";
+        double max_h_err = 0.0;
+        for (size_t i = 0; i < dim; ++i) {
+            std::cout << "  Row " << i << " Plain: [";
+            for (size_t j = 0; j < dim; ++j) {
+                std::cout << std::setw(8) << std::fixed << std::setprecision(4) << expected_H[i][j] << (j + 1 < dim ? ", " : "");
+            }
+            std::cout << "]  MPC: [";
+            for (size_t j = 0; j < dim; ++j) {
+                double val = static_cast<double>(opened_h_up.data()[i * dim + j]) / scale;
+                double err = std::abs(expected_H[i][j] - val);
+                if (err > max_h_err) max_h_err = err;
+                std::cout << std::setw(8) << std::fixed << std::setprecision(4) << val << (j + 1 < dim ? ", " : "");
+            }
+            std::cout << "]" << std::endl;
+        }
+        std::cout << "  Max Matrix Abs Error: " << max_h_err << std::endl;
+    }
+
+    // 5. Test MinimizeBFGS
+    if (pID == 0) {
+        std::cout << "\nRunning MinimizeBFGS (Secure Quasi-Newton Optimizer)..." << std::endl;
+    }
+    // Initial parameter guess: [0.0, 0.0, 0.0]
+    std::vector<AV> init_params_sec;
+    for (size_t i = 0; i < dim; ++i) {
+        cdough::Vector<DataType> p_init(1, precision); p_init[0] = 0;
+        init_params_sec.push_back(engine.secret_share_a(p_init, 0, precision));
+    }
+
+    OptResult opt_res = MinimizeBFGS(objective_func, init_params_sec, 50);
+
+    auto opened_final_val = opt_res.value.open();
+    std::vector<double> opened_final_params;
+    for (size_t i = 0; i < dim; ++i) {
+        auto op_p = opt_res.params[i].open();
+        opened_final_params.push_back(static_cast<double>(op_p[0]) / scale);
+    }
+
+    if (pID == 0) {
+        std::cout << "MinimizeBFGS Result:\n"
+                  << "  Iterations: " << opt_res.iterations << "\n"
+                  << "  Converged:  " << (opt_res.converged ? "True" : "False") << "\n"
+                  << "  Final Objective Value: " << static_cast<double>(opened_final_val[0]) / scale << "\n"
+                  << "  Fitted Parameters [beta_0, beta_1, s]: [";
+        for (size_t i = 0; i < dim; ++i) {
+            std::cout << opened_final_params[i] << (i + 1 < dim ? ", " : "");
+        }
         std::cout << "]" << std::endl;
         std::cout << "\nAll functions executed and validated successfully against plaintext!" << std::endl;
     }
