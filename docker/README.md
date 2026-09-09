@@ -11,6 +11,11 @@ experiments. It targets
 - [Iterating on source](#iterating-on-source)
 - [Troubleshooting](#troubleshooting)
 
+> **Running across separate organizations?** This document covers a cluster you
+> control. For a real multi-party deployment where the parties do not trust each other
+> — mutually-authenticated TLS, no SSH between parties, per-party private data — see
+> [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## What the image gives you
 
 `docker build` produces an image where every dependency is already compiled, so
@@ -139,6 +144,13 @@ failure on a lean base image.
 | `ca-certificates` | TLS roots | cloning at build time |
 | `perl` | `perl` | NTL's `./configure` is a Perl script |
 | `python3-venv` | venv | Ubuntu 24.04 enforces PEP 668 |
+
+### TLS (optional, `-DTLS=ON`)
+
+`libssl-dev` is in the image. Building with `-DTLS=ON` puts every party-to-party
+connection inside a mutually-authenticated TLS 1.3 session; it is **off by default** so
+benchmark builds stay comparable with published numbers. All parties must agree on the
+setting, since it changes the wire protocol. See [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ### Python — `requirements.txt`, installed to `/opt/venv`
 

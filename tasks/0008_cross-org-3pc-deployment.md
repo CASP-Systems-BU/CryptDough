@@ -6,7 +6,7 @@
 - Requested by: Adam Godel
 - Owner: Adam Godel
 - Date: 2026-09-09
-- Status: In Progress
+- Status: Done (validated on blinky/pinky/inky)
 - Estimated effort: 3-5 days (the TLS retrofit dominates)
 - Related documents: [tasks/0007](0007_dockerize-cryptdough.md), [docker/README.md](../docker/README.md)
 - Branch: orchestration
@@ -165,6 +165,54 @@ Cons:
 - Tests updated or added: TLS on/off suite runs; pinning-rejection check.
 - Documentation updated: `DEPLOYMENT.md`, `docker/README.md`, main `README.md` pointer.
 
+## Verification Results (2026-09-09, blinky/pinky/inky)
+
+### TLS transport
+- Builds and runs with `-DTLS=OFF` (default): behaviour unchanged.
+- Builds and runs with `-DTLS=ON`: full `test_primitives` passes, exit 0.
+- **Wire is encrypted.** Packet capture of a 3-party run: **108,930 packets classified
+  as TLS with TLS on, 0 with TLS off.** The TLS-off control is what makes this
+  meaningful -- it shows the check can detect failure.
+- **TLS 1.3 specifically:** ServerHello `supported_version 0x0304`, cipher
+  `TLS_AES_256_GCM_SHA384` (a TLS 1.3-only suite).
+- **Handshake count:** exactly 3 for 3 parties at 1 thread, matching the expected
+  connections 0->1, 0->2, 1->2.
+- **Pinning fails closed:** a valid but unpinned certificate is rejected on both the
+  client and server side, naming the offending fingerprint, with no plaintext fallback.
+- **Structural guarantee:** `Conn` keeps the descriptor private, so bypassing TLS is a
+  compile error rather than a silent leak. `grep` confirms zero raw `send`/`recv` calls
+  remain in the communicator.
+
+### Cross-organizational launch
+- Three machines, three independently-built images, three separate keypairs (private
+  keys never left their machines), certificates exchanged as public files.
+- Launched in descending rank order with `run-party-external.sh`; **no SSH between
+  parties**. All three completed successfully; rank 0 ran 85 passing tests.
+- **Rank 0 needs no inbound ports -- verified empirically.** During a run with
+  `base_port=26000`, `-t 1`: rank 0 opened *no listening sockets*, rank 1 listened on
+  26001, rank 2 on 26002 and 26005 -- exactly `base + H*T*i + T*j`.
+- `check-manifest.sh` detects compile-time mismatches before launch and prints the
+  exact per-rank inbound port ranges.
+- `examples/ex6_three_party_private_input.cpp` runs with three per-party CSVs; only the
+  owning party opens each file.
+
+### Bugs found and fixed during validation
+1. `socket_connect` retried `connect()` on the *same* descriptor after a failure, which
+   can never succeed. Each attempt now gets a fresh socket. (Pre-existing, unrelated to
+   TLS; found while adding the retry ceiling.)
+2. One `recv()` site read a whole share without looping, so a short read would have
+   silently produced a partial value even over plain TCP. Now uses `read_exact`.
+3. Container could not read bind-mounted TLS material: the host directory is 0700 owned
+   by the host user, and the container runs as an unrelated uid. The entrypoint now
+   stages the material as the container user while still root, keeping the key 0600.
+4. Recursive retry on `SSL_ERROR_WANT_READ/WRITE` could grow the stack; replaced with
+   loops.
+
+### Carried over from task 0007
+- **Protocol 2 fails** the suite at `test_join.cpp:208`. Confirmed **pre-existing**: the
+  identical assertion fails on bare metal with no Docker involved. Unrelated to this task.
+- The 2PC/REAL-triples coproto/boost issue remains open (task 0007).
+
 ## Approval
 - [x] Task document reviewed
 - [x] Approved to implement (plan approved 2026-09-09)
@@ -173,3 +221,4 @@ Cons:
 
 ## Change Log
 - 2026-09-09: Initial draft created; design decisions confirmed with the requester.
+- 2026-09-09: Implemented and validated on three machines; four bugs found and fixed.

@@ -8,5 +8,5 @@ Short list of all tasks so far.
 - 0004 — Factor out logistic-regression value type — Status: Done — [tasks/0004_factor-out-logistic-regression-value-type.md](0004_factor-out-logistic-regression-value-type.md)
 - 0005 — Add a simulated fixed-precision value type — Status: Done — [tasks/0005_simulated-float-value-type.md](0005_simulated-float-value-type.md)
 - 0006 — Make Taylor math compatible with SimulatedFloat — Status: Done — [tasks/0006_simulated-float-taylor-math.md](0006_simulated-float-taylor-math.md)
-- 0007 — Dockerize CryptDough for portable experiment execution — Status: In Progress — [tasks/0007_dockerize-cryptdough.md](0007_dockerize-cryptdough.md)
-- 0008 — Real 3PC across three organizations (mTLS, SSH-free launch, per-party data) — Status: In Progress — [tasks/0008_cross-org-3pc-deployment.md](0008_cross-org-3pc-deployment.md)
+- 0007 — Dockerize CryptDough for portable experiment execution — Status: Done — [tasks/0007_dockerize-cryptdough.md](0007_dockerize-cryptdough.md)
+- 0008 — Real 3PC across three organizations (mTLS, SSH-free launch, per-party data) — Status: Done — [tasks/0008_cross-org-3pc-deployment.md](0008_cross-org-3pc-deployment.md)

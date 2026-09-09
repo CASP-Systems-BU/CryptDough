@@ -87,6 +87,50 @@ if [[ -d "${CDOUGH_KEY_DIR}" && "$(id -u)" -eq 0 ]]; then
     install_keys
 fi
 
+# ---------------------------------------------------------------------------
+# TLS material
+#
+# The certificates and key are bind-mounted from the host, where they belong to the
+# host user and usually sit in a 0700 directory (a private key should not be world
+# readable on a shared machine). The container runs as an unrelated uid, so it cannot
+# traverse that directory at all. Since we are still root here, copy what was asked
+# for into a private staging directory owned by the container user, and repoint the
+# variables at the copies. The key stays 0600 and never becomes readable to anyone
+# else inside the container.
+# ---------------------------------------------------------------------------
+stage_tls() {
+    local staged_dir=/run/cdough-tls
+    install -d -m 0700 -o "${CDOUGH_USER}" -g "${CDOUGH_USER}" "${staged_dir}"
+
+    if [[ -n "${CDOUGH_TLS_CERT:-}" && -f "${CDOUGH_TLS_CERT}" ]]; then
+        install -m 0644 -o "${CDOUGH_USER}" -g "${CDOUGH_USER}" \
+            "${CDOUGH_TLS_CERT}" "${staged_dir}/own.crt"
+        export CDOUGH_TLS_CERT="${staged_dir}/own.crt"
+    fi
+    if [[ -n "${CDOUGH_TLS_KEY:-}" && -f "${CDOUGH_TLS_KEY}" ]]; then
+        install -m 0600 -o "${CDOUGH_USER}" -g "${CDOUGH_USER}" \
+            "${CDOUGH_TLS_KEY}" "${staged_dir}/own.key"
+        export CDOUGH_TLS_KEY="${staged_dir}/own.key"
+    fi
+    if [[ -n "${CDOUGH_TLS_PEER_CERTS:-}" ]]; then
+        local staged_list="" index=0
+        local IFS=','
+        for peer in ${CDOUGH_TLS_PEER_CERTS}; do
+            [[ -f "${peer}" ]] || { log "warning: peer certificate not found: ${peer}"; continue; }
+            install -m 0644 -o "${CDOUGH_USER}" -g "${CDOUGH_USER}" \
+                "${peer}" "${staged_dir}/peer${index}.crt"
+            staged_list+="${staged_dir}/peer${index}.crt,"
+            index=$((index + 1))
+        done
+        export CDOUGH_TLS_PEER_CERTS="${staged_list%,}"
+        log "staged TLS material (${index} pinned peer certificate(s))"
+    fi
+}
+
+if [[ "$(id -u)" -eq 0 && ( -n "${CDOUGH_TLS_CERT:-}" || -n "${CDOUGH_TLS_KEY:-}" ) ]]; then
+    stage_tls
+fi
+
 if [[ "${CDOUGH_SSHD:-0}" == "1" ]]; then
     if [[ "$(id -u)" -ne 0 ]]; then
         log "FATAL: CDOUGH_SSHD=1 requires the entrypoint to start as root"

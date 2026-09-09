@@ -1,0 +1,72 @@
+# CryptDough cross-organizational run manifest.
+#
+# ONE of these is agreed between the parties before a run and distributed to all of
+# them. Every party checks its local build against it with docker/check-manifest.sh.
+#
+# Why this file exists: the port each connection uses is
+#     base_port + num_parties * threads * i + threads * j
+# so if the parties disagree about `threads`, the port arithmetic diverges and nothing
+# connects -- with no error message that explains why. The same is true of every
+# compile-time protocol option: a mismatch produces a hang or, worse, a wrong answer.
+
+run_id: 2026-09-example
+git_commit: 0000000000000000000000000000000000000000   # exact SHA every party builds
+
+# --- Party assignment -------------------------------------------------------
+#
+# Order is rank order and is significant. Party i connects to every j > i and listens
+# for every j < i, so:
+#   * rank 0 needs NO inbound ports at all -- give it to the most firewalled party
+#   * rank 2 is the most exposed -- give it to whoever can open ports most easily
+parties:
+  - rank: 0
+    org: "Organization A"
+    host: "mpc-a.example.edu"     # resolvable by the other parties
+    cert: "party0.crt"
+  - rank: 1
+    org: "Organization B"
+    host: "mpc-b.example.org"
+    cert: "party1.crt"
+  - rank: 2
+    org: "Organization C"
+    host: "mpc-c.example.com"
+    cert: "party2.crt"
+
+# --- Network ----------------------------------------------------------------
+base_port: 20000
+
+# --- Runtime arguments (identical for every party) --------------------------
+# Written verbatim into a file consumed with the framework's own -f/--file-args
+# mechanism (include/backend/common/setup.h), so no party can drift.
+program: micro_primitives
+runtime_args:
+  threads: 8          # -t   MUST match: the port arithmetic depends on it
+  batch: -12          # -b
+  rows: 1048576       # -r
+  setting: lan        # -s
+  num_engines: 1      # -neng
+
+# --- Compile-time options (identical for every party) -----------------------
+# These change the wire protocol or the computation; a mismatch is silent.
+cmake:
+  PROTOCOL: 3         # replicated 3PC (Araki et al.) -- SEMI-HONEST, see DEPLOYMENT.md
+  COMM: NOCOPY
+  COMM_THREADS: 4
+  TLS: "ON"           # mutually-authenticated TLS 1.3; must match everywhere
+  TRIPLES: ZERO
+  DEFAULT_BITWIDTH: 32
+  SORT_PROTO: QUICKSORT
+  BOOLEAN_ADDER: AUTO
+  DIVISION_CORRECTION: "ON"
+
+# May differ per party (each builds on its own CPU):
+#   OPT_LEVEL, and the -march=native the compiler selects.
+
+# --- Data -------------------------------------------------------------------
+# Only the owning party ever opens its file; the others allocate zeros and receive
+# shares (encoded_table.h inputCSVTableData). Schema must be identical everywhere
+# because all parties construct the same table.
+data:
+  mount: /data                     # each party mounts ITS OWN directory here
+  file: patients.csv
+  schema: ["id", "zip", "age", "score"]

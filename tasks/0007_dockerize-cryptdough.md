@@ -6,7 +6,7 @@
 - Requested by: Adam Godel
 - Owner: Adam Godel
 - Date: 2026-09-09
-- Status: In Progress (validated on the blinky/pinky/inky/clyde cluster)
+- Status: Done (validated on the blinky/pinky/inky/clyde cluster)
 - Estimated effort: 1-2 days (image build alone is 30-60 min per iteration)
 - Target completion date: TBD
 - Related issue or PR: n/a
@@ -267,7 +267,12 @@ LAN at ~0.1 ms RTT. Docker 29.1.3 on all four.
    the failure surfaces much later as a confusing "No such file or directory" from
    `stdbuf`. `run-node.sh` now detects this and refuses with a clear message.
 
-### Open issue
+### Open issues
+**Protocol 2 fails the suite** at `test_join.cpp:208` (a correctness assertion, under
+DUMMY triples). Confirmed **pre-existing and not container-induced**: the identical
+assertion fails on bare metal with no Docker involved. Protocols 3 and 4 pass fully
+under both communicators.
+
 PROTOCOL=2 with REAL Beaver triples does not compile in the container. Only this
 configuration is affected; the test suite uses DUMMY triples and passes.
 

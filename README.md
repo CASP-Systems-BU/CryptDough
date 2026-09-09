@@ -80,6 +80,12 @@ Experiment binaries are still compiled on the machine that runs them, because
 `CMakeLists.txt` builds with `-march=native`. See [`docker/README.md`](./docker/README.md)
 for the cluster setup, the full dependency list, and the communicator details.
 
+For a deployment across separate organizations that do not trust one another — with
+mutually-authenticated TLS on every connection, no SSH between parties, and each party's
+private data staying on its own machine — see
+[`docker/DEPLOYMENT.md`](./docker/DEPLOYMENT.md). Build with `-DTLS=ON` for that case;
+it is off by default so benchmark results remain comparable.
+
 ## Building CryptDough
 
 CryptDough is a multi-party computation framework and requires installation on different nodes, where each node is a computing party. However, for testing purposes, we enable running computation from either a single-node or a cluster.

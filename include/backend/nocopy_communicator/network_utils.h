@@ -415,7 +415,7 @@ inline int socket_create(int port) {
  * only the connecting side can time out; that asymmetry is why parties are started in
  * descending rank order (party i only ever connects to j > i). The retry budget below
  * is generous enough to also tolerate a peer restarting mid-deployment, which matters
- * when the parties are separate organisations launching independently.
+ * when the parties are separate organizations launching independently.
  */
 inline int socket_connect(const std::string& hostname, int port) {
     struct addrinfo hints{}, *res;

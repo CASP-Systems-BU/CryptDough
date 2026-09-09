@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Generate this party's TLS identity for a cross-organisational CryptDough run.
+# Generate this party's TLS identity for a cross-organizational CryptDough run.
 #
-# Each organisation runs this ONCE, keeps the private key to itself, and sends the
+# Each organization runs this ONCE, keeps the private key to itself, and sends the
 # certificate (public, safe to email) to the other parties. Everyone then pins
 # everyone else's certificate by SHA-256 fingerprint -- there is no CA, because with a
 # small fixed set of mutually-distrusting parties there is no third party they would
