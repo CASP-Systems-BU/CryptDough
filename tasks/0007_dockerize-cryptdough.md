@@ -6,7 +6,7 @@
 - Requested by: Adam Godel
 - Owner: Adam Godel
 - Date: 2026-09-09
-- Status: In Progress
+- Status: In Progress (validated on the blinky/pinky/inky/clyde cluster)
 - Estimated effort: 1-2 days (image build alone is 30-60 min per iteration)
 - Target completion date: TBD
 - Related issue or PR: n/a
@@ -225,6 +225,58 @@ Cons:
 - Tests updated or added: none required; the existing suite is the acceptance test.
 - Documentation updated: `docker/README.md` written; main `README.md` gains a pointer to it.
 
+## Verification Results (2026-09-09, blinky/pinky/inky/clyde)
+
+Cluster: 4x Ubuntu 24.04, x86_64, 192 cores, ~251 GB RAM, private 192.168.100.0/24
+LAN at ~0.1 ms RTT. Docker 29.1.3 on all four.
+
+### Passed
+- Image builds (1.65 GB, ~5 min at `-j48`); loads on peers in ~14 s each.
+- CMake configure finds every dependency from `/opt/cdough-deps` via
+  `CMAKE_PREFIX_PATH` with no `build/*-install` in the source tree.
+- Single container: `test_primitives` passes under nocopy and under MPI.
+- Full suite protocol 3, both communicators: `[[ All 3PC 1 thread MPI tests passed! ]]`,
+  exit 0.
+- Three-machine LAN run: `run_experiment.py -s lan -c nocopy` works unmodified; the
+  binary is scp'd into the peer containers and all tests pass.
+- SSH proven to terminate *inside* the peer container (`/opt/cryptdough` and
+  `/opt/cdough-deps` exist there; they do not exist on the peer host).
+- `--add-host` works under `--network host`, so `node0..node3` map to real machine
+  names without editing `/etc/hosts` or needing root.
+- SSH-free fallback (`run-party.sh`) works across three machines.
+- `micro_sorting`, 3PC, 2^20 rows, 8 worker + 4 comm threads, containers on three
+  separate machines over the LAN: Quicksort 3.18 s, Bitonic 7.04 s, Pairwise 6.71 s,
+  Radix 6.50 s, Overall 23.43 s.
+- Container vs bare metal on an idle machine, stable primitives (AND, MULT, EQ, PPA):
+  parity within noise. High-variance ops (EQ_A, GR_A, RCA<) swing equally in both, so
+  the variance is loopback-nocopy noise, not container overhead. Caveat: the container
+  has gcc 13.3 and the bare-metal build gcc 12.4, so this is not a pure isolation of
+  container cost.
+
+### Bugs found and fixed during validation
+1. `docker exec` bypasses the ENTRYPOINT that drops privileges, so it runs as root.
+   All docs and `run-node.sh` hints now use `-u cdough`.
+2. Ubuntu's `docker.io` ships without buildx, so the BuildKit-only
+   `docker/Dockerfile.dockerignore` was silently ignored. Moved to a root
+   `.dockerignore`, which both builders honor.
+3. `CMakeLists.txt:154,167` hardcode `build/secure-join-install` into the source tree,
+   bypassing CMake's search. The entrypoint now creates that symlink at container
+   start (it cannot be baked into the image because `build/` is a volume).
+4. Under `--network host`, port 2222 is a host-wide resource, so only one CryptDough
+   container can run per machine. A second one starts but its sshd cannot bind, and
+   the failure surfaces much later as a confusing "No such file or directory" from
+   `stdbuf`. `run-node.sh` now detects this and refuses with a clear message.
+
+### Open issue
+PROTOCOL=2 with REAL Beaver triples does not compile in the container. Only this
+configuration is affected; the test suite uses DUMMY triples and passes.
+
+### Operational note
+The legacy (non-BuildKit) builder does not invalidate `COPY --from=<stage>` when the
+source stage is rebuilt. Changing a dependency pin requires `--no-cache`, or install
+`docker-buildx`. This cost two misleading rebuild cycles during validation and is
+documented in `docker/README.md`.
+
 ## Approval
 - [x] Task document reviewed
 - [x] Approved to implement
@@ -233,3 +285,4 @@ Cons:
 
 ## Change Log
 - 2026-09-09: Initial draft created and approved.
+- 2026-09-09: Validated end-to-end on the blinky/pinky/inky/clyde cluster; four bugs found and fixed; one open issue (2PC with REAL triples) documented.

@@ -117,17 +117,10 @@ RUN echo "==== Cloning libOTe @ ${LIBOTE_COMMIT}..." \
     && git submodule update --init
 
 # --- cryptoTools (always needed; see CMakeLists.txt:157) --------------------
-#
-# The thirdparty flags here must MATCH the libOTe step below. cryptoTools vendors
-# coproto and installs coproto/config.h into the shared prefix; building it bare
-# (as scripts/setup/_setup_cryptotools.sh does) writes a header with
-# COPROTO_ENABLE_BOOST undefined, and the later libOTe build -- which does enable
-# boost -- does not overwrite it. The stale header compiles cp::asioConnect out of
-# existence, which breaks tests/test_libote.cpp under PROTOCOL=2 with REAL triples.
+# Matches scripts/setup/_setup_cryptotools.sh exactly.
 RUN echo "==== Building cryptoTools..." \
     && cd libOTe/cryptoTools \
-    && python3 build.py --par=${BUILD_JOBS} --boost --sodium --relic \
-        -DSODIUM_MONTGOMERY=false --install=${DEPS_PREFIX} \
+    && python3 build.py --par=${BUILD_JOBS} --install=${DEPS_PREFIX} \
     && echo "==== cryptoTools installed"
 
 # --- libOTe (only linked for PROTOCOL=2 with REAL triples) ------------------
@@ -140,6 +133,7 @@ RUN echo "==== Building libOTe..." \
        fi \
     && python3 build.py --par=${BUILD_JOBS} --boost --sodium --relic \
         -DSODIUM_MONTGOMERY=false --all --install=${DEPS_PREFIX} ${SSE_OPTION} \
+        -DCOPROTO_ENABLE_BOOST=ON -DCOPROTO_FETCH_BOOST=ON \
     && echo "==== libOTe installed"
 
 # --- secure-join (2PC OPRF) ------------------------------------------------

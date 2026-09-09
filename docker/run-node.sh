@@ -109,6 +109,23 @@ fi
 
 docker rm -f "${NAME}" >/dev/null 2>&1 || true
 
+# --- port 2222 is a host-wide resource under --network host -----------------
+# Only one CryptDough container can run per machine. A second one starts fine but
+# its sshd cannot bind, so it is silently unreachable; startmpc and scp then talk
+# to whichever container *does* own 2222, and the run fails much later with a
+# confusing "stdbuf: failed to run command './<binary>': No such file or directory".
+# Fail loudly here instead.
+if ss -tln 2>/dev/null | grep -qE '[:.]2222[[:space:]]'; then
+    holder=""
+    for c in $(docker ps --format '{{.Names}}'); do
+        if docker exec "$c" pgrep -x sshd >/dev/null 2>&1; then holder="$c"; break; fi
+    done
+    echo "ERROR: port 2222 on this host is already in use${holder:+ by container '${holder}'}." >&2
+    echo "       Under --network host only one CryptDough container can run per machine." >&2
+    echo "       Stop the other one first:  docker rm -f ${holder:-<container>}" >&2
+    exit 1
+fi
+
 echo "Starting ${NAME} from ${IMAGE}..."
 docker run -d \
     --name "${NAME}" \
