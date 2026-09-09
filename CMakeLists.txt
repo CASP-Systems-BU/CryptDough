@@ -48,6 +48,20 @@ if (COMM_THREADS)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D NOCOPY_COMMUNICATOR_THREADS=${COMM_THREADS}")
 endif (COMM_THREADS)
 
+# Option: mutually-authenticated TLS 1.3 on every party-to-party connection.
+#
+# OFF by default so that benchmark builds are byte-for-byte what they always were --
+# TLS record encryption sits on the critical path and would make published numbers
+# incomparable. Turn it ON for real deployments across untrusted networks, where the
+# plaintext PRG seed exchange in backend/common/rand_setup.h would otherwise hand an
+# on-path attacker every common PRG. All parties must agree: it changes the wire format.
+option(TLS "Encrypt and authenticate party-to-party traffic with TLS 1.3" OFF)
+if (TLS)
+    find_package(OpenSSL REQUIRED)
+    add_compile_definitions(CDOUGH_ENABLE_TLS)
+    message(STATUS "TLS enabled: OpenSSL ${OPENSSL_VERSION}")
+endif (TLS)
+
 set(SINGLE 0 CACHE STRING "whether this is a communicator (0) or single (1) execution")
 if(SINGLE EQUAL 1)
     add_definitions(-DSINGLE_EXECUTION)
@@ -138,6 +152,10 @@ find_package(SQLite3)
 
 # Base list of link libraries
 set(LINK_LIBRARIES "${MPI_LIBRARIES}" "${SODIUM_LIBRARY}" "${NTL_LIBRARY}")
+
+if (TLS)
+    list(APPEND LINK_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+endif (TLS)
 
 # Add libOTe and SecureJoin for 2pc only
 if (PROTOCOL EQUAL "2" AND LINK_LIBOTE)

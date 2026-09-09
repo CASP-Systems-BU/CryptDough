@@ -5,20 +5,24 @@
 
 #include <unordered_map>
 
+#include "backend/nocopy_communicator/network_utils.h"
 #include "core/communication/communicator.h"
 #include "debug/cdough_debug.h"
 #include "no_copy_ring.h"
 
 /**
- * @brief Storage for a NoCopy send ring and socket file descriptor.
+ * @brief Storage for a NoCopy send ring and the party-to-party connection.
  *
+ * Holds a `Conn` rather than a raw descriptor: `Conn` keeps the descriptor private so
+ * that every byte goes through its send/receive members. When built with -DTLS=ON that
+ * is what guarantees no traffic can bypass the TLS session.
  */
 struct PartyInfoBasic {
-    int sockfd;
+    Conn conn;
 
     NoCopyRing sendRing;
 
-    PartyInfoBasic(int sockfd, int ringSize) : sockfd(sockfd), sendRing(ringSize) {}
+    PartyInfoBasic(Conn conn, int ringSize) : conn(conn), sendRing(ringSize) {}
 };
 
 namespace cdough {
@@ -35,12 +39,12 @@ class NoCopyCommunicator : public Communicator {
      * @brief Construct a new No Copy Communicator
      *
      * @param _currentId party ID of this node
-     * @param socket_map map (stored as a vector) of party IDs to socket file
-     * descriptors. The current party ID (i.e., `_currentID`) can contain any
-     * value in this map and should be ignored.
+     * @param socket_map map (stored as a vector) of party IDs to connections.
+     * The current party ID (i.e., `_currentID`) can contain any value in this map
+     * and should be ignored.
      * @param _numParties The number of parties in this execution
      */
-    NoCopyCommunicator(int _currentId, const std::vector<int>& socket_map, int _numParties,
+    NoCopyCommunicator(int _currentId, const std::vector<Conn>& socket_map, int _numParties,
                        std::string host_prefix, double latency, double bandwidth,
                        cdough::service::Setting setting = cdough::service::Setting::SAME)
         : Communicator(_currentId, host_prefix, latency, bandwidth, setting),
@@ -60,7 +64,7 @@ class NoCopyCommunicator : public Communicator {
     ~NoCopyCommunicator() {
         for (auto& party : _party_map) {
             if (party) {
-                close(party->sockfd);
+                party->conn.close_conn();
             }
         }
     }
@@ -163,10 +167,15 @@ class NoCopyCommunicator : public Communicator {
 
         printType<T>("receiveShare", "From: " + std::to_string(from_id));
 
-        int sockfd = get_party(from_id).sockfd;
+        Conn& conn = get_party(from_id).conn;
 
         T data;
-        recv(sockfd, &data, sizeof(data), 0);
+        // read_exact rather than a single read: a short read here would have silently
+        // returned a partially-filled share.
+        if (conn.read_exact(reinterpret_cast<char*>(&data), sizeof(data)) < 0) {
+            throw std::runtime_error("receiveShare: connection closed by party " +
+                                     std::to_string(from_id));
+        }
 
         _share = data;
 #endif
@@ -196,7 +205,7 @@ class NoCopyCommunicator : public Communicator {
 
         printType<T>("receiveSharesVector", "From: " + std::to_string(from_id));
 
-        int sockfd = get_party(from_id).sockfd;
+        Conn& conn = get_party(from_id).conn;
 
         size_t totalBytes = _size * sizeof(T);
         size_t bytesProcessed = 0;
@@ -206,7 +215,7 @@ class NoCopyCommunicator : public Communicator {
 
             char* dataPtr = reinterpret_cast<char*>(&_shareVector[0]) + bytesProcessed;
 
-            ssize_t receivedBytes = recv(sockfd, dataPtr, remainingBytes, 0);
+            ssize_t receivedBytes = conn.read_some(dataPtr, remainingBytes);
 
             if (receivedBytes > 0) {
                 bytesProcessed += receivedBytes;
@@ -253,14 +262,14 @@ class NoCopyCommunicator : public Communicator {
         size_t totalBytes = _size * sizeof(T);
         size_t bytesProcessed = 0;
 
-        int sockfd = get_party(from_id).sockfd;
+        Conn& conn = get_party(from_id).conn;
 
         while (bytesProcessed < totalBytes) {
             size_t remainingBytes = totalBytes - bytesProcessed;
 
             char* dataPtr = reinterpret_cast<char*>(&received_shares[0]) + bytesProcessed;
 
-            ssize_t receivedBytes = recv(sockfd, dataPtr, remainingBytes, 0);
+            ssize_t receivedBytes = conn.read_some(dataPtr, remainingBytes);
 
             if (receivedBytes > 0) {
                 bytesProcessed += receivedBytes;
@@ -334,7 +343,7 @@ class NoCopyCommunicator : public Communicator {
             // Convert relative ID to PartyID
             int from_id = (numParties + partyID[party_idx] + this->currentId) % numParties;
 
-            int sockfd = get_party(from_id).sockfd;
+            Conn& conn = get_party(from_id).conn;
 
             auto size = shares[party_idx].size();
 
@@ -351,7 +360,7 @@ class NoCopyCommunicator : public Communicator {
 
                 char* dataPtr = reinterpret_cast<char*>(temp_recv_vector.data()) + bytesProcessed;
 
-                ssize_t receivedBytes = recv(sockfd, dataPtr, bytesToCopy, 0);
+                ssize_t receivedBytes = conn.read_some(dataPtr, bytesToCopy);
 
                 if (receivedBytes > 0) {
                     bytesProcessed += receivedBytes;

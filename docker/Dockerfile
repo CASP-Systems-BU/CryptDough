@@ -48,6 +48,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps coreutils util-linux \
         dnsutils iproute2 iputils-ping \
         sudo ca-certificates perl \
+        `# TLS transport (-DTLS=ON); see docker/DEPLOYMENT.md` \
+        libssl-dev \
         `# convenience for debugging inside a running container` \
         netcat-openbsd curl less nano \
     && rm -rf /var/lib/apt/lists/*
