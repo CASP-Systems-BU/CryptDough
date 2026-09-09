@@ -13,6 +13,7 @@ NOTICE: This is an academic proof-of-concept prototype, delivered as is without 
 ## Table of Contents
 
 - [Dependencies](#dependencies)
+- [Docker](#docker)
 - [Building CryptDough](#building-cryptdough)
   - [Single-Node](#single-node)
   - [Cluster](#cluster)
@@ -61,6 +62,23 @@ In addition to the following open source libraries:
 
 > [!IMPORTANT]
 > You should still run `setup.sh` even if you install the dependencies manually, because other libraries will be compiled and built manually. You can ignore errors from, e.g. `apt` not being installed.
+
+## Docker
+
+If you would rather not install the dependencies by hand, [`docker/`](./docker/README.md)
+packages the whole toolchain into an image: every apt package, all five source-built
+libraries at pinned commits, and the `startmpc` wiring for the no-copy communicator.
+Setup on a new machine becomes installing Docker and loading the image.
+
+```bash
+$ docker build -t cryptdough:latest -f docker/Dockerfile .
+$ ./docker/run-node.sh --nodes node0,node1,node2      # on every machine
+$ docker exec -it cdough ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
+```
+
+Experiment binaries are still compiled on the machine that runs them, because
+`CMakeLists.txt` builds with `-march=native`. See [`docker/README.md`](./docker/README.md)
+for the cluster setup, the full dependency list, and the communicator details.
 
 ## Building CryptDough
 

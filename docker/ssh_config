@@ -1,0 +1,25 @@
+# Dropped into /etc/ssh/ssh_config.d/ inside the CryptDough image.
+#
+# This block is what lets startmpc and run_experiment.py keep calling plain
+# `ssh <host>` / `scp <file> <host>:<path>` with no port flag while still reaching
+# a peer *container* on 2222. Nothing in the repository has to learn about the port.
+#
+# Adjust the Host patterns if your cluster uses a different node prefix
+# (run_experiment.py's -x flag).
+Host node* blinky pinky inky clyde
+    Port 2222
+    User cdough
+    # Containers are recreated constantly, so their host keys churn. This is a
+    # benchmarking cluster on a trusted network; the repository README already
+    # notes that the SSH channel is a testing convenience and is not part of the
+    # MPC security model.
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+    # Reuse one TCP connection for the many ssh/scp calls a sweep makes.
+    ControlMaster auto
+    ControlPath /tmp/.ssh-mux-%r@%h:%p
+    ControlPersist 10m
+    ServerAliveInterval 60
+    ServerAliveCountMax 60
+    SendEnv STARTMPC_*
