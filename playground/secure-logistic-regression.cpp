@@ -1,3 +1,4 @@
+#include <cmath>
 #include <numeric>
 #include <vector>
 #include <functional>
@@ -20,26 +21,35 @@ using PMatrix = PlainMatrix<DataType>;
 const int precision = 16;
 const DataType scale = 1 << precision;
 
-const float kLn2 = 0.6931;
-const float kLn2_inv = 1.4427;
-const float kSqrt2 = 1.4142;
-const float kSqrt1_2 = 0.7071;
+const double kLn2 = 0.69314718055994531;
+const double kLn2_inv = 1.44269504088896341;
+const double kSqrt2 = 1.41421356237309505;
+const double kSqrt1_2 = 0.70710678118654752;
 const float kSmallEpsilon = 0.0001;
 const float kSeriesTolerance = 0.0001;
-const float kNumericalGradientStep = 0.001;
+const float kNumericalGradientStep = 0.05;
+const float kMaxExpArg = 10.0;
 
-const DataType kLn2_scaled = (kLn2 * scale);
-const DataType kLn2_inv_scaled = (kLn2_inv * scale);
-const DataType kSqrt2_scaled = (kSqrt2 * scale);
-const DataType kSqrt1_2_scaled = (kSqrt1_2 * scale);
+const DataType kLn2_scaled = std::llround(kLn2 * scale);
+const DataType kLn2_inv_scaled = std::llround(kLn2_inv * scale);
+const DataType kSqrt2_scaled = std::llround(kSqrt2 * scale);
+const DataType kSqrt1_2_scaled = std::llround(kSqrt1_2 * scale);
 const DataType kSmallEpsilon_scaled = (kSmallEpsilon * scale);
 const DataType kSeriesTolerance_scaled = (kSeriesTolerance * scale);
 const DataType kHalf_scaled = (0.5 * scale);
 const DataType kMaxNewtonStep_scaled = (4.0 * scale);
+const DataType kMaxExpArg_scaled = (kMaxExpArg * scale);
 
 constexpr int kMaxSeriesTerms = 3;
 constexpr int kMaxNewtonStep = 4;
 constexpr int kNewtonIterations = 5;
+
+// Width of the oblivious exponent stage in Exp: the shifted exponent k + kExpOffset
+// must fit in kExpBits bits, i.e. k in [-kExpOffset, kExpOffset - 1] = [-16, 15].
+// That covers x in [-11.4, 10.7], which spans the whole range representable at
+// `precision` bits; kMaxExpArg keeps k inside it with margin to spare.
+constexpr int kExpBits = 5;
+constexpr int kExpOffset = 1 << (kExpBits - 1);
 
 // Data structures for secure mixed-effects logistic regression
 struct ClusterGroup {
@@ -57,25 +67,75 @@ struct Dataset {
     size_t num_fixed = 0;
 };
 
+// Use these helpers wherever a copy is going to be written to.
+AV Clone(const AV& v) {
+    AV out(v.size(), v.engine);
+    out = v;
+    out.setPrecision(v.getPrecision());
+    return out;
+}
+
+std::vector<AV> Clone(const std::vector<AV>& vs) {
+    std::vector<AV> out;
+    out.reserve(vs.size());
+    for (const AV& v : vs) out.push_back(Clone(v));
+    return out;
+}
+
+// std::vector<AV>(n, AV(...)) copy-constructs n aliases of a single buffer, so
+// every element would share storage. Build the elements individually instead.
+std::vector<AV> MakeVector(size_t n, size_t elem_size, EngineRef engine) {
+    std::vector<AV> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; ++i) out.emplace_back(elem_size, engine);
+    return out;
+}
+
+std::vector<std::vector<AV>> MakeMatrix(size_t rows, size_t cols, EngineRef engine) {
+    std::vector<std::vector<AV>> out;
+    out.reserve(rows);
+    for (size_t i = 0; i < rows; ++i) out.push_back(MakeVector(cols, 1, engine));
+    return out;
+}
+
+// Secure clamping to [-bound_scaled, bound_scaled].
+AV ClampAbs(const AV& x, DataType bound_scaled) {
+    AV x_ = Clone(x);
+    x_.setPrecision(0);
+
+    // cond_high = 1 if x >= bound, and then x - cond_high * (x - bound) == bound.
+    AV diff_high = x_ - bound_scaled;
+    AV cond_high = *(diff_high.gtez());
+    x_ -= *(cond_high * diff_high);
+
+    // cond_low = 1 if x < -bound, i.e. if (-bound - 1) - x >= 0.
+    AV diff_low = -x_;
+    diff_low -= (bound_scaled + 1);
+    AV cond_low = *(diff_low.gtez());
+    AV delta_low = -x_;
+    delta_low -= bound_scaled; // -bound - x
+    x_ += *(cond_low * delta_low);
+
+    x_.setPrecision(precision);
+    return x_;
+}
+
 AV Exp (const AV& x) {
-    AV x_ = x;
+    // Saturate first. The oblivious 2^k stage below can only represent
+    // k in [-kExpOffset, kExpOffset - 1]; an out-of-range k would wrap modulo
+    // 2^kExpBits and silently invert the result
+    AV x_ = ClampAbs(x, kMaxExpArg_scaled);
     x_.setPrecision(0);
 
     // TODO: truncate, not divide by scale
     // TODO: add multiplication by float/double constants
     AV quotient = (*(x_ * kLn2_inv_scaled)) / scale;
-    AV pos_quotient = quotient.gtez();
-
-    // pos_quotient ? 0.5 : - 0.5 is equivalent to (pos_quotient - 0.5)
-    // Since we do precision, we need to scale both
-    // hence, pos_quotient * scale - ((DataType)(0.5 * scale))
-    AV k_add = (*(pos_quotient * scale)) - ((DataType)(0.5 * scale));
-    AV k_fixed = quotient + k_add;
+    AV k_fixed = quotient + kHalf_scaled;
 
     // Integer k (unscaled)
     AV k_int = *(k_fixed / scale);
 
-    // Remainder r = x - k * ln(2)
+    // Remainder r = x - k * ln(2), so |r| <= ln(2)/2
     AV r = x_ - (*(k_int * kLn2_scaled));
 
     // 2. Maclaurin series evaluation: exp(r) = 1 + r + r^2/2! + r^3/3! + ...
@@ -91,28 +151,28 @@ AV Exp (const AV& x) {
     }
 
     // 3. Oblivious 2^k scaling
-    // Shift k by an offset to keep exponent positive within [0, 2^B - 1]
-    constexpr int kOffset = 8;
-    AV k_shifted = k_int + static_cast<DataType>(kOffset);
+    // Shift k by an offset to keep exponent positive within [0, 2^kExpBits - 1]
+    AV k_shifted = k_int + static_cast<DataType>(kExpOffset);
 
     auto k_b = k_shifted.a2b();
 
-    // Multiply by 2^(b_i * 2^i) obliviously: factor = 1 + b_i * (2^(2^i) - 1)
+    // Multiply by 2^(b_i * 2^i) obliviously: factor = 1 + b_i * (2^(2^i) - 1).
+    // The factors are unscaled integers, so the product needs no rescaling
     AV result = series;
     BV current_bit(x.size(), x.engine);
-    for (size_t i = 0; i < 4; ++i) { // 4 bits cover offset range [0, 15]
+    for (int i = 0; i < kExpBits; ++i) {
         current_bit.bit_logical_right_shift(*k_b, i);
         current_bit.mask(1);
         AV bit_a = *current_bit.b2a_bit();
         DataType multiplier = (DataType(1) << (1 << i)) - 1;
         AV factor(x.size(), x.engine);
-        factor += scale;
-        factor += *(bit_a * (multiplier * scale));
-        result = *(result * factor) / scale;
+        factor += DataType(1);
+        factor += *(bit_a * multiplier);
+        result = *(result * factor);
     }
 
-    // Adjust for the constant offset 2^(-kOffset)
-    result = *(result / (DataType(1) << kOffset));
+    // Adjust for the constant offset 2^(-kExpOffset)
+    result = *(result / (DataType(1) << kExpOffset));
     result.setPrecision(precision);
 
     return result;
@@ -317,27 +377,7 @@ AV Sum(const AV& v) {
 
 // Secure clamping to [-kMaxNewtonStep, kMaxNewtonStep]
 AV ClampNewtonStep(const AV& step) {
-    AV step_ = step;
-    step_.setPrecision(0);
-
-    // 1. step > kMaxNewtonStep_scaled <=> step - kMaxNewtonStep_scaled > 0
-    AV diff_high = step_ - kMaxNewtonStep_scaled;
-    AV cond_high = *(diff_high.gtez()); // 1 if step >= kMaxNewtonStep, 0 otherwise
-    AV delta_high = step_ - kMaxNewtonStep_scaled;
-    AV sub_high = *(cond_high * delta_high);
-    step_ -= sub_high;
-
-    // 2. step < -kMaxNewtonStep_scaled <=> -kMaxNewtonStep_scaled - step > 0
-    AV diff_low = -step_;
-    diff_low -= (kMaxNewtonStep_scaled + 1);
-    AV cond_low = *(diff_low.gtez()); // 1 if step <= -kMaxNewtonStep
-    AV delta_low = -step_;
-    delta_low -= kMaxNewtonStep_scaled; // -kMaxNewtonStep_scaled - step_
-    AV add_low = *(cond_low * delta_low);
-    step_ += add_low;
-
-    step_.setPrecision(precision);
-    return step_;
+    return ClampAbs(step, kMaxNewtonStep_scaled);
 }
 
 // Finds the conditional mode u_hat = argmax_u g_i(u) for one group, given the
@@ -549,7 +589,7 @@ std::vector<AV> NumericalGradient(
     std::vector<AV> gradient;
     gradient.reserve(dim);
 
-    std::vector<AV> perturbed = x;
+    std::vector<AV> perturbed = Clone(x);
     for (size_t k = 0; k < dim; ++k) {
         perturbed[k].setPrecision(precision);
     }
@@ -679,7 +719,8 @@ SMatrix BfgsInverseUpdate(const SMatrix& h_inv, const std::vector<AV>& s,
     EngineRef engine = s[0].engine;
 
     // We extract h_inv elements into an n x n 2D array of 1-element AVs
-    std::vector<std::vector<AV>> h_elements(n, std::vector<AV>(n, AV(1, engine)));
+    // Distinct buffers per element
+    std::vector<std::vector<AV>> h_elements = MakeMatrix(n, n, engine);
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
             h_elements[i][j] = h_inv.data().slice(i * n + j, i * n + j + 1);
@@ -692,7 +733,7 @@ SMatrix BfgsInverseUpdate(const SMatrix& h_inv, const std::vector<AV>& s,
 
     // Compute left = I - rho * s * y^T as an n x n matrix in std::vector<std::vector<AV>>
     // In fixed point: (s_i * y_j) / scale, then (* rho) / scale
-    std::vector<std::vector<AV>> left(n, std::vector<AV>(n, AV(1, engine)));
+    std::vector<std::vector<AV>> left = MakeMatrix(n, n, engine);
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
             AV si = s[i];
@@ -714,7 +755,7 @@ SMatrix BfgsInverseUpdate(const SMatrix& h_inv, const std::vector<AV>& s,
 
     // temp = left * h_inv
     // temp[i][j] = sum_k (left[i][k] * h_inv[k][j]) / scale
-    std::vector<std::vector<AV>> temp(n, std::vector<AV>(n, AV(1, engine)));
+    std::vector<std::vector<AV>> temp = MakeMatrix(n, n, engine);
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
             AV sum(1, engine);
@@ -796,7 +837,7 @@ OptResult MinimizeBFGS(
     size_t n = x0.size();
     EngineRef engine = x0[0].engine;
 
-    std::vector<AV> x = x0;
+    std::vector<AV> x = Clone(x0);
     for (size_t i = 0; i < n; ++i) {
         x[i].setPrecision(precision);
     }
@@ -852,15 +893,15 @@ OptResult MinimizeBFGS(
         // Backtracking line search satisfying the Armijo sufficient-decrease rule
         const double c1 = 1e-4;
         double alpha = 1.0;
-        std::vector<AV> x_new = x;
-        AV fx_new = fx;
+        std::vector<AV> x_new = Clone(x);
+        AV fx_new = Clone(fx);
 
         auto opened_fx = fx.open();
         double fx_val = static_cast<double>(opened_fx[0]) / scale;
 
         while (true) {
             for (size_t i = 0; i < n; ++i) {
-                AV alpha_dir = direction[i];
+                AV alpha_dir = Clone(direction[i]);
                 alpha_dir.setPrecision(0);
                 alpha_dir = (*(alpha_dir * static_cast<DataType>(alpha * scale))) / scale;
                 x_new[i] = x[i] + alpha_dir;
@@ -885,7 +926,7 @@ OptResult MinimizeBFGS(
         }
 
         // Step = x_new - x
-        std::vector<AV> step(n, AV(1, engine));
+        std::vector<AV> step = MakeVector(n, 1, engine);
         double max_step = 0.0;
         for (size_t i = 0; i < n; ++i) {
             step[i] = x_new[i] - x[i];
@@ -896,7 +937,7 @@ OptResult MinimizeBFGS(
         }
 
         std::vector<AV> gradient_new = NumericalGradient(f, x_new);
-        std::vector<AV> gradient_delta(n, AV(1, engine));
+        std::vector<AV> gradient_delta = MakeVector(n, 1, engine);
         for (size_t i = 0; i < n; ++i) {
             gradient_delta[i] = gradient_new[i] - gradient[i];
             gradient_delta[i].setPrecision(precision);
