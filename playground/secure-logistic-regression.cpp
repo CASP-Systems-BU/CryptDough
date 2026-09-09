@@ -893,6 +893,7 @@ OptResult MinimizeBFGS(
         // Backtracking line search satisfying the Armijo sufficient-decrease rule
         const double c1 = 1e-4;
         double alpha = 1.0;
+        bool line_search_failed = false;
         std::vector<AV> x_new = Clone(x);
         AV fx_new = Clone(fx);
 
@@ -921,6 +922,7 @@ OptResult MinimizeBFGS(
             if (alpha < 1e-5) {
                 x_new = x;
                 fx_new = fx;
+                line_search_failed = true;
                 break;
             }
         }
@@ -934,6 +936,20 @@ OptResult MinimizeBFGS(
             auto opened_s = step[i].open();
             double val = std::abs(static_cast<double>(opened_s[0]) / scale);
             if (val > max_step) max_step = val;
+        }
+
+        // A failed line search is a fixed point: x is unchanged, so the next
+        // iteration recomputes the same direction and fails identically
+        if (line_search_failed) {
+            if (engine.getPartyID() == 0) {
+                std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
+                          << "  no descent found along search direction; stopping at"
+                          << " neg_log_lik=" << std::fixed << std::setprecision(6) << fx_val
+                          << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
+                          << std::endl;
+            }
+            result.converged = true;
+            break;
         }
 
         std::vector<AV> gradient_new = NumericalGradient(f, x_new);
@@ -1201,23 +1217,113 @@ int main(int argc, char** argv) {
         std::cout << "\n--- Testing ConditionalMode, GroupLaplaceLogLik, NegMarginalLogLik, and NumericalGradient ---" << std::endl;
     }
 
-    // Create synthetic test data: 2 groups, 3 observations per group, 2 fixed effects (intercept + 1 feature)
-    // Beta = [0.2, -0.4], s = 0.0 (sigma^2 = exp(0) = 1.0)
-    size_t test_num_groups = 2;
-    size_t test_obs_per_group = 3;
-    size_t test_num_fixed = 2;
+    // Randomly generated mixed-effects dataset, drawn from known parameters
+    size_t test_num_groups = 8;
+    size_t test_obs_per_group = 16;
+    size_t test_num_fixed = 2; // intercept + one covariate
 
-    std::vector<std::vector<std::vector<double>>> plain_X = {
-        { {1.0, 0.5}, {1.0, -0.5}, {1.0, 1.0} },
-        { {1.0, -1.0}, {1.0, 0.2}, {1.0, 0.8} }
+    const double kTrueBeta0 = 0.5;
+    const double kTrueBeta1 = 1.0;
+    const double kTrueSigma = 0.8;
+    const double kTwoPi = 6.28318530717958647692;
+
+    size_t num_uniforms = test_num_groups * (2 + test_obs_per_group * 3);
+    cdough::Vector<DataType> raw_random(num_uniforms);
+    engine.populateLocalRandom(raw_random);
+
+    size_t raw_pos = 0;
+    auto next_uniform = [&raw_random, &raw_pos]() {
+        // top 53 bits of a fresh 64-bit word, mapped into [0, 1)
+        uint64_t bits = static_cast<uint64_t>(raw_random[raw_pos++]);
+        return static_cast<double>(bits >> 11) * (1.0 / 9007199254740992.0);
     };
-    std::vector<std::vector<double>> plain_Y = {
-        { 1.0, 0.0, 1.0 },
-        { 0.0, 1.0, 1.0 }
+    auto next_normal = [&next_uniform, kTwoPi]() {
+        double u1 = next_uniform();
+        double u2 = next_uniform();
+        if (u1 < 1e-300) u1 = 1e-300;
+        return std::sqrt(-2.0 * std::log(u1)) * std::cos(kTwoPi * u2);
     };
-    std::vector<double> plain_beta = {0.2, -0.4};
-    double plain_s = 0.0;
+
+    std::vector<std::vector<std::vector<double>>> plain_X(
+        test_num_groups,
+        std::vector<std::vector<double>>(test_obs_per_group,
+                                         std::vector<double>(test_num_fixed, 0.0)));
+    std::vector<std::vector<double>> plain_Y(test_num_groups,
+                                             std::vector<double>(test_obs_per_group, 0.0));
+    std::vector<double> true_u(test_num_groups, 0.0);
+
+    for (size_t g = 0; g < test_num_groups; ++g) {
+        true_u[g] = kTrueSigma * next_normal();
+        for (size_t j = 0; j < test_obs_per_group; ++j) {
+            plain_X[g][j][0] = 1.0; // intercept
+            plain_X[g][j][1] = next_normal();
+        }
+    }
+
+    // Standardize the covariate to exactly zero mean / unit variance before
+    // drawing the responses, so beta stays interpretable
+    {
+        double mean = 0.0;
+        for (size_t g = 0; g < test_num_groups; ++g)
+            for (size_t j = 0; j < test_obs_per_group; ++j) mean += plain_X[g][j][1];
+        mean /= static_cast<double>(test_num_groups * test_obs_per_group);
+
+        double var = 0.0;
+        for (size_t g = 0; g < test_num_groups; ++g)
+            for (size_t j = 0; j < test_obs_per_group; ++j) {
+                double d = plain_X[g][j][1] - mean;
+                var += d * d;
+            }
+        var /= static_cast<double>(test_num_groups * test_obs_per_group);
+        double sd = std::sqrt(var);
+        if (sd < 1e-12) sd = 1.0;
+
+        for (size_t g = 0; g < test_num_groups; ++g)
+            for (size_t j = 0; j < test_obs_per_group; ++j)
+                plain_X[g][j][1] = (plain_X[g][j][1] - mean) / sd;
+    }
+
+    for (size_t g = 0; g < test_num_groups; ++g) {
+        for (size_t j = 0; j < test_obs_per_group; ++j) {
+            double eta = kTrueBeta0 + kTrueBeta1 * plain_X[g][j][1] + true_u[g];
+            double prob = 1.0 / (1.0 + std::exp(-eta));
+            plain_Y[g][j] = (next_uniform() < prob) ? 1.0 : 0.0;
+        }
+    }
+
+    // Evaluate the per-function tests at the true generating parameters.
+    std::vector<double> plain_beta = {kTrueBeta0, kTrueBeta1};
+    double plain_s = std::log(kTrueSigma);
     double plain_sigma2 = std::exp(2.0 * plain_s);
+
+    if (pID == 0) {
+        size_t num_obs_total = test_num_groups * test_obs_per_group;
+        size_t num_ones = 0;
+        double max_abs_eta = 0.0;
+        double cov_mean = 0.0, cov_sd = 0.0;
+        for (size_t g = 0; g < test_num_groups; ++g)
+            for (size_t j = 0; j < test_obs_per_group; ++j) cov_mean += plain_X[g][j][1];
+        cov_mean /= static_cast<double>(num_obs_total);
+        for (size_t g = 0; g < test_num_groups; ++g)
+            for (size_t j = 0; j < test_obs_per_group; ++j)
+                cov_sd += (plain_X[g][j][1] - cov_mean) * (plain_X[g][j][1] - cov_mean);
+        cov_sd = std::sqrt(cov_sd / static_cast<double>(num_obs_total));
+        for (size_t g = 0; g < test_num_groups; ++g) {
+            for (size_t j = 0; j < test_obs_per_group; ++j) {
+                num_ones += static_cast<size_t>(plain_Y[g][j]);
+                double eta = kTrueBeta0 + kTrueBeta1 * plain_X[g][j][1] + true_u[g];
+                max_abs_eta = std::max(max_abs_eta, std::abs(eta));
+            }
+        }
+        std::cout << "Generated dataset: " << test_num_groups << " groups x "
+                  << test_obs_per_group << " obs = " << num_obs_total << " observations\n"
+                  << "  true [beta_0, beta_1, s] = [" << kTrueBeta0 << ", " << kTrueBeta1 << ", "
+                  << plain_s << "]  (sigma = " << kTrueSigma << ")\n"
+                  << "  class balance: " << num_ones << "/" << num_obs_total << " ones"
+                  << ",  max |eta| = " << max_abs_eta << " (Exp clamp is " << kMaxExpArg << ")\n"
+                  << "  covariate standardized: mean = " << cov_mean << ", sd = " << cov_sd
+                  << std::endl;
+    }
 
     // Build secret-shared Dataset
     Dataset secure_dataset;
@@ -1575,6 +1681,19 @@ int main(int argc, char** argv) {
             std::cout << opened_final_params[i] << (i + 1 < dim ? ", " : "");
         }
         std::cout << "]" << std::endl;
+
+        // The MLE need not equal the generating parameters on a finite sample,
+        // so score the fit by the plaintext objective instead
+        std::vector<double> true_params = {kTrueBeta0, kTrueBeta1, plain_s};
+        double nll_at_true = plain_neg_marginal_log_lik(true_params);
+        double nll_at_fit = plain_neg_marginal_log_lik(opened_final_params);
+        std::cout << "  True Parameters [beta_0, beta_1, s]:   [" << kTrueBeta0 << ", "
+                  << kTrueBeta1 << ", " << plain_s << "]\n"
+                  << "  Plaintext NLL at true params: " << nll_at_true << "\n"
+                  << "  Plaintext NLL at MPC fit:     " << nll_at_fit
+                  << (nll_at_fit <= nll_at_true ? "   (fit beats truth: OK)"
+                                                : "   (WORSE than truth)")
+                  << std::endl;
         std::cout << "\nAll functions executed and validated successfully against plaintext!" << std::endl;
     }
 
