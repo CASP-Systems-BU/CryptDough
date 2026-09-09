@@ -72,7 +72,14 @@ fi
 
 echo "party ${RANK}/${HOST_COUNT}  hosts=${HOSTS}  base_port=${BASE_PORT}"
 
-exec docker run --rm -it \
+# -t only when there is a TTY: this script is normally invoked over ssh from a
+# driver script, where `docker run -it` would fail with "the input device is not a TTY".
+TTY_ARGS=()
+if [[ -t 0 && -t 1 ]]; then
+    TTY_ARGS+=(-it)
+fi
+
+exec docker run --rm "${TTY_ARGS[@]}" \
     --network host \
     --shm-size=1g \
     --ulimit nofile=65536:65536 \

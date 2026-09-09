@@ -17,7 +17,7 @@ experiments. It targets
 `run_experiment.py` works exactly as it does on a hand-provisioned node:
 
 ```bash
-docker exec -it cdough ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
+docker exec -it -u cdough cdough ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
 ```
 
 **What it does not do.** A container is not a VM — it shares the host kernel and runs
@@ -95,7 +95,7 @@ resolves each machine and injects `node0..nodeN-1` aliases into the container's 
 ### 6. Run experiments from the node0 machine
 
 ```bash
-docker exec -it cdough ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
+docker exec -it -u cdough cdough ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
 ```
 
 Results land in the `cdough-build` named volume, which survives `docker rm`:
@@ -213,11 +213,11 @@ survive:
 ## Troubleshooting
 
 **`find_package` cannot find cryptoTools / Blaze / NTL / MPI.**
-`CMAKE_PREFIX_PATH` is not reaching CMake. Check `docker exec cdough env | grep CMAKE`.
+`CMAKE_PREFIX_PATH` is not reaching CMake. Check `docker exec -u cdough cdough env | grep CMAKE`.
 As a fallback, symlink the prefixes into the build directory under the names
 `CMakeLists.txt` hints for:
 ```bash
-docker exec cdough bash -c 'cd /opt/cryptdough/build &&
+docker exec -u cdough cdough bash -c 'cd /opt/cryptdough/build &&
   ln -sfn /opt/cdough-deps ntl-install &&
   ln -sfn /opt/cdough-deps libOTe-install &&
   ln -sfn /opt/cdough-deps secure-join-install &&
@@ -227,10 +227,13 @@ docker exec cdough bash -c 'cd /opt/cryptdough/build &&
 **`ssh node1` hangs or is refused.** Check the peer's container is up
 (`docker ps`), that 2222 is reachable (`nc -vz node1 2222`), and that both machines
 were started with the same `--nodes` list. Confirm the alias resolves:
-`docker exec cdough getent hosts node1`.
+`docker exec -u cdough cdough getent hosts node1`.
 
-**`mpirun` refuses to run as root.** The entrypoint should have dropped to `cdough`.
-Check with `docker exec cdough whoami`. This only affects MPI; nocopy is unaffected.
+**`mpirun` refuses to run as root.** You almost certainly omitted `-u cdough`.
+`docker exec` bypasses the ENTRYPOINT that normally drops privileges, so
+`docker exec cdough whoami` prints `root` while `docker exec -u cdough cdough whoami`
+prints `cdough`. This affects MPI only; nocopy runs either way, but as root it leaves
+root-owned files in the build volume.
 
 **A run crashes in a mysterious way across nodes.** The main README warns that mismatched
 binaries on different hosts cause exactly this. `run_experiment.py` scp's the binary
@@ -240,9 +243,23 @@ each run, but if you built by hand, rebuild everywhere.
 Rebuild it here, or rebuild the dependencies with an explicit baseline such as
 `-march=x86-64-v3`.
 
+**You changed a dependency pin and the image did not pick it up.** The legacy builder
+(what Ubuntu's `docker.io` gives you, since it ships without buildx) does not invalidate
+`COPY --from=<stage>` when the source stage is rebuilt. It will happily rebuild the whole
+`deps` stage and then serve the final stage's `COPY --from=deps` from cache, so the new
+libraries never reach the image. Symptom: the build log shows your dependency rebuilding,
+but the installed file's mtime is from an older build:
+
+```bash
+docker run --rm cryptdough:latest stat -c '%y %n' /opt/cdough-deps/include/coproto/config.h
+```
+
+Rebuild with `--no-cache` after any dependency change, or install `docker-buildx`, which
+tracks inter-stage dependencies correctly.
+
 **Ports still in use after a failed run.** `startmpc` randomizes its base port for this
 reason, and `run_experiment.py` sleeps 30s between nocopy repetitions. If a run wedges,
-`docker exec cdough pkill -f <binary>` on every machine.
+`docker exec -u cdough cdough pkill -f <binary>` on every machine.
 
 **WAN simulation does nothing.** `wan-sim.py` runs `sudo tc qdisc`, which needs
 `--cap-add NET_ADMIN`. Restart with `run-node.sh --wan`.

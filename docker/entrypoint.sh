@@ -38,6 +38,26 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# secure-join compatibility symlink
+#
+# CMAKE_PREFIX_PATH covers every find_package/find_path/find_library call in
+# CMakeLists.txt, but two lines bypass CMake's search entirely and hardcode a path
+# into the source tree (only reached by PROTOCOL=2 with REAL triples):
+#
+#   CMakeLists.txt:154  link_directories(.../build/secure-join-install/lib)
+#   CMakeLists.txt:167  target_include_directories(... .../build/secure-join-install/include/secureJoin/)
+#
+# /opt/cdough-deps has exactly that internal layout, so one symlink satisfies both.
+# It must be made here rather than in the Dockerfile because build/ is normally a
+# mounted volume, which would shadow anything baked into the image.
+compat_link="${CDOUGH_SRC}/build/secure-join-install"
+if [[ ! -e "${compat_link}" ]]; then
+    ln -sfn /opt/cdough-deps "${compat_link}" 2>/dev/null \
+        && log "linked build/secure-join-install -> /opt/cdough-deps" \
+        || log "warning: could not create secure-join compatibility symlink"
+fi
+
+# ---------------------------------------------------------------------------
 # SSH key material
 # ---------------------------------------------------------------------------
 install_keys() {

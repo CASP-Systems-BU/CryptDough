@@ -9,7 +9,10 @@
 #
 # Then drive the experiment from the node0 machine:
 #
-#   docker exec -it cdough ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
+#   docker exec -it -u cdough cdough ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting
+#
+# Note the `-u cdough`: `docker exec` bypasses the image's ENTRYPOINT, which is what
+# normally drops privileges, so without it the command runs as root.
 #
 # Why the --nodes list matters: run_experiment.py addresses peers as <prefix><i>
 # (default prefix "node") and assumes consistent numbering, but real machines are
@@ -129,8 +132,8 @@ docker run -d \
 
 echo
 echo "Container '${NAME}' is up. Verify with:"
-echo "  docker exec ${NAME} hostname"
-echo "  docker exec ${NAME} ssh node1 hostname     # from the node0 machine"
+echo "  docker exec -u cdough ${NAME} hostname"
+echo "  docker exec -u cdough ${NAME} ssh node1 hostname   # from the node0 machine"
 echo
 echo "Run an experiment from the node0 machine:"
-echo "  docker exec -it ${NAME} ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting"
+echo "  docker exec -it -u cdough ${NAME} ../scripts/run_experiment.py -s lan -c nocopy -n 4 -T 8 micro_sorting"
