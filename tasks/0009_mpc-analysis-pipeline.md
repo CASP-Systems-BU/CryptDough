@@ -1,4 +1,4 @@
-# 0009 — MPC analysis pipeline (`playground/mpc-analysis.cpp`)
+# 0009 — MPC analysis pipeline (`playground/mpc-analysis.cpp` + headers)
 
 ## Metadata
 - Task ID: 0009
@@ -495,6 +495,100 @@ be re-examined if the workload ever changes.
   `TestSegmented`, to 1e-9, so an index slip in the reimplemented Brent-Kung
   level geometry cannot pass silently.
 
+## Follow-up: header split (merge of `logistic-regression`)
+
+The single-file form was always a consequence of Option C above -- rename and grow
+one file -- not a preference. The `logistic-regression` branch had meanwhile
+established a header convention for exactly this code (`#pragma once`, namespace
+`cdough::regression` with the protocol `using`s inside it, types and constants in
+`primitives.h`, a linear include chain), so that branch was merged and the
+convention adopted.
+
+`mpc-analysis.cpp` went from 4392 lines to 336: it now holds only the driver --
+stage selection, ingestion, and the loop over the nodes.
+
+| Header | Lines | Contents |
+|---|---|---|
+| `primitives.h` | 706 | types, constants, `Clone`; `ClampAbs`/`ClampRange`/`Abs`, `RecipSeeded`/`Div`/`Recip`, `Sqrt`/`Rsqrt`, `Exp`/`Log`/`Log1p`, `Sigmoid`/`LogOnePlusExp`; share and open helpers |
+| `segmented.h` | 309 | `SegScan`/`SegTotal`, the cached-group-bit `SegScanPlanned`/`SegTotalPlanned`, `First`/`LastOfGroup`, `CountDistinct` |
+| `linalg.h` | 243 | `Gram`, Cholesky factor / solve / `SymmetricInverse` |
+| `optimizer.h` | 667 | the branch's matrix helpers and `NewtonSchulzInverse` (task 0010), plus BFGS, its numerical gradient and the value-plus-gradient objective interface |
+| `cohort.h` | 515 | plaintext and secret-shared row layouts, synthetic generator, per-party CSV ingestion |
+| `nodes.h` | 321 | `d1a`, `d1b`, `sisa_perct_cnt` x3 |
+| `regression.h` | 827 | design matrices, IRLS (steps 6a/6b), flat Laplace mixed model with the analytic gradient |
+| `reporting.h` | 284 | coefficient tables and the plaintext IRLS oracle |
+| `harness.h` | 546 | accuracy harnesses and the cost breakdown |
+| `mixedeffects.h` | 237 | the branch's balanced-cluster mixed-effects model (tasks 0001-0003), used by `secure-logistic-regression.cpp` |
+
+Include order is `primitives` -> {`segmented`, `linalg`, `optimizer`} -> `cohort`
+-> `nodes` -> `regression` -> `reporting` -> `harness` -> `mpc-analysis.cpp`.
+`mixedeffects.h` hangs off `optimizer.h` on its own and is included only by
+`secure-logistic-regression.cpp`, so the two programs share the primitives and
+the optimiser without either depending on the other's model code.
+
+The split moved code without changing it, with two mechanical exceptions:
+
+1. The type aliases are now qualified — `using AV =
+   COMPILED_MPC_PROTOCOL_NAMESPACE::ASharedVector<DataType>;` rather than the
+   bare name. Inside `namespace cdough::regression` the unqualified name is
+   ambiguous, because the enclosing `cdough` namespace declares
+   `ASharedVector` too and the protocol namespace aliases the same name. This is
+   the branch's own convention; it was not optional.
+2. The duplicate `Identity` was dropped in favour of the branch's
+   `ScaledIdentity` / `Identity` pair, which is strictly more general.
+
+**Verified behaviour-preserving:** all 75 machine-readable `RESULT` lines from
+`-S models -r 60` are byte-identical before and after the split, every figure in
+the kernel accuracy harness is unchanged to the last digit, `-S all` exits 0 with
+both harnesses passing, and the build is warning-free under both `PROTOCOL=1` and
+`PROTOCOL=3`.
+
+### Merge resolutions
+
+Nothing from the branch was dropped. Every one of its 126 top-level symbols is
+present; the only differences that remain are four local variable names inside
+`BfgsInverseUpdate` and `MinimizeBFGS`, whose bodies are equivalent (`Clone(x)`
+is exactly the branch's `AV t(x.size(), engine); t = x;` idiom).
+
+- `playground/secure-logistic-regression.cpp` is **kept**, as a second binary.
+  One line changed: `#include "./regression.h"` became
+  `#include "./mixedeffects.h"`. It now runs against the pipeline's corrected
+  kernels, so it is *more* accurate than it was on the branch -- `ConditionalMode`
+  agrees with its plaintext oracle to 2.2e-5 and `NegMarginalLogLik` to 1.2e-3,
+  where the unfixed `Exp` had been the limiting error.
+- The branch's balanced mixed-effects model (`ClusterGroup`, `Dataset`,
+  `UnpackParameters`, `ConditionalMode`, `GroupLaplaceLogLik`,
+  `NegMarginalLogLik`) is **kept**, moved verbatim into `mixedeffects.h` under the
+  same `cdough::regression::mixedeffects` namespace. It is not an older version
+  of `regression.h` -- it is a different data layout. One cluster per
+  `ClusterGroup` is the natural form for balanced clusters; the pipeline's flat
+  padded table with segmented scans exists because real patients have a ragged
+  number of encounters. Both are useful, and the header split is what makes
+  keeping both cheap.
+- `Sum` is **restored** to `primitives.h`, verbatim from the branch.
+- `kMaxSeriesTerms` is **restored**, marked as superseded by `kExpSeriesTerms` /
+  `kLogSeriesTerms`, which tune the Exp and Log series independently. It no
+  longer controls anything, and the comment says so.
+- `MinimizeBFGS` now has **two overloads**: the pipeline's
+  value-plus-gradient form and the branch's value-only form, which differences
+  the objective. They are distinguished by arity, so a lambda selects the right
+  one on its own, and the branch's call sites compile unchanged. The
+  `MinimizeBFGSNumeric` name introduced during the optimisation work is gone --
+  it was the same function under a different name.
+- `SecureReciprocal` is kept in `optimizer.h`, where `NewtonSchulzInverse` uses
+  it. It goes through the boolean division circuit, so it must not appear on a
+  hot path; `Recip` is the replacement there.
+- The branch's task 0007 collided with `0007_dockerize-cryptdough.md` already on
+  this branch, so the Newton-Schulz task was renumbered to 0010.
+- `include/`, `docker/` and `examples/` are unchanged by the merge, so the TLS
+  and cross-org deployment work from tasks 0007-0008 is intact.
+
+Both binaries build warning-free under `PROTOCOL=1` and `PROTOCOL=3`, and
+`mpc-analysis`'s 75 `RESULT` lines are byte-identical to before the merge.
+
 ## Change Log
 - 2026-09-10: Initial draft created and approved.
 - 2026-09-10: Implementation notes and validation results added.
+- 2026-09-10: Cost optimisation (11.1x end to end); see that section.
+- 2026-09-10: Merged `logistic-regression` and split the program into headers;
+  both programs and every branch symbol retained.
