@@ -27,25 +27,193 @@ std::vector<std::vector<AV>> MakeMatrix(size_t rows, size_t cols, EngineRef engi
 std::vector<AV> Clone(const std::vector<AV>& vs) {
     std::vector<AV> out;
     out.reserve(vs.size());
-    for (const AV& v : vs) {
-        AV copy(v.size(), v.engine);
-        copy = v;
-        copy.setPrecision(precision);
-        out.push_back(copy);
-    }
+    for (const AV& v : vs) out.push_back(Clone(v));
     return out;
 }
 
-// Generates an n x n identity SecureMatrix in MPC (row-major).
-SMatrix Identity(size_t n, EngineRef engine) {
+// Generates c * I_n as a SecureMatrix in MPC (row-major).
+SMatrix ScaledIdentity(size_t n, double c, EngineRef engine) {
     cdough::Vector<DataType> eye(n * n, 0);
+    const DataType diagonal = std::llround(c * scale);
     for (size_t i = 0; i < n; ++i) {
-        eye[i * n + i] = scale;
+        eye[i * n + i] = diagonal;
     }
     PMatrix plain_eye(eye, n, n, false);
     auto sec_eye = engine.secret_share_matrix(plain_eye, 0);
     sec_eye.setPrecision(precision);
     return sec_eye;
+}
+
+// Generates an n x n identity SecureMatrix in MPC (row-major).
+SMatrix Identity(size_t n, EngineRef engine) { return ScaledIdentity(n, 1.0, engine); }
+
+// Permutes a row-major (rows x cols) buffer into the row-major buffer of its
+// transpose. This is a pure index permutation, so it costs no communication.
+//
+// `mapping_reference` only builds a view, and the matmul kernel rejects views
+// (mapping_access_vector.h asserts !has_mapping()), so the view has to be
+// materialized. `Clone` is exactly the library's own materialization recipe
+// (construct a fresh buffer, then assign), so it drops the mapping for us.
+AV TransposeData(const AV& data, size_t rows, size_t cols) {
+    assert(data.size() == rows * cols);
+    std::vector<size_t> map(rows * cols);
+    for (size_t i = 0; i < rows; ++i) {
+        for (size_t j = 0; j < cols; ++j) {
+            map[j * rows + i] = i * cols + j;
+        }
+    }
+    return Clone(data.mapping_reference(map));
+}
+
+// Row-major transpose of `m`, as a new (cols x rows) SecureMatrix.
+SMatrix Transpose(const SMatrix& m) {
+    assert(!m.isColumnWise());
+    SMatrix result(TransposeData(m.data(), m.rows(), m.cols()), m.cols(), m.rows(), false);
+    result.setPrecision(m.data().getPrecision());
+    return result;
+}
+
+// Column-wise matrix that represents `m` itself, for use as a matmul right-hand side.
+//
+// NOTE: reinterpreting a row-major buffer as column-wise yields m^T, NOT m --
+// a column-wise (r x c) matrix reads element (i, j) from data[j * r + i]. To
+// represent `m`, the buffer has to be physically transposed first.
+SMatrix AsColumnWise(const SMatrix& m) {
+    assert(!m.isColumnWise());
+    SMatrix result(TransposeData(m.data(), m.rows(), m.cols()), m.rows(), m.cols(), true);
+    result.setPrecision(m.data().getPrecision());
+    return result;
+}
+
+// Matrix product a * b, both row-major, result row-major.
+//
+// The protocol rescales for us: the 3PC matmul kernel calls handle_precision()
+// and then truncate() on the accumulated dot product, so the result is already
+// in fixed point and must NOT be divided by `scale`. handle_precision() throws
+// unless both operands carry exactly the same precision.
+SMatrix MatMul(const SMatrix& a, const SMatrix& b) {
+    assert(a.cols() == b.rows());
+    assert(!a.isColumnWise() && !b.isColumnWise());
+    assert(a.data().getPrecision() == b.data().getPrecision());
+    SMatrix result = a.matrixRightMultiplyWithColumnMatrixVectorized(AsColumnWise(b));
+    result.setPrecision(a.data().getPrecision());
+    return result;
+}
+
+// Multiplies every entry of `m` by the secret scalar held in the 1-element `s`.
+SMatrix ScaleMatrix(const SMatrix& m, const AV& s) {
+    assert(s.size() == 1);
+    const size_t count = m.rows() * m.cols();
+
+    AV entries = Clone(m.data());
+    entries.setPrecision(0);
+    AV scalar = s.repeated_subset_reference(count);
+    scalar.setPrecision(0);
+
+    // The product lands in a fresh, unmapped buffer, so it is safe to feed to MatMul.
+    AV scaled = (*(entries * scalar)) / scale;
+    SMatrix result(scaled, m.rows(), m.cols(), m.isColumnWise());
+    result.setPrecision(precision);
+    return result;
+}
+
+// Squared Frobenius norm sum_ij m_ij^2, as a 1-element AV.
+AV FrobeniusNormSquared(const SMatrix& m) {
+    AV entries = Clone(m.data());
+    entries.setPrecision(0);
+    AV squares = (*(entries * entries)) / scale;
+    squares.setPrecision(precision);
+
+    AV total = squares.chunkedSum(squares.size());
+    total.setPrecision(precision);
+    return total;
+}
+
+// Fixed iteration bound for NewtonSchulzInverse. This must stay a compile-time
+// constant: it is what keeps the operator oblivious, since a data-dependent
+// stopping rule would leak the conditioning of the input matrix.
+//
+// Newton-Schulz squares the error each step, so with X_0 = A^T / ||A||_F^2 the
+// error after k steps is ||E_0||^(2^k) with ||E_0|| ~ 1 - 1/(n * kappa^2).
+// Reaching a target epsilon needs k >~ log2(n * kappa^2 * ln(1/epsilon)); for
+// n = 3 and epsilon = 1e-4 that is about 12 steps at kappa = 10 and about 15 at
+// kappa = 30. That is only a sanity check on the number below, not its source.
+//
+// Measured, not guessed. Calibration sweep on the 3PC LAN cluster
+// (blinky/pinky/inky, 2026-09-09), reading residual |A*X - I| against iteration
+// count over the test suite in main(). Iteration at which each case reaches its
+// noise floor, and the floor it settles on:
+//
+//   identity 3x3         k = 5    0
+//   spd, kappa ~ 4       k = 8    ~1e-4
+//   spd, kappa ~ 19      k = 13   ~5e-5     <- worst in-range case
+//   non-symmetric 3x3    k = 6    ~1e-4
+//   2x2                  k = 7    ~5e-5
+//   X^T W X / N (2x2)    k = 5    ~7e-5
+//
+// The worst in-range case plateaus at 13, so 14 carries one iteration of margin.
+// The resulting floor (5e-5 to 1.2e-4) sits at or below the abs errors the other
+// oblivious operators in these headers report (Exp/Log ~1e-4, BfgsInverseUpdate
+// ~5e-4), which is the accuracy bar. Beyond the plateau, extra iterations buy
+// nothing and only cost rounds.
+//
+// A kappa ~ 199 case was also measured and is still descending at k = 20; it is
+// outside the operating range by design, and is kept in the suite to mark where
+// a fixed bound stops being able to help.
+constexpr int kMatrixInverseIterations = 14;
+
+// Sweeps NewtonSchulzInverse over iteration counts and prints the accuracy at
+// each, to choose kMatrixInverseIterations. Off by default: it multiplies the
+// runtime of the matrix-inverse validation by kMatrixInverseCalibrationMax.
+constexpr bool kRunMatrixInverseCalibration = false;
+constexpr int kMatrixInverseCalibrationMax = 20;
+
+// Secure matrix inverse by Newton-Schulz iteration:
+//
+//     X_{k+1} = X_k (2I - A X_k),      X_0 = A^T / ||A||_F^2
+//
+// The error E_k = I - A X_k obeys E_{k+1} = E_k^2, so convergence is quadratic.
+// The initializer guarantees ||E_0||_2 < 1 for any nonsingular A, because
+// sigma_max(A) <= ||A||_F, so the iteration is always in the convergence basin.
+//
+// Security: the iteration count is a compile-time constant and the loop body has
+// no branch on shared data and never calls open(). The running time and the
+// communication pattern therefore depend only on the public values `n` and
+// `iterations`. The price is that an ill-conditioned A silently yields a poorer
+// approximation rather than iterating longer -- see kMatrixInverseIterations.
+//
+// The form below is self-correcting: A X_k is recomputed from A every step, so
+// ABY3 truncation error does not accumulate. The iteration descends to the
+// fixed-point noise floor and stays there.
+//
+// Preconditions: A is square, row-major, nonsingular, at `precision`, and
+// O(1)-scaled (if ||A||_F^2 is large enough that A^T / ||A||_F^2 underflows the
+// fixed-point resolution, X_0 truncates to zero and the iteration cannot move).
+SMatrix NewtonSchulzInverse(const SMatrix& a, int iterations = kMatrixInverseIterations) {
+    const size_t n = a.rows();
+    assert(a.cols() == n);
+    assert(!a.isColumnWise());
+    EngineRef engine = a.data().engine;
+
+    // The only division in the operator: one boolean division circuit per call.
+    AV inverse_norm = SecureReciprocal(FrobeniusNormSquared(a));
+    SMatrix x = ScaleMatrix(Transpose(a), inverse_norm);
+    x.setPrecision(precision);
+
+    SMatrix two_identity = ScaledIdentity(n, 2.0, engine);
+
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        SMatrix a_x = MatMul(a, x);
+        a_x.setPrecision(precision);
+
+        SMatrix residual = two_identity - a_x; // local elementwise
+        residual.setPrecision(precision);
+
+        x = MatMul(x, residual);
+        x.setPrecision(precision);
+    }
+
+    return x;
 }
 
 // Matrix-vector product m * v where m is SecureMatrix (n x n) and v is std::vector<AV> (length n).
@@ -413,13 +581,7 @@ OptResult MinimizeBFGS(const std::function<AV(const std::vector<AV>&)>& f,
 
         if (curv_val > kSmallEpsilon) {
             // rho = 1.0 / curvature
-            AV scale_sq(1, engine);
-            scale_sq += (DataType(1) << (2 * precision));
-            auto scale_sq_b = scale_sq.a2b();
-            auto curv_b = curvature.a2b();
-            auto rho_b = (*scale_sq_b) / (*curv_b);
-            AV rho = *(rho_b->b2a());
-            rho.setPrecision(precision);
+            AV rho = SecureReciprocal(curvature);
 
             h_inv = BfgsInverseUpdate(h_inv, step, gradient_delta, rho);
             h_inv.setPrecision(precision);

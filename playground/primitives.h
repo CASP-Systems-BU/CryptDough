@@ -47,6 +47,33 @@ constexpr int kMaxSeriesTerms = 3;
 constexpr int kMaxNewtonStep = 4;
 constexpr int kNewtonIterations = 5;
 
+// Use these helpers wherever a copy is going to be written to.
+// The std::vector<AV> overload lives in optimizer.h, beside the other container helpers.
+AV Clone(const AV& v) {
+    AV out(v.size(), v.engine);
+    out = v;
+    out.setPrecision(v.getPrecision());
+    return out;
+}
+
+// Secure reciprocal 1/x in fixed point, computed as scale^2 / x over a boolean
+// division circuit. Requires x > 0: the non-restoring division circuit assumes
+// non-negative operands.
+AV SecureReciprocal(const AV& x) {
+    AV numerator(x.size(), x.engine);
+    numerator += (DataType(1) << (2 * precision));
+
+    auto numerator_b = numerator.a2b();
+    AV denominator = Clone(x);
+    denominator.setPrecision(0);
+    auto denominator_b = denominator.a2b();
+
+    auto quotient_b = (*numerator_b) / (*denominator_b);
+    AV quotient = *(quotient_b->b2a());
+    quotient.setPrecision(precision);
+    return quotient;
+}
+
 // Secure clamping to [-bound_scaled, bound_scaled].
 AV ClampAbs(const AV& x, DataType bound_scaled) {
     AV x_(x.size(), x.engine);

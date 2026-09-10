@@ -54,12 +54,7 @@ namespace mixedeffects {
         size_t num_fixed = beta.size();
 
         // inv_sigma2 = 1.0 / sigma2 (in fixed-point: scale^2 / sigma2)
-        AV scale_sq(1, engine);
-        scale_sq += (DataType(1) << (2 * precision));
-        auto scale_sq_b = scale_sq.a2b();
-        auto sigma2_b = sigma2.a2b();
-        auto inv_sigma2_b = (*scale_sq_b) / (*sigma2_b);
-        AV inv_sigma2 = *(inv_sigma2_b->b2a());
+        AV inv_sigma2 = SecureReciprocal(sigma2);
         inv_sigma2.setPrecision(0);
 
         // Compute fixed effects linear predictor X_beta = sum_{k=0}^{p-1} X_col[k] * beta[k]
@@ -137,12 +132,7 @@ namespace mixedeffects {
         size_t num_fixed = beta.size();
 
         // inv_sigma2 = scale^2 / sigma2
-        AV scale_sq(1, engine);
-        scale_sq += (DataType(1) << (2 * precision));
-        auto scale_sq_b = scale_sq.a2b();
-        auto sigma2_b = sigma2.a2b();
-        auto inv_sigma2_b = (*scale_sq_b) / (*sigma2_b);
-        AV inv_sigma2 = *(inv_sigma2_b->b2a());
+        AV inv_sigma2 = SecureReciprocal(sigma2);
         inv_sigma2.setPrecision(0);
 
         AV u_hat = ConditionalMode(group, beta, sigma2);  // size 1

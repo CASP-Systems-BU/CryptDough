@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <cmath>
-#include <numeric>
-#include <vector>
 #include <functional>
+#include <numeric>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "cdough.h"
 #include "./regression.h"
@@ -653,50 +656,306 @@ int main(int argc, char** argv) {
         std::cout << "  Max Matrix Abs Error: " << max_h_err << std::endl;
     }
 
-    // 5. Test MinimizeBFGS
+
+    // =========================================================================
+    // Validation for Transpose, MatMul, and NewtonSchulzInverse
+    // =========================================================================
     if (pID == 0) {
-        std::cout << "\nRunning MinimizeBFGS (Secure Quasi-Newton Optimizer)..." << std::endl;
-    }
-    // Initial parameter guess: [0.0, 0.0, 0.0]
-    std::vector<AV> init_params_sec;
-    for (size_t i = 0; i < dim; ++i) {
-        cdough::Vector<DataType> p_init(1, precision); p_init[0] = 0;
-        init_params_sec.push_back(engine.secret_share_a(p_init, 0, precision));
+        std::cout << "\n--- Testing Transpose, MatMul, and NewtonSchulzInverse ---" << std::endl;
     }
 
-    OptResult opt_res = MinimizeBFGS(objective_func, init_params_sec, 50);
+    using Mat = std::vector<std::vector<double>>;
 
-    auto opened_final_val = opt_res.value.open();
-    std::vector<double> opened_final_params;
-    for (size_t i = 0; i < dim; ++i) {
-        auto op_p = opt_res.params[i].open();
-        opened_final_params.push_back(static_cast<double>(op_p[0]) / scale);
-    }
-
-    if (pID == 0) {
-        std::cout << "MinimizeBFGS Result:\n"
-                  << "  Iterations: " << opt_res.iterations << "\n"
-                  << "  Converged:  " << (opt_res.converged ? "True" : "False") << "\n"
-                  << "  Final Objective Value: " << static_cast<double>(opened_final_val[0]) / scale << "\n"
-                  << "  Fitted Parameters [beta_0, beta_1, s]: [";
-        for (size_t i = 0; i < dim; ++i) {
-            std::cout << opened_final_params[i] << (i + 1 < dim ? ", " : "");
+    auto share_matrix = [&engine](const Mat& m) -> SMatrix {
+        size_t rows = m.size();
+        size_t cols = m[0].size();
+        cdough::Vector<DataType> flat(rows * cols, precision);
+        for (size_t i = 0; i < rows; ++i) {
+            for (size_t j = 0; j < cols; ++j) {
+                flat[i * cols + j] = std::llround(m[i][j] * scale);
+            }
         }
-        std::cout << "]" << std::endl;
+        PMatrix plain(flat, rows, cols, false);
+        SMatrix shared = engine.secret_share_matrix(plain, 0);
+        shared.setPrecision(precision);
+        return shared;
+    };
 
-        // The MLE need not equal the generating parameters on a finite sample,
-        // so score the fit by the plaintext objective instead
-        std::vector<double> true_params = {kTrueBeta0, kTrueBeta1, plain_s};
-        double nll_at_true = plain_neg_marginal_log_lik(true_params);
-        double nll_at_fit = plain_neg_marginal_log_lik(opened_final_params);
-        std::cout << "  True Parameters [beta_0, beta_1, s]:   [" << kTrueBeta0 << ", "
-                  << kTrueBeta1 << ", " << plain_s << "]\n"
-                  << "  Plaintext NLL at true params: " << nll_at_true << "\n"
-                  << "  Plaintext NLL at MPC fit:     " << nll_at_fit
-                  << (nll_at_fit <= nll_at_true ? "   (fit beats truth: OK)"
-                                                : "   (WORSE than truth)")
-                  << std::endl;
-        std::cout << "\nAll functions executed and validated successfully against plaintext!" << std::endl;
+    // Must be called by every party: open() is a communication round.
+    auto open_matrix = [](const SMatrix& m) -> Mat {
+        auto opened = m.open();
+        Mat out(m.rows(), std::vector<double>(m.cols(), 0.0));
+        for (size_t i = 0; i < m.rows(); ++i) {
+            for (size_t j = 0; j < m.cols(); ++j) {
+                out[i][j] = static_cast<double>(opened.data()[i * m.cols() + j]) / scale;
+            }
+        }
+        return out;
+    };
+
+    auto plain_transpose = [](const Mat& m) -> Mat {
+        Mat out(m[0].size(), std::vector<double>(m.size(), 0.0));
+        for (size_t i = 0; i < m.size(); ++i) {
+            for (size_t j = 0; j < m[0].size(); ++j) out[j][i] = m[i][j];
+        }
+        return out;
+    };
+
+    auto plain_matmul = [](const Mat& a, const Mat& b) -> Mat {
+        Mat out(a.size(), std::vector<double>(b[0].size(), 0.0));
+        for (size_t i = 0; i < a.size(); ++i) {
+            for (size_t j = 0; j < b[0].size(); ++j) {
+                double sum = 0.0;
+                for (size_t k = 0; k < b.size(); ++k) sum += a[i][k] * b[k][j];
+                out[i][j] = sum;
+            }
+        }
+        return out;
+    };
+
+    // Gauss-Jordan with partial pivoting. Reference only; the secure operator
+    // cannot pivot, because pivot selection branches on the data.
+    auto plain_inverse = [](Mat m) -> Mat {
+        size_t n = m.size();
+        Mat inv(n, std::vector<double>(n, 0.0));
+        for (size_t i = 0; i < n; ++i) inv[i][i] = 1.0;
+        for (size_t col = 0; col < n; ++col) {
+            size_t pivot = col;
+            for (size_t r = col + 1; r < n; ++r) {
+                if (std::abs(m[r][col]) > std::abs(m[pivot][col])) pivot = r;
+            }
+            std::swap(m[col], m[pivot]);
+            std::swap(inv[col], inv[pivot]);
+            double d = m[col][col];
+            for (size_t j = 0; j < n; ++j) {
+                m[col][j] /= d;
+                inv[col][j] /= d;
+            }
+            for (size_t r = 0; r < n; ++r) {
+                if (r == col) continue;
+                double f = m[r][col];
+                for (size_t j = 0; j < n; ++j) {
+                    m[r][j] -= f * m[col][j];
+                    inv[r][j] -= f * inv[col][j];
+                }
+            }
+        }
+        return inv;
+    };
+
+    auto max_abs_diff = [](const Mat& a, const Mat& b) -> double {
+        double worst = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            for (size_t j = 0; j < a[0].size(); ++j) {
+                worst = std::max(worst, std::abs(a[i][j] - b[i][j]));
+            }
+        }
+        return worst;
+    };
+
+    // Residual max |A * A_inv - I|, the honest accuracy metric: it stays
+    // meaningful even when the entries of A^-1 are large.
+    auto residual_error = [&plain_matmul](const Mat& a, const Mat& a_inv) -> double {
+        Mat product = plain_matmul(a, a_inv);
+        double worst = 0.0;
+        for (size_t i = 0; i < product.size(); ++i) {
+            for (size_t j = 0; j < product[0].size(); ++j) {
+                double target = (i == j) ? 1.0 : 0.0;
+                worst = std::max(worst, std::abs(product[i][j] - target));
+            }
+        }
+        return worst;
+    };
+
+    // 1. Transpose and MatMul, before anything is built on top of them.
+    // Every matrix here is deliberately non-symmetric: a symmetric one cannot
+    // tell A * B apart from A * B^T, which is the failure mode of getting the
+    // library's column-wise calling convention backwards.
+    Mat plain_wide = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};        // 2 x 3
+    Mat plain_tall = {{7.0, 8.0}, {9.0, 10.0}, {11.0, 12.0}};   // 3 x 2
+    Mat plain_left = {{1.0, 2.0}, {3.0, 4.0}};                  // 2 x 2
+    Mat plain_right = {{5.0, 6.0}, {7.0, 8.0}};                 // 2 x 2
+
+    SMatrix secure_wide = share_matrix(plain_wide);
+    SMatrix secure_tall = share_matrix(plain_tall);
+    SMatrix secure_left = share_matrix(plain_left);
+    SMatrix secure_right = share_matrix(plain_right);
+
+    Mat opened_transpose = open_matrix(Transpose(secure_wide));
+    Mat opened_rect_product = open_matrix(MatMul(secure_wide, secure_tall));
+    Mat opened_square_product = open_matrix(MatMul(secure_left, secure_right));
+
+    if (pID == 0) {
+        Mat expected_transpose = plain_transpose(plain_wide);
+        Mat expected_rect = plain_matmul(plain_wide, plain_tall);
+        Mat expected_square = plain_matmul(plain_left, plain_right);
+        // If the column-wise convention were inverted we would land on this instead.
+        Mat wrong_square = plain_matmul(plain_left, plain_transpose(plain_right));
+
+        std::cout << "Transpose (2x3 -> 3x2):        max abs error = "
+                  << max_abs_diff(expected_transpose, opened_transpose) << std::endl;
+        std::cout << "MatMul (2x3 * 3x2):            max abs error = "
+                  << max_abs_diff(expected_rect, opened_rect_product) << std::endl;
+        std::cout << "MatMul (2x2 * 2x2):            max abs error = "
+                  << max_abs_diff(expected_square, opened_square_product) << std::endl;
+        std::cout << "  (distance from the A*B^T mistake: "
+                  << max_abs_diff(wrong_square, opened_square_product)
+                  << ", must be large)" << std::endl;
+    }
+
+    // 2. NewtonSchulzInverse over a suite spanning conditioning and symmetry.
+    // Note every matrix is O(1)-scaled, as the operator requires: X_0 is
+    // A^T / ||A||_F^2, which underflows to zero if ||A||_F^2 grows too large.
+    std::vector<std::pair<std::string, Mat>> inverse_cases = {
+        {"identity 3x3", {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}}},
+        {"spd, kappa ~ 4", {{4.0, 1.0, 0.0}, {1.0, 3.0, 1.0}, {0.0, 1.0, 2.0}}},
+        {"spd, kappa ~ 19", {{1.0, 0.9, 0.0}, {0.9, 1.0, 0.0}, {0.0, 0.0, 1.0}}},
+        {"non-symmetric 3x3", {{2.0, 1.0, 0.0}, {0.0, 3.0, 1.0}, {1.0, 0.0, 4.0}}},
+        {"2x2", {{2.0, 1.0}, {1.0, 3.0}}},
+        // Deliberately past the operating range, to show where the fixed bound gives up.
+        {"spd, kappa ~ 199", {{1.0, 0.99, 0.0}, {0.99, 1.0, 0.0}, {0.0, 0.0, 1.0}}},
+    };
+
+    // A realistic case: the averaged information matrix X^T W X / N from the
+    // synthetic dataset above, evaluated at the true parameters. Averaging by N
+    // is what keeps it O(1)-scaled.
+    {
+        size_t num_obs_total = test_num_groups * test_obs_per_group;
+        Mat gram(test_num_fixed, std::vector<double>(test_num_fixed, 0.0));
+        for (size_t g = 0; g < test_num_groups; ++g) {
+            for (size_t j = 0; j < test_obs_per_group; ++j) {
+                double eta = kTrueBeta0 + kTrueBeta1 * plain_X[g][j][1] + true_u[g];
+                double prob = 1.0 / (1.0 + std::exp(-eta));
+                double weight = prob * (1.0 - prob);
+                for (size_t r = 0; r < test_num_fixed; ++r) {
+                    for (size_t c = 0; c < test_num_fixed; ++c) {
+                        gram[r][c] += weight * plain_X[g][j][r] * plain_X[g][j][c];
+                    }
+                }
+            }
+        }
+        for (size_t r = 0; r < test_num_fixed; ++r) {
+            for (size_t c = 0; c < test_num_fixed; ++c) {
+                gram[r][c] /= static_cast<double>(num_obs_total);
+            }
+        }
+        inverse_cases.emplace_back("X^T W X / N (2x2)", gram);
+    }
+
+    if (pID == 0) {
+        std::cout << "\nNewtonSchulzInverse (" << kMatrixInverseIterations
+                  << " iterations):" << std::endl;
+        std::cout << std::left << std::setw(24) << "Matrix"
+                  << std::setw(18) << "Max entry error"
+                  << std::setw(18) << "Residual |AX-I|" << std::endl;
+    }
+
+    for (const auto& [name, matrix] : inverse_cases) {
+        SMatrix secure_case = share_matrix(matrix);
+        Mat opened_inverse = open_matrix(NewtonSchulzInverse(secure_case));
+        if (pID == 0) {
+            double entry_error = max_abs_diff(plain_inverse(matrix), opened_inverse);
+            double residual = residual_error(matrix, opened_inverse);
+            std::cout << std::left << std::setw(24) << name
+                      << std::setw(18) << std::scientific << std::setprecision(3) << entry_error
+                      << std::setw(18) << residual << std::endl;
+        }
+    }
+    if (pID == 0) {
+        std::cout << "  (the kappa ~ 199 row is deliberately past the operating range:"
+                  << " a fixed iteration bound cannot chase arbitrary conditioning)" << std::endl;
+        std::cout << std::fixed << std::setprecision(6);
+    }
+
+    // 3. Iteration-count calibration. Sweeps the bound so it can be chosen from
+    // measurement on the real 3PC deployment rather than guessed. The error
+    // should fall quadratically and then flatten on the ABY3 truncation noise
+    // floor; take the first count on the plateau for the worst case here, and
+    // require that plateau to sit at or below the abs errors the other
+    // operators above report (~1e-4).
+    if (kRunMatrixInverseCalibration) {
+        if (pID == 0) {
+            std::cout << "\nNewtonSchulzInverse iteration calibration"
+                      << " (residual |AX-I|, by iteration count):" << std::endl;
+            std::cout << std::left << std::setw(24) << "Matrix";
+            for (int k = 1; k <= kMatrixInverseCalibrationMax; ++k) {
+                std::cout << std::setw(11) << k;
+            }
+            std::cout << std::endl;
+        }
+        for (const auto& [name, matrix] : inverse_cases) {
+            SMatrix secure_case = share_matrix(matrix);
+            std::vector<double> residuals;
+            residuals.reserve(kMatrixInverseCalibrationMax);
+            for (int k = 1; k <= kMatrixInverseCalibrationMax; ++k) {
+                Mat opened_inverse = open_matrix(NewtonSchulzInverse(secure_case, k));
+                residuals.push_back(residual_error(matrix, opened_inverse));
+            }
+            if (pID == 0) {
+                std::cout << std::left << std::setw(24) << name;
+                for (double r : residuals) {
+                    std::cout << std::setw(11) << std::scientific << std::setprecision(2) << r;
+                }
+                std::cout << std::endl;
+            }
+        }
+        if (pID == 0) {
+            std::cout << std::fixed << std::setprecision(6);
+        }
+    }
+
+    // 5. Test MinimizeBFGS.
+    // Skipped while calibrating: the sweep above is what that run is for, and
+    // the full optimizer costs far more than everything else here combined.
+    if (kRunMatrixInverseCalibration) {
+        if (pID == 0) {
+            std::cout << "\nSkipping MinimizeBFGS (matrix-inverse calibration run)." << std::endl;
+        }
+    } else {
+        if (pID == 0) {
+            std::cout << "\nRunning MinimizeBFGS (Secure Quasi-Newton Optimizer)..." << std::endl;
+        }
+        // Initial parameter guess: [0.0, 0.0, 0.0]
+        std::vector<AV> init_params_sec;
+        for (size_t i = 0; i < dim; ++i) {
+            cdough::Vector<DataType> p_init(1, precision); p_init[0] = 0;
+            init_params_sec.push_back(engine.secret_share_a(p_init, 0, precision));
+        }
+
+        OptResult opt_res = MinimizeBFGS(objective_func, init_params_sec, 50);
+
+        auto opened_final_val = opt_res.value.open();
+        std::vector<double> opened_final_params;
+        for (size_t i = 0; i < dim; ++i) {
+            auto op_p = opt_res.params[i].open();
+            opened_final_params.push_back(static_cast<double>(op_p[0]) / scale);
+        }
+
+        if (pID == 0) {
+            std::cout << "MinimizeBFGS Result:\n"
+                      << "  Iterations: " << opt_res.iterations << "\n"
+                      << "  Converged:  " << (opt_res.converged ? "True" : "False") << "\n"
+                      << "  Final Objective Value: " << static_cast<double>(opened_final_val[0]) / scale << "\n"
+                      << "  Fitted Parameters [beta_0, beta_1, s]: [";
+            for (size_t i = 0; i < dim; ++i) {
+                std::cout << opened_final_params[i] << (i + 1 < dim ? ", " : "");
+            }
+            std::cout << "]" << std::endl;
+
+            // The MLE need not equal the generating parameters on a finite sample,
+            // so score the fit by the plaintext objective instead
+            std::vector<double> true_params = {kTrueBeta0, kTrueBeta1, plain_s};
+            double nll_at_true = plain_neg_marginal_log_lik(true_params);
+            double nll_at_fit = plain_neg_marginal_log_lik(opened_final_params);
+            std::cout << "  True Parameters [beta_0, beta_1, s]:   [" << kTrueBeta0 << ", "
+                      << kTrueBeta1 << ", " << plain_s << "]\n"
+                      << "  Plaintext NLL at true params: " << nll_at_true << "\n"
+                      << "  Plaintext NLL at MPC fit:     " << nll_at_fit
+                      << (nll_at_fit <= nll_at_true ? "   (fit beats truth: OK)"
+                                                    : "   (WORSE than truth)")
+                      << std::endl;
+            std::cout << "\nAll functions executed and validated successfully against plaintext!" << std::endl;
+        }
     }
 
     return 0;

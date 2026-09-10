@@ -8,3 +8,4 @@ Short list of all tasks so far.
 - 0004 — Factor out logistic-regression value type — Status: Done — [tasks/0004_factor-out-logistic-regression-value-type.md](0004_factor-out-logistic-regression-value-type.md)
 - 0005 — Add a simulated fixed-precision value type — Status: Done — [tasks/0005_simulated-float-value-type.md](0005_simulated-float-value-type.md)
 - 0006 — Make Taylor math compatible with SimulatedFloat — Status: Done — [tasks/0006_simulated-float-taylor-math.md](0006_simulated-float-taylor-math.md)
+- 0007 — Secure matrix inversion via Newton–Schulz iterations — Status: Done — [tasks/0007_secure-matrix-inversion-newton-schulz.md](0007_secure-matrix-inversion-newton-schulz.md)
