@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -25,12 +27,15 @@
 // Layout:
 //   1. Fixed-point kernels      ClampAbs/ClampRange/Abs, Div/Recip, Sqrt/Rsqrt,
 //                               Exp/Log/Log1p/Sigmoid/LogOnePlusExp
-//   2. Segmented helpers        SegScan/SegTotal, First/LastOfGroup, CountDistinct
+//   2. Segmented helpers        SegScan/SegTotal, the cached-group-bit
+//                               SegScanPlanned/SegTotalPlanned, First/LastOfGroup,
+//                               CountDistinct
 //   3. Dense linear algebra     Gram, Cholesky factor/solve, SymmetricInverse
 //   4. BFGS                     numerical gradient, Armijo line search
 //   5. Cohort + ingestion       synthetic generator, CSV reader/writer, sharing
 //   6. Descriptive + aggregate  d1a, d1b, sisa_perct_cnt x3
 //   7. Models                   design matrices, IRLS (6a/6b), flat Laplace GLMM
+//                               with an analytic gradient
 //   8. Reporting + oracle       coefficient tables, plaintext IRLS cross-check
 //   9. main()                   stage selection and the pipeline driver
 //
@@ -41,12 +46,18 @@
 //   - `AV a = b` is a SHALLOW copy sharing the underlying buffer, while
 //     `operator=` is a deep element-wise copy. Use Clone() before mutating a
 //     copy of anything you do not own.
+//   - Private division is expensive enough to shape the whole design.
+//     BSharedVector::operator/ (circuits.h:39) is 64 sequential rounds; nothing
+//     on a hot path may use it. Div/Recip do Newton on a normalised denominator,
+//     and RecipSeeded skips even the normalisation when the range is known.
 //
 // Run:
 //   ../scripts/run_experiment.py -p 3 -r 200 mpc-analysis
 //   ./mpc-analysis -S kernels                 # accuracy harnesses only (fast)
 //   ./mpc-analysis -S describe -r 200         # ingestion + descriptive nodes
-//   ./mpc-analysis -S models -r 200           # the fourteen fits (slow)
+//   ./mpc-analysis -S models -r 200           # the fourteen fits
+//   ./mpc-analysis -S bench -r 200            # cost breakdown of one fit
+//   ./mpc-analysis -S models -r 200 -C 0      # ... with uncached segmented scans
 //   ./mpc-analysis -D /data                   # read per-party CSVs instead
 //   ./mpc-analysis -O /tmp/dump               # dump the synthetic cohort to CSV
 
@@ -90,7 +101,14 @@ const DataType kMaxExpArg_scaled = (kMaxExpArg * scale);
 constexpr int kExpSeriesTerms = 5;
 constexpr int kLogSeriesTerms = 5;
 constexpr int kMaxNewtonStep = 4;
-constexpr int kNewtonIterations = 5;
+// Iterations of the inner damped Newton search for the conditional mode. The
+// objective is strictly concave in u and the search starts at u = 0, so it
+// converges almost immediately. Measured against a 12-iteration reference, 3
+// iterations reproduce the fitted coefficients to 1e-6 while 2 leave 1e-4, so 3
+// it is -- a 40% cut in the inner loop for no accuracy at all. Keep this in
+// step with NEWTON_ITERATIONS in scripts/testing/validate_mpc_analysis.py,
+// which mirrors the estimator.
+constexpr int kNewtonIterations = 3;
 
 // Width of the oblivious exponent stage in Exp: the shifted exponent k + kExpOffset
 // must fit in kExpBits bits, i.e. k in [-kExpOffset, kExpOffset - 1] = [-16, 15].
@@ -112,6 +130,24 @@ const double kRecipSeedB = 8.0 / 17.0;
 const DataType kRecipSeedA_scaled = std::llround(kRecipSeedA * scale);
 const DataType kRecipSeedB_scaled = std::llround(kRecipSeedB * scale);
 constexpr int kRecipNewtonSteps = 3;
+
+// Sigmoid's and Log's denominators are confined to known intervals, so they can
+// skip Div's normalisation ladder entirely and go straight to a seed. The
+// minimax linear seed for 1/d on [L, U] is a + b*d with
+//     b = -2 / (L*U + (L+U)^2/4),   a = -b*(L+U),
+// which equioscillates at L, (L+U)/2 and U.
+//
+// Sigmoid: den = 1 + exp(-|eta|), so den is in (1, 2]. Seed error 5.88%,
+// three Newton steps reach 1.4e-10.
+const DataType kRecipUnitA_scaled = std::llround((24.0 / 17.0) * scale);
+const DataType kRecipUnitB_scaled = std::llround((8.0 / 17.0) * scale);
+constexpr int kRecipUnitSteps = 3;
+
+// Log: den = m + 1 with m range-reduced into [sqrt(1/2), sqrt(2)], so den is in
+// [1.7071, 2.4142]. Seed error 1.49%, two Newton steps reach 5.0e-8.
+const DataType kRecipLogA_scaled = std::llround(0.985061500 * scale);
+const DataType kRecipLogB_scaled = std::llround(0.239015999 * scale);
+constexpr int kRecipLogSteps = 2;
 
 // Denominators are clamped into this band before normalisation. Below the low
 // bound a fixed-point denominator is indistinguishable from zero anyway.
@@ -236,6 +272,31 @@ AV Abs(const AV& x) {
     AV out = *(two_sign * x_);
     out.setPrecision(precision);
     return out;
+}
+
+// Reciprocal of a denominator already known to lie in a fixed public interval.
+//
+// This is the fast path that matters. Div's normalisation ladder is ten
+// conditional shifts and ten sign tests, and it exists only to bring an
+// arbitrary denominator into [1, 2). Sigmoid and Log both know their
+// denominator's range up front, so for them the whole ladder is dead work --
+// and they are called on every row, several times per objective evaluation.
+// Given a minimax linear seed for the interval, all that remains is
+// r <- r(2 - d r), which is two multiplications per step.
+AV RecipSeeded(const AV& den, DataType seed_a_scaled, DataType seed_b_scaled, int steps) {
+    AV d_ = Clone(den);
+    d_.setPrecision(0);
+
+    AV r = -(*(*(d_ * seed_b_scaled) / scale));
+    r += seed_a_scaled;
+    for (int i = 0; i < steps; ++i) {
+        AV dr = *(*(d_ * r) / scale);
+        AV corr = -dr;
+        corr += DataType(2) * DataType(scale);  // 2 - d*r
+        r = *(*(r * corr) / scale);
+    }
+    r.setPrecision(0);
+    return r;
 }
 
 // Secure fixed-point division num / den, for den > 0.
@@ -531,11 +592,10 @@ AV Log(AV x) {
     AV num = m - scale;
     AV den = m + scale;
 
-    auto num_b = (*(num * scale)).a2b();
-    auto den_b = den.a2b();
-
-    auto w_b = (*num_b) / (*den_b);
-    AV w = *(w_b->b2a());
+    // m has been reduced into [sqrt(1/2), sqrt(2)], so den is in
+    // [1.7071, 2.4142] -- again no normalisation needed.
+    AV inv_den = RecipSeeded(den, kRecipLogA_scaled, kRecipLogB_scaled, kRecipLogSteps);
+    AV w = *(*(num * inv_den) / scale);
     w.setPrecision(0);
 
     // Compute series: 2 * (w + w^3/3 + w^5/5)
@@ -605,11 +665,12 @@ AV Sigmoid(const AV& eta) {
     AV den = z;
     den += scale;
 
-    // Secure division: num / den with fixed-point precision
-    auto num_b = (*(num * scale)).a2b();
-    auto den_b = den.a2b();
-    auto res_b = (*num_b) / (*den_b);
-    AV res = *(res_b->b2a());
+    // den = 1 + z with z in (0, 1], so den is in (1, 2] and needs no
+    // normalisation. This replaced BSharedVector::operator/ (circuits.h:39),
+    // which was 79% of Sigmoid's cost and, since Sigmoid runs six times per
+    // objective evaluation on every row, the largest single cost in the program.
+    AV inv_den = RecipSeeded(den, kRecipUnitA_scaled, kRecipUnitB_scaled, kRecipUnitSteps);
+    AV res = *(*(num * inv_den) / scale);
     res.setPrecision(precision);
     return res;
 }
@@ -765,6 +826,139 @@ AV SegScan(std::vector<BV>& keys, const AV& in, SegDirection dir) {
     outs.emplace_back(in.size(), in.engine);
     SegScan(keys, ins, outs, dir);
     return outs[0];
+}
+
+bool g_use_cached_scans = true;
+
+struct ScanPlan {
+    size_t n = 0;
+    int depth = 0;
+    // Arithmetic 0/1 "same group" bits, one vector per network level, for each
+    // scan direction.
+    std::vector<AV> forward;
+    std::vector<AV> reverse;
+};
+
+// The (earlier, later) index pair the Brent-Kung network compares at one level.
+struct ScanLevel {
+    size_t a_start, b_start, step, count;
+};
+
+ScanLevel PlanLevel(size_t n, int level) {
+    const int half = static_cast<int>(std::bit_width(n - 1));
+    size_t gap, a_start, b_start;
+    if (level < half) {
+        gap = size_t{1} << level;
+        a_start = gap - 1;
+        b_start = 2 * gap - 1;
+    } else {
+        const int mirrored = 2 * half - 2 - level;
+        gap = size_t{1} << mirrored;
+        a_start = 2 * gap - 1;
+        b_start = 3 * gap - 1;
+    }
+    const size_t step = 2 * gap;
+    // `a` may run further than `b`; the network truncates it to b's length.
+    const size_t count = b_start <= n - 1 ? (n - 1 - b_start) / step + 1 : 0;
+    return ScanLevel{a_start, b_start, step, count};
+}
+
+int ScanDepth(size_t n) { return 2 * static_cast<int>(std::bit_width(n - 1)) - 1; }
+
+// A write-through reversed view, used to run the forward geometry backwards.
+std::vector<cdough::VectorSizeType> ReverseMap(size_t n) {
+    std::vector<cdough::VectorSizeType> map(n);
+    for (size_t i = 0; i < n; ++i) map[i] = static_cast<cdough::VectorSizeType>(n - 1 - i);
+    return map;
+}
+
+ScanPlan BuildScanPlan(const BV& key) {
+    EngineRef engine = key.engine;
+    ScanPlan plan;
+    plan.n = key.size();
+    plan.depth = ScanDepth(plan.n);
+
+    // A materialised reversed copy of the keys, so the reverse direction can use
+    // the same level arithmetic.
+    BV key_rev(plan.n, engine);
+    key_rev = key.mapping_reference(ReverseMap(plan.n));
+
+    for (int pass = 0; pass < 2; ++pass) {
+        const BV& k = (pass == 0) ? key : key_rev;
+        std::vector<AV>& into = (pass == 0) ? plan.forward : plan.reverse;
+        for (int level = 0; level < plan.depth; ++level) {
+            const ScanLevel geom = PlanLevel(plan.n, level);
+            if (geom.count == 0) {
+                into.emplace_back(1, engine);
+                continue;
+            }
+            BV a = k.simple_subset_reference(geom.a_start, geom.step,
+                                             geom.a_start + (geom.count - 1) * geom.step);
+            BV b = k.simple_subset_reference(geom.b_start, geom.step,
+                                             geom.b_start + (geom.count - 1) * geom.step);
+            AV same = *((a == b)->b2a_bit());
+            same.setPrecision(0);
+            into.push_back(same);
+        }
+    }
+    return plan;
+}
+
+// Per-group inclusive scan using a precomputed plan. Same contract as SegScan.
+void SegScanPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vector<AV>& out,
+                    SegDirection dir) {
+    assert(in.size() == out.size());
+    const size_t n = plan.n;
+    const std::vector<AV>& bits =
+        (dir == SegDirection::Forward) ? plan.forward : plan.reverse;
+    const bool reversed = (dir != SegDirection::Forward);
+    const std::vector<cdough::VectorSizeType> rev = reversed ? ReverseMap(n)
+                                                             : std::vector<cdough::VectorSizeType>{};
+
+    for (size_t k = 0; k < in.size(); ++k) {
+        out[k].setPrecision(0);
+        AV src = in[k];
+        src.setPrecision(0);
+        out[k] = src;  // deep element-wise copy, as aggregate() also does
+
+        // Reversing the accumulator lets one set of index arithmetic serve both
+        // directions; the mapping is a public view, so it writes through.
+        AV acc = reversed ? out[k].mapping_reference(rev) : out[k];
+        acc.setPrecision(0);
+
+        for (int level = 0; level < plan.depth; ++level) {
+            const ScanLevel geom = PlanLevel(n, level);
+            if (geom.count == 0) continue;
+            AV a = acc.simple_subset_reference(geom.a_start, geom.step,
+                                               geom.a_start + (geom.count - 1) * geom.step);
+            AV b = acc.simple_subset_reference(geom.b_start, geom.step,
+                                               geom.b_start + (geom.count - 1) * geom.step);
+            a.setPrecision(0);
+            b.setPrecision(0);
+            b += *(bits[level] * a);  // later += same_group * earlier
+        }
+        out[k].setPrecision(0);
+    }
+}
+
+// Broadcast each group's total to every row, using a precomputed plan.
+void SegTotalPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vector<AV>& out) {
+    const size_t n = plan.n;
+    std::vector<AV> suffix;
+    suffix.reserve(in.size());
+    for (size_t k = 0; k < in.size(); ++k) suffix.emplace_back(n, in[k].engine);
+
+    SegScanPlanned(plan, in, out, SegDirection::Forward);
+    SegScanPlanned(plan, in, suffix, SegDirection::Reverse);
+
+    for (size_t k = 0; k < in.size(); ++k) {
+        AV self = Clone(in[k]);
+        self.setPrecision(0);
+        out[k].setPrecision(0);
+        suffix[k].setPrecision(0);
+        out[k] += suffix[k];
+        out[k] -= self;
+    }
 }
 
 // 1 on the first row of each run of equal keys (operators::distinct marks
@@ -1316,11 +1510,13 @@ struct OptResult {
 // for free. It is a quasi-Newton approximation rather than the exact observed
 // information -- unlike the IRLS models, whose covariance is exact -- and the
 // report says so.
-OptResult MinimizeBFGS(
-    const std::function<AV(const std::vector<AV>&)>& f,
-    const std::vector<AV>& x0,
-    int max_iterations = 20,
-    SMatrix* h_inv_out = nullptr) {
+// An objective that can return its own gradient. Passing nullptr asks for the
+// value alone, which is all the line search needs; passing a vector asks for
+// both, so a caller with an analytic gradient pays for the shared work once.
+using ValueGradFn = std::function<AV(const std::vector<AV>&, std::vector<AV>*)>;
+
+OptResult MinimizeBFGS(const ValueGradFn& f, const std::vector<AV>& x0,
+                       int max_iterations = 20) {
     size_t n = x0.size();
     EngineRef engine = x0[0].engine;
 
@@ -1328,10 +1524,10 @@ OptResult MinimizeBFGS(
     for (size_t i = 0; i < n; ++i) {
         x[i].setPrecision(precision);
     }
-    AV fx = f(x);
+    std::vector<AV> gradient;
+    AV fx = f(x, &gradient);
     fx.setPrecision(precision);
 
-    std::vector<AV> gradient = NumericalGradient(f, x);
     SMatrix h_inv = Identity(n, engine);
 
     OptResult result(x, fx, 0, false);
@@ -1395,7 +1591,7 @@ OptResult MinimizeBFGS(
                 x_new[i] = x[i] + alpha_dir;
                 x_new[i].setPrecision(precision);
             }
-            fx_new = f(x_new);
+            fx_new = f(x_new, nullptr);
             fx_new.setPrecision(precision);
 
             auto opened_fx_new = fx_new.open();
@@ -1439,7 +1635,8 @@ OptResult MinimizeBFGS(
             break;
         }
 
-        std::vector<AV> gradient_new = NumericalGradient(f, x_new);
+        std::vector<AV> gradient_new;
+        f(x_new, &gradient_new);
         std::vector<AV> gradient_delta = MakeVector(n, 1, engine);
         for (size_t i = 0; i < n; ++i) {
             gradient_delta[i] = gradient_new[i] - gradient[i];
@@ -1489,7 +1686,6 @@ OptResult MinimizeBFGS(
 
     result.params = x;
     result.value = fx;
-    if (h_inv_out != nullptr) *h_inv_out = h_inv;
     return result;
 }
 
@@ -1626,6 +1822,10 @@ struct SecureCohort {
           hispanic(padded, engine),
           last_of_subject(padded, engine),
           first_of_subject(padded, engine) {}
+
+    // Per-level group bits for the segmented scans. Built once per cohort and
+    // reused by every objective evaluation of every model fitted to it.
+    ScanPlan scan_plan;
 
     // Number of patients. Published: it is already the first reported column of
     // both descriptive nodes, so treating it as secret would protect nothing
@@ -1980,6 +2180,8 @@ SecureCohort ShareCohort(EngineRef engine, const PlainCohort& c, int input_party
     sc.first_of_subject = *(first * sc.valid);
     sc.first_of_subject.setPrecision(0);
 
+    sc.scan_plan = BuildScanPlan(sc.subject_key);
+
     return sc;
 }
 
@@ -2329,6 +2531,7 @@ struct ModelData {
     AV y;         // n_pad, 0/1
     AV row_mask;  // n_pad, 1 on rows this model actually uses
     std::vector<BV> keys;
+    const ScanPlan* scan_plan = nullptr;  // owned by the cohort
     AV last_of_subject;
     std::vector<std::string> terms;
     long rows_used = 0;
@@ -2362,6 +2565,7 @@ ModelData BuildDesign(const SecureCohort& c, const ModelSpec& spec) {
     ModelData md(engine, np, p);
     md.terms = terms;
     md.keys = c.keys;
+    md.scan_plan = &c.scan_plan;
     md.last_of_subject = c.last_of_subject;
 
     // Rows this model uses. A b-axis model silently drops every row whose
@@ -2604,8 +2808,6 @@ AV FlatConditionalMode(const ModelData& md, const AV& x_beta, const AV& inv_sigm
     AV u(n, engine);
     u.setPrecision(0);
 
-    std::vector<BV> keys = md.keys;
-
     for (int it = 0; it < kNewtonIterations; ++it) {
         AV eta = x_beta + u;
         eta = ClampAbs(eta, kMaxExpArg_scaled);
@@ -2624,12 +2826,18 @@ AV FlatConditionalMode(const ModelData& md, const AV& x_beta, const AV& inv_sigm
         resid = *(resid * md.row_mask);
         resid.setPrecision(0);
 
-        // One call, both columns: the group bits are shared between them.
+        // One call, both columns, with the group bits taken from the cohort's
+        // precomputed plan rather than recomputed per level per call.
         std::vector<AV> in{resid, varp};
         std::vector<AV> out;
         out.emplace_back(n, engine);
         out.emplace_back(n, engine);
-        SegTotal(keys, in, out);
+        if (g_use_cached_scans) {
+            SegTotalPlanned(*md.scan_plan, in, out);
+        } else {
+            std::vector<BV> keys = md.keys;
+            SegTotal(keys, in, out);
+        }
 
         AV grad = out[0] - *(*(u * inv_sigma2_row) / scale);
         grad.setPrecision(0);
@@ -2652,9 +2860,53 @@ AV FlatConditionalMode(const ModelData& md, const AV& x_beta, const AV& inv_sigm
 // which is zero everywhere else, and zero on the sentinel pad block -- picks
 // exactly those rows out. A cluster with no usable rows contributes
 // -0.5 log(sigma^2) - 0.5 log(1/sigma^2) = 0, so it drops out on its own.
-AV FlatNegMarginalLogLik(const ModelData& md, const std::vector<AV>& params) {
+// Counts calls to the marginal likelihood. The number of objective evaluations
+// is the multiplier on everything else in a mixed-model fit, so it is the first
+// thing to look at when the cost is wrong.
+long g_objective_evaluations = 0;
+
+// Negative Laplace-approximated marginal log-likelihood and, optionally, its
+// ANALYTIC gradient.
+//
+// The gradient is worth deriving rather than differencing. Central differences
+// cost 2*dim objective evaluations, which measurement showed to be the single
+// largest multiplier in the whole program; the analytic form shares the
+// conditional-mode search with the value and costs about one extra segmented
+// scan. It is also strictly more accurate, because it never divides by a step.
+//
+// Derivation. Write g_i(u) for the exponent inside the integral, so that
+//     l_i = g_i(u_i) - 0.5 log(sigma^2) - 0.5 log(A_i),
+//     A_i = 1/sigma^2 + sum_j v_ij,        v_ij = p_ij (1 - p_ij),
+// with u_i the conditional mode. Because u_i is a stationary point of g_i, the
+// envelope theorem kills the du_i/dbeta terms in d g_i(u_i)/dbeta and it
+// collapses to the partial derivative at fixed u:
+//     d/dbeta_k [ g_i(u_i) ] = sum_j (y_ij - p_ij) x_ijk.
+// The log(A_i) term gets no such cancellation. Differentiating A_i through both
+// x and u_i, using
+//     du_i/dbeta_k  = -(sum_j v_ij x_ijk) / A_i          (implicit function theorem)
+//     dv_ij/deta_ij = v_ij (1 - 2 p_ij)
+// gives dA_i/dbeta_k = S3_k - S1_k S2_i / A_i, and therefore
+//     dl_i/dbeta_k = S4_k - (S3_k - S1_k S2_i / A_i) / (2 A_i)
+// where, all sums being over the rows of cluster i,
+//     S1_k = sum v_ij x_ijk,                 S2_i = sum v_ij (1 - 2 p_ij),
+//     S3_k = sum v_ij (1 - 2 p_ij) x_ijk,    S4_k = sum (y_ij - p_ij) x_ijk.
+// For the variance, parameterised as sigma^2 = exp(2s) to keep it positive:
+//     du_i/ds  = 2 u_i / (sigma^2 A_i),
+//     dA_i/ds  = -2/sigma^2 + S2_i du_i/ds,
+//     dl_i/ds  = u_i^2/sigma^2 - 1 - (dA_i/ds) / (2 A_i).
+//
+// Every S is a per-cluster sum of a per-row quantity, so all 3p+2 of them come
+// out of ONE forward segmented scan alongside the two the value already needs.
+//
+// Pass nullptr for `gradient_out` to get the value alone, which is what the
+// line search wants.
+AV FlatObjective(const ModelData& md, const std::vector<AV>& params,
+                 std::vector<AV>* gradient_out) {
+    ++g_objective_evaluations;
+
     EngineRef engine = md.y.engine;
     const size_t n = md.n_pad, p = md.p;
+    const bool want_gradient = (gradient_out != nullptr);
 
     AV beta(p, engine);
     beta.setPrecision(0);
@@ -2704,14 +2956,52 @@ AV FlatNegMarginalLogLik(const ModelData& md, const std::vector<AV>& params) {
     varp_row = *(varp_row * md.row_mask);
     varp_row.setPrecision(0);
 
-    // Forward scan only: the totals are needed on the last row of each cluster,
-    // not broadcast back, so one pass suffices.
-    std::vector<BV> keys = md.keys;
-    std::vector<AV> in{cll_row, varp_row};
+    // Columns to scan. The first two are what the value needs; the rest are the
+    // gradient's per-cluster sums, folded into the same pass.
+    std::vector<AV> columns{cll_row, varp_row};
+    AV resid(n, engine), skew(n, engine);
+    if (want_gradient) {
+        // skew = v * (1 - 2p), the derivative of v with respect to eta.
+        AV one_minus_two_p = *(pr * DataType(2));
+        one_minus_two_p = -one_minus_two_p;
+        one_minus_two_p += DataType(scale);
+        skew = *(*(varp_row * one_minus_two_p) / scale);
+        skew.setPrecision(0);
+
+        resid = md.y - pr;
+        resid = *(resid * md.row_mask);
+        resid.setPrecision(0);
+
+        columns.push_back(skew);
+        for (size_t k = 0; k < p; ++k) {
+            AV xk = md.x.simple_subset_reference(k, p, (n - 1) * p + k);
+            xk.setPrecision(0);
+            columns.push_back(*(*(varp_row * xk) / scale));
+            columns.back().setPrecision(0);
+        }
+        for (size_t k = 0; k < p; ++k) {
+            AV xk = md.x.simple_subset_reference(k, p, (n - 1) * p + k);
+            xk.setPrecision(0);
+            columns.push_back(*(*(skew * xk) / scale));
+            columns.back().setPrecision(0);
+        }
+        for (size_t k = 0; k < p; ++k) {
+            AV xk = md.x.simple_subset_reference(k, p, (n - 1) * p + k);
+            xk.setPrecision(0);
+            columns.push_back(*(*(resid * xk) / scale));
+            columns.back().setPrecision(0);
+        }
+    }
+
     std::vector<AV> pre;
-    pre.emplace_back(n, engine);
-    pre.emplace_back(n, engine);
-    SegScan(keys, in, pre, SegDirection::Forward);
+    pre.reserve(columns.size());
+    for (size_t k = 0; k < columns.size(); ++k) pre.emplace_back(n, engine);
+    if (g_use_cached_scans) {
+        SegScanPlanned(*md.scan_plan, columns, pre, SegDirection::Forward);
+    } else {
+        std::vector<BV> keys = md.keys;
+        SegScan(keys, columns, pre, SegDirection::Forward);
+    }
 
     AV a_row = pre[1] + inv_sigma2_row;
     a_row.setPrecision(0);
@@ -2732,9 +3022,75 @@ AV FlatNegMarginalLogLik(const ModelData& md, const std::vector<AV>& params) {
     AV total = contrib.chunkedSum(n);
     total.setPrecision(0);
 
+    if (want_gradient) {
+        // One reciprocal serves the whole gradient. It is computed on every row
+        // even though only the last row of each cluster is used, because a
+        // vectorised division over n rows is cheaper than compacting first.
+        AV inv_a = Recip(a_row);
+        inv_a.setPrecision(0);
+        AV s2 = pre[2];  // S2_i, the skew total
+
+        gradient_out->clear();
+        gradient_out->reserve(p + 1);
+
+        for (size_t k = 0; k < p; ++k) {
+            AV s1 = pre[3 + k];
+            AV s3 = pre[3 + p + k];
+            AV s4 = pre[3 + 2 * p + k];
+
+            // dA/dbeta_k = S3_k - S1_k * S2 / A
+            AV s1_s2 = *(*(s1 * s2) / scale);
+            AV shift = *(*(s1_s2 * inv_a) / scale);
+            AV d_a = s3 - shift;
+            d_a.setPrecision(0);
+
+            // dl/dbeta_k = S4_k - (dA/dbeta_k) / (2 A)
+            AV correction = *(*(d_a * inv_a) / scale);
+            AV half_correction = *(correction / DataType(2));
+            AV row = s4 - half_correction;
+            row.setPrecision(0);
+
+            AV masked = *(row * md.last_of_subject);
+            AV summed = masked.chunkedSum(n);
+            AV negated = -summed;  // gradient of the NEGATIVE log-likelihood
+            negated.setPrecision(precision);
+            gradient_out->push_back(negated);
+        }
+
+        // du/ds = 2 u / (sigma^2 A)
+        AV du_ds = *(*(u * inv_sigma2_row) / scale);
+        du_ds = *(*(du_ds * inv_a) / scale);
+        du_ds = *(du_ds * DataType(2));
+        du_ds.setPrecision(0);
+
+        // dA/ds = -2/sigma^2 + S2 * du/ds
+        AV d_a_ds = *(*(s2 * du_ds) / scale);
+        AV two_inv = *(inv_sigma2_row * DataType(2));
+        d_a_ds -= two_inv;
+        d_a_ds.setPrecision(0);
+
+        // dl/ds = u^2/sigma^2 - 1 - (dA/ds) / (2 A)
+        AV correction = *(*(d_a_ds * inv_a) / scale);
+        AV half_correction = *(correction / DataType(2));
+        AV row = pen - half_correction;  // pen is u^2/sigma^2
+        row -= DataType(scale);
+        row.setPrecision(0);
+
+        AV masked = *(row * md.last_of_subject);
+        AV summed = masked.chunkedSum(n);
+        AV negated = -summed;
+        negated.setPrecision(precision);
+        gradient_out->push_back(negated);
+    }
+
     AV neg = -total;
     neg.setPrecision(precision);
     return neg;
+}
+
+// Value-only wrapper, for the places that do not want a gradient.
+AV FlatNegMarginalLogLik(const ModelData& md, const std::vector<AV>& params) {
+    return FlatObjective(md, params, nullptr);
 }
 
 constexpr int kGlmmBfgsIterations = 12;
@@ -2745,9 +3101,15 @@ constexpr int kGlmmBfgsIterations = 12;
 // 1e-4 at precision 16, the balance sits near h = eps^(1/4) ~ 0.1.
 const double kHessianStep = 0.1;
 
-// Above this, the observed-information matrix is ill-conditioned enough that the
-// standard errors on its weakly determined directions should not be relied on.
-const double kHessianConditionWarn = 1e4;
+// Above this the observed-information matrix is close enough to singular that
+// its inverse should not be trusted at all. The threshold is deliberately high:
+// with the Hessian built from differences of the ANALYTIC gradient, standard
+// errors measured against an accurate double-precision reference stayed within
+// 8% at condition numbers around 2e4, so warning there would be crying wolf.
+// The earlier objective-difference Hessian was 17-46% off at the same
+// conditioning, which is what the old, much lower threshold was compensating
+// for.
+const double kHessianConditionWarn = 1e6;
 
 // Standard errors for the mixed models, from the observed information at the
 // optimum.
@@ -2768,51 +3130,58 @@ const double kHessianConditionWarn = 1e4;
 // It matters: in a near-collinear direction the Hessian is nearly singular, and
 // inverting it amplifies the objective's fixed-point noise without limit. The
 // standard errors on such terms are not trustworthy and the caller says so.
-std::vector<double> ObservedInformationSE(
-    const std::function<AV(const std::vector<AV>&)>& objective,
-    const std::vector<AV>& optimum, size_t num_reported,
-    double* condition_out = nullptr) {
+//
+// The Hessian is built from CENTRAL DIFFERENCES OF THE ANALYTIC GRADIENT, not
+// from second differences of the objective. That matters twice over. It costs
+// 2*dim gradient evaluations instead of 1 + 2*dim + dim(dim-1)/2 objective
+// evaluations -- about 2.5x less at dim = 7 -- and, more importantly, a first
+// difference divides by h rather than h^2, so it amplifies the fixed-point noise
+// by one factor of 1/h instead of two. That is exactly the term that made the
+// standard errors on near-collinear directions unreliable.
+//
+// The differences are opened and the small dense algebra is done in plaintext,
+// consistent with the choice already made for p-values: the curvature of the
+// log-likelihood at the optimum is precisely what a published standard error
+// discloses, so evaluating it under MPC would protect nothing.
+std::vector<double> ObservedInformationSE(const ValueGradFn& objective,
+                                          const std::vector<AV>& optimum,
+                                          size_t num_reported,
+                                          double* condition_out = nullptr) {
     const size_t dim = optimum.size();
-    EngineRef engine = optimum[0].engine;
     const double h = kHessianStep;
 
-    auto shifted = [&](const std::vector<double>& deltas) {
+    auto gradient_at = [&](size_t axis, double delta) {
         std::vector<AV> point;
         point.reserve(dim);
         for (size_t k = 0; k < dim; ++k) {
             AV v = Clone(optimum[k]);
             v.setPrecision(0);
-            v += static_cast<DataType>(std::llround(deltas[k] * scale));
+            if (k == axis) v += static_cast<DataType>(std::llround(delta * scale));
             v.setPrecision(precision);
             point.push_back(v);
         }
-        return OpenScalar(objective(point));
+        std::vector<AV> grad;
+        objective(point, &grad);
+        std::vector<double> out;
+        out.reserve(dim);
+        for (AV& g : grad) out.push_back(OpenScalar(g));
+        return out;
     };
 
-    const std::vector<double> zero(dim, 0.0);
-    const double f0 = shifted(zero);
-
-    std::vector<double> f_plus(dim), f_minus(dim);
-    for (size_t k = 0; k < dim; ++k) {
-        std::vector<double> d = zero;
-        d[k] = h;
-        f_plus[k] = shifted(d);
-        d[k] = -h;
-        f_minus[k] = shifted(d);
-    }
-
+    // Column k of the Hessian is d(grad)/d(x_k).
     std::vector<double> hess(dim * dim, 0.0);
-    for (size_t k = 0; k < dim; ++k)
-        hess[k * dim + k] = (f_plus[k] - 2.0 * f0 + f_minus[k]) / (h * h);
+    for (size_t k = 0; k < dim; ++k) {
+        const std::vector<double> forward = gradient_at(k, h);
+        const std::vector<double> backward = gradient_at(k, -h);
+        for (size_t j = 0; j < dim; ++j)
+            hess[j * dim + k] = (forward[j] - backward[j]) / (2.0 * h);
+    }
+    // The true Hessian is symmetric; averaging the two estimates of each
+    // off-diagonal entry halves the noise for free.
     for (size_t j = 0; j < dim; ++j) {
         for (size_t k = j + 1; k < dim; ++k) {
-            std::vector<double> d = zero;
-            d[j] = h;
-            d[k] = h;
-            const double f_jk = shifted(d);
-            const double v = (f_jk - f_plus[j] - f_plus[k] + f0) / (h * h);
-            hess[j * dim + k] = v;
-            hess[k * dim + j] = v;
+            const double avg = 0.5 * (hess[j * dim + k] + hess[k * dim + j]);
+            hess[j * dim + k] = hess[k * dim + j] = avg;
         }
     }
 
@@ -2874,7 +3243,6 @@ std::vector<double> ObservedInformationSE(
                          ? std::sqrt(var)
                          : std::numeric_limits<double>::quiet_NaN());
     }
-    (void)engine;
     return se;
 }
 
@@ -2891,8 +3259,9 @@ FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_i
         x0.push_back(v);
     }
 
-    auto objective = [&md](const std::vector<AV>& params) -> AV {
-        return FlatNegMarginalLogLik(md, params);
+    ValueGradFn objective = [&md](const std::vector<AV>& params,
+                                  std::vector<AV>* gradient) -> AV {
+        return FlatObjective(md, params, gradient);
     };
 
     OptResult opt = MinimizeBFGS(objective, x0, kGlmmBfgsIterations);
@@ -2915,18 +3284,22 @@ FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_i
     r.sigma2 = std::exp(2.0 * s_hat);
 
     r.notes.push_back(
-        "standard errors come from a finite-difference observed-information matrix at the "
+        "standard errors come from central differences of the analytic gradient at the "
         "optimum, not from the BFGS inverse-Hessian approximation");
     if (!opt.hessian_updated)
         r.notes.push_back(
             "no BFGS curvature update was accepted, so the optimiser may have stopped early");
-    if (!(condition < kHessianConditionWarn)) {
+    {
+        // Always report the conditioning: it is the single most useful number
+        // for judging how much to trust the standard errors on the weakly
+        // determined terms, which here are the intercept and any near-collinear
+        // dummy such as hispanic.
         std::ostringstream note;
-        note << "the observed-information matrix is ill-conditioned (1-norm condition estimate "
-             << std::scientific << std::setprecision(2) << condition
-             << "), so standard errors on the weakly determined terms -- typically the "
-                "intercept and any near-collinear dummy such as hispanic -- are not reliable "
-                "at this precision. The time coefficient is unaffected.";
+        note << "observed-information 1-norm condition estimate " << std::scientific
+             << std::setprecision(2) << condition;
+        if (!(condition < kHessianConditionWarn))
+            note << " -- close to singular; treat every standard error from this fit as "
+                    "indicative only";
         r.notes.push_back(note.str());
     }
     (void)party_id;
@@ -3354,6 +3727,20 @@ void TestSegmented(EngineRef engine, int party_id) {
     auto opened_total = total.open();
     AV prefix = SegScan(keys, val_col, SegDirection::Forward);
     auto opened_prefix = prefix.open();
+
+    // The cached-group-bit scan reimplements the Brent-Kung level geometry, so
+    // it is checked against the library's own aggregate rather than only
+    // against the plaintext expectation: an index slip that happened to be
+    // self-consistent would otherwise pass.
+    ScanPlan plan = BuildScanPlan(key_col);
+    std::vector<AV> plan_in{val_col};
+    std::vector<AV> plan_total, plan_prefix;
+    plan_total.emplace_back(n, engine);
+    plan_prefix.emplace_back(n, engine);
+    SegTotalPlanned(plan, plan_in, plan_total);
+    SegScanPlanned(plan, plan_in, plan_prefix, SegDirection::Forward);
+    auto opened_plan_total = plan_total[0].open();
+    auto opened_plan_prefix = plan_prefix[0].open();
     BV last_b = LastOfGroup(keys);
     auto opened_last = last_b.open();
     BV first_b = FirstOfGroup(keys);
@@ -3382,8 +3769,14 @@ void TestSegmented(EngineRef engine, int party_id) {
         const bool exp_last =
             (i + 1 == n_real) || (plain_keys_real[i] != plain_keys_real[i + 1]);
 
+        const double planned_total = static_cast<double>(opened_plan_total[i]) / scale;
+        const double planned_prefix = static_cast<double>(opened_plan_prefix[i]) / scale;
+
         ok &= std::abs(exp_total - got_total) < 1e-3;
         ok &= std::abs(running - got_prefix) < 1e-3;
+        // The cached scan must agree with the library's aggregate exactly.
+        ok &= std::abs(planned_total - got_total) < 1e-9;
+        ok &= std::abs(planned_prefix - got_prefix) < 1e-9;
         ok &= (static_cast<int>(opened_first[i]) == static_cast<int>(exp_first));
         // The last real row is only "last" once the sentinel block is excluded,
         // which is what makes the pad key matter.
@@ -3401,6 +3794,12 @@ void TestSegmented(EngineRef engine, int party_id) {
     const long exp_nd = static_cast<long>(distinct_masked.size());
     ok &= (got_nd == exp_nd);
     std::cout << "COUNT(DISTINCT key) WHERE mask=1: expected " << exp_nd << ", got " << got_nd
+              << std::endl;
+    std::cout << "cached-group-bit scan matches aggregate(): "
+              << (std::abs(static_cast<double>(opened_plan_total[0]) -
+                           static_cast<double>(opened_total[0])) < 1.0
+                      ? "yes"
+                      : "NO")
               << std::endl;
     std::cout << (ok ? "SEGMENTED HELPERS: PASS" : "SEGMENTED HELPERS: *** FAIL ***")
               << std::endl;
@@ -3567,6 +3966,212 @@ const PlainCohort& PickPlain(const PlainCohort& any, const PlainCohort& umass,
     return any;
 }
 
+// Measures the cost of the pieces a mixed-model fit is built from, so an
+// optimisation can be checked against a number instead of an intuition.
+void BenchmarkObjective(EngineRef engine, int party_id, const SecureCohort& cohort) {
+    using Clock = std::chrono::steady_clock;
+    auto seconds_since = [](Clock::time_point start) {
+        return std::chrono::duration<double>(Clock::now() - start).count();
+    };
+
+    // Model 5a is the widest mixed model: six fixed effects plus the variance.
+    ModelSpec spec;
+    spec.step = "5a";
+    spec.time = TimeAxis::VisitNum;
+    spec.covars = true;
+    spec.scope = cohort.scope;
+    ModelData md = BuildDesign(cohort, spec);
+    const size_t dim = md.p + 1;
+
+    std::vector<AV> params;
+    for (size_t k = 0; k < dim; ++k) {
+        AV v(1, engine);
+        v.setPrecision(precision);
+        params.push_back(v);
+    }
+    auto objective = [&md](const std::vector<AV>& p) { return FlatNegMarginalLogLik(md, p); };
+
+    // One untimed call first, so any lazily built correlated randomness is not
+    // charged to the measurement.
+    objective(params).open();
+
+    g_objective_evaluations = 0;
+    auto start = Clock::now();
+    objective(params).open();
+    const double one_eval = seconds_since(start);
+
+    start = Clock::now();
+    std::vector<AV> numeric = NumericalGradient(objective, params);
+    std::vector<double> numeric_open;
+    for (AV& g : numeric) numeric_open.push_back(OpenScalar(g));
+    const double numeric_gradient = seconds_since(start);
+    const long evals_in_gradient = g_objective_evaluations - 1;
+
+    // The analytic gradient has to be checked against the numerical one before
+    // it can be trusted: a sign slip or a missing term in the derivation would
+    // otherwise show up only as a mysteriously worse fit.
+    g_objective_evaluations = 0;
+    start = Clock::now();
+    std::vector<AV> analytic;
+    AV value = FlatObjective(md, params, &analytic);
+    value.open();
+    std::vector<double> analytic_open;
+    for (AV& g : analytic) analytic_open.push_back(OpenScalar(g));
+    const double analytic_gradient = seconds_since(start);
+    const long evals_in_analytic = g_objective_evaluations;
+
+    start = Clock::now();
+    std::vector<AV> in{md.y, md.row_mask};
+    std::vector<AV> out;
+    out.emplace_back(md.n_pad, engine);
+    out.emplace_back(md.n_pad, engine);
+    SegTotal(md.keys, in, out);
+    out[0].open();
+    const double one_segtotal = seconds_since(start);
+
+    // Library aggregate versus the cached-group-bit scan, at both the 2-column
+    // width the Newton loop uses and the 3p+2 width the gradient uses.
+    auto time_scan = [&](size_t width, bool planned, bool total) {
+        std::vector<AV> cols, dst;
+        for (size_t k = 0; k < width; ++k) {
+            cols.push_back(md.y);
+            dst.emplace_back(md.n_pad, engine);
+        }
+        std::vector<BV> ks = md.keys;
+        auto t0 = Clock::now();
+        if (total) {
+            if (planned) SegTotalPlanned(*md.scan_plan, cols, dst);
+            else SegTotal(ks, cols, dst);
+        } else {
+            if (planned) SegScanPlanned(*md.scan_plan, cols, dst, SegDirection::Forward);
+            else SegScan(ks, cols, dst, SegDirection::Forward);
+        }
+        dst[0].open();
+        return seconds_since(t0);
+    };
+    const size_t wide = 3 * md.p + 2;
+    const double lib_total2 = time_scan(2, false, true);
+    const double plan_total2 = time_scan(2, true, true);
+    const double lib_scan_wide = time_scan(wide, false, false);
+    const double plan_scan_wide = time_scan(wide, true, false);
+
+    start = Clock::now();
+    ScanPlan fresh = BuildScanPlan(md.keys[0]);
+    (void)fresh;
+    const double plan_build = seconds_since(start);
+
+    // Log is timed to bound what a --public-clusters fast path could win. The
+    // per-cluster quantities -- the Newton-step reciprocal, 1/A and log(A) --
+    // are computed on all n rows but only used on one row per cluster, so
+    // revealing the cluster boundaries would let them run on m rows instead.
+    AV logarg(md.n_pad, engine);
+    logarg.setPrecision(0);
+    logarg += DataType(scale) * 2;
+    logarg.setPrecision(precision);
+    start = Clock::now();
+    AV lg = Log(logarg);
+    lg.open();
+    const double one_log = seconds_since(start);
+
+    start = Clock::now();
+    AV sig = Sigmoid(md.y);
+    sig.open();
+    const double one_sigmoid = seconds_since(start);
+
+    // Split Sigmoid into its two halves. Sigmoid's denominator is 1 + exp(-|eta|),
+    // which lies in [1, 2] exactly, so if Div's normalisation ladder is a large
+    // share of the cost then a range-specialised reciprocal is worth having.
+    start = Clock::now();
+    AV ex = Exp(md.y);
+    ex.open();
+    const double one_exp = seconds_since(start);
+
+    AV den(md.n_pad, engine);
+    den.setPrecision(0);
+    den += DataType(scale) + DataType(scale) / 2;  // a denominator inside [1, 2]
+    den.setPrecision(precision);
+    start = Clock::now();
+    AV rec = Div(md.y, den);
+    rec.open();
+    const double one_div = seconds_since(start);
+
+    if (party_id != 0) return;
+    std::cout << "\n================ cost breakdown ================\n"
+              << "population           " << ScopeName(cohort.scope) << "\n"
+              << "rows (padded)        " << md.n_pad << "\n"
+              << "parameters (dim)     " << dim << "\n"
+              << std::fixed << std::setprecision(4)
+              << "\n  one Exp over n rows          " << one_exp << " s"
+              << "\n  one Div over n rows          " << one_div << " s"
+              << "\n  one Sigmoid over n rows      " << one_sigmoid << " s  (Exp + Div + masks)"
+              << "\n  one SegTotal (2 columns)     " << one_segtotal << " s"
+              << "\n  SegTotal  2 cols: aggregate  " << lib_total2 << " s   cached "
+              << plan_total2 << " s"
+              << "\n  SegScan  " << wide << " cols: aggregate  " << lib_scan_wide
+              << " s   cached " << plan_scan_wide << " s"
+              << "\n  one Log over n rows          " << one_log << " s"
+              << "\n  building the scan plan       " << plan_build << " s (once per cohort)"
+              << "\n  one objective evaluation     " << one_eval << " s"
+              << "\n  numerical gradient           " << numeric_gradient << " s  ("
+              << evals_in_gradient << " objective evaluations)"
+              << "\n  analytic gradient + value    " << analytic_gradient << " s  ("
+              << evals_in_analytic << " objective evaluation)"
+              << "\n  speedup                      "
+              << (analytic_gradient > 0 ? numeric_gradient / analytic_gradient : 0.0) << "x"
+              << std::defaultfloat << std::endl;
+
+    std::cout << "\n  gradient agreement (analytic vs central differences)\n  " << std::left
+              << std::setw(34) << "term" << std::setw(16) << "analytic" << std::setw(16)
+              << "numerical" << std::setw(12) << "abs diff" << std::endl;
+    double worst = 0.0, scale_of_grad = 0.0;
+    for (size_t k = 0; k < analytic_open.size(); ++k) {
+        const double d = std::abs(analytic_open[k] - numeric_open[k]);
+        worst = std::max(worst, d);
+        scale_of_grad = std::max(scale_of_grad, std::abs(numeric_open[k]));
+        const std::string name = k < md.terms.size() ? md.terms[k] : "s (log sigma)";
+        std::cout << "  " << std::left << std::setw(34) << name << std::fixed
+                  << std::setprecision(6) << std::setw(16) << analytic_open[k] << std::setw(16)
+                  << numeric_open[k] << std::setw(12) << d << std::defaultfloat << std::endl;
+    }
+    const double relative = scale_of_grad > 0 ? worst / scale_of_grad : worst;
+    std::cout << "  worst |difference| = " << std::scientific << worst << "  (relative to the "
+              << "largest component: " << relative << ")" << std::defaultfloat << "\n  "
+              << (relative < 0.05 ? "ANALYTIC GRADIENT: PASS"
+                                  : "ANALYTIC GRADIENT: *** CHECK ***")
+              << "\n\n  a " << kGlmmBfgsIterations
+              << "-iteration fit costs roughly " << std::fixed << std::setprecision(1)
+              << (kGlmmBfgsIterations * (numeric_gradient + 2 * one_eval) + numeric_gradient)
+              << " s with numerical gradients, "
+              << (kGlmmBfgsIterations * (analytic_gradient + 2 * one_eval) + analytic_gradient)
+              << " s with analytic ones" << std::defaultfloat << std::endl;
+
+    // What is left on the table, and at what price.
+    const double per_cluster_work =
+        static_cast<double>(kNewtonIterations) * one_div + one_div + one_log;
+    const double mean_cluster =
+        static_cast<double>(md.rows_used) / std::max<double>(1.0, static_cast<double>(cohort.num_subjects));
+    const double reclaimable = per_cluster_work * (1.0 - 1.0 / mean_cluster);
+    std::cout << "\n  per-cluster work done on all n rows: " << std::fixed
+              << std::setprecision(4) << per_cluster_work << " s of " << one_eval
+              << " s (" << std::setprecision(0) << 100.0 * per_cluster_work / one_eval
+              << "%)\n  mean cluster size " << std::setprecision(2) << mean_cluster
+              << ", so revealing the cluster boundaries could reclaim at most "
+              << std::setprecision(4) << reclaimable << " s -- a "
+              << std::setprecision(2) << one_eval / (one_eval - reclaimable)
+              << "x objective speedup." << std::defaultfloat << std::endl;
+}
+
+// Adapter for an objective with no analytic gradient: differences it. Retained
+// so the analytic path has something to be validated against.
+OptResult MinimizeBFGSNumeric(const std::function<AV(const std::vector<AV>&)>& f,
+                              const std::vector<AV>& x0, int max_iterations = 20) {
+    ValueGradFn wrapped = [&f](const std::vector<AV>& x, std::vector<AV>* g) {
+        if (g != nullptr) *g = NumericalGradient(f, x);
+        return f(x);
+    };
+    return MinimizeBFGS(wrapped, x0, max_iterations);
+}
+
 int main(int argc, char** argv) {
     EngineRef engine = cdough_init(argc, argv);
     auto pID = engine.getPartyID();
@@ -3575,12 +4180,14 @@ int main(int argc, char** argv) {
     // are fast; the model fits are not, so they are separately selectable.
     //   kernels  - fixed-point, segmented-scan and linear-algebra accuracy only
     //   describe - ingestion plus the descriptive and aggregate nodes
+    //   bench    - cost breakdown of one mixed-model fit
     //   models   - the fourteen regression fits
     //   all      - everything (default)
     const std::string stage = engine.getArg<std::string>("stage", "S", "all");
     const bool run_kernels = (stage == "kernels" || stage == "all");
     const bool run_describe = (stage == "describe" || stage == "models" || stage == "all");
     const bool run_models = (stage == "models" || stage == "all");
+    const bool run_bench = (stage == "bench");
     const bool print_describe = (stage == "describe" || stage == "all");
 
     // Number of patients in the synthetic cohort. Ignored in CSV mode.
@@ -3594,13 +4201,16 @@ int main(int argc, char** argv) {
     const int party_any = engine.getArg<int>("party-any", "pa", 0);
     const int party_umass = engine.getArg<int>("party-umass", "pu", 0);
     const int party_nonumass = engine.getArg<int>("party-nonumass", "pn", 0);
+    // 0 routes the segmented scans through aggregators::aggregate instead of the
+    // cached per-level group bits, for A/B measurement.
+    g_use_cached_scans = engine.getArg<int>("cached-scans", "C", 1) != 0;
 
     if (run_kernels) {
         TestNewKernels(engine, pID);
         TestSegmented(engine, pID);
         TestLinearAlgebra(engine, pID);
     }
-    if (!run_describe) return 0;
+    if (!run_describe && !run_bench) return 0;
 
     // ---------------------------------------------------------------- ingest
     SyntheticTruth truth;
@@ -3644,6 +4254,11 @@ int main(int argc, char** argv) {
                       << "  beta_visit=" << truth.beta_visit << "  beta_fu=" << truth.beta_fu
                       << "  beta_age=" << truth.beta_age << "  sigma=" << truth.sigma
                       << "  slope_diff(UMass-nonUMass)=" << truth.slope_diff << std::endl;
+    }
+
+    if (run_bench) {
+        BenchmarkObjective(engine, pID, any);
+        return 0;
     }
 
     // ------------------------------------------------- descriptive and counts

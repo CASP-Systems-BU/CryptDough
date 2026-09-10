@@ -6,7 +6,7 @@
 - Requested by: Adam Godel
 - Owner: Adam Godel
 - Date: 2026-09-10
-- Status: In Progress
+- Status: Done
 - Estimated effort: Large (~1,300 new lines on top of the existing ~1,700)
 - Target completion date: TBD
 - Related issue or PR: —
@@ -31,7 +31,10 @@
 - Goal 2: Make the 12 mixed models work on **ragged** clusters (patients have 1..k encounters), which
   the current balanced `ClusterGroup`/`Dataset` code cannot express.
 - Goal 3: Add the missing numeric primitives — `Recip`, `Rsqrt`/`Sqrt`, `CholeskySolve` — and remove
-  the boolean divider from the hot path.
+  the boolean divider from the hot path. **Done, including from inside `Sigmoid` and `Log`, which
+  the first pass missed.**
+- Goal 5 (added): bring the cost of a mixed-model fit down far enough to be usable. **Done: 11.1x
+  end to end, 64x on the gradient.**
 - Goal 4: Keep the program runnable standalone (synthetic data, self-validating) *and* against real
   per-party CSVs.
 
@@ -312,7 +315,7 @@ code ran.
    and print an explicit warning above 1e4, and the validation script holds the
    two groups of terms to different tolerances rather than one blunt bound.
 
-10. **Measured cost.** Under `-DPROTOCOL=1` (plaintext 1PC) on blinky, one mixed
+10. **Initial measured cost.** Under `-DPROTOCOL=1` (plaintext 1PC) on blinky, one mixed
    model on a 400-patient / ~1000-encounter cohort takes about 2m45s, so the full
    set of fourteen is roughly 40 minutes. The dominant term is BFGS with
    central-difference numerical gradients: `2*dim` objective evaluations per
@@ -368,6 +371,93 @@ a well-determined answer to compare against:
   covariate dummies (40%). See implementation note 9 for why that split is a
   property of the data rather than a convenience.
 
+## Cost optimisation
+
+Measured on blinky with `-S bench`, which times one mixed model (step 5a, the
+widest, `dim = 7`) rather than relying on estimates. Both protocols were checked,
+because the plan's cost model was about communication while the first
+measurements were plaintext-only; the wins turned out to be protocol independent.
+
+### What actually dominated
+
+The plan predicted the segmented scans would be the bottleneck once the boolean
+divider was gone. Measurement said otherwise: at the starting point one
+`SegTotal` was 0.0039 s against 0.80 s for one objective evaluation — **0.5%**.
+The real multiplier was the gradient: central differences cost `2*dim = 14`
+objective evaluations, and BFGS wants one gradient per iteration.
+
+### Changes, in the order they were made
+
+| # | Change | Effect |
+|---|---|---|
+| 1 | **Analytic gradient** of the Laplace objective, derived via the envelope theorem plus the implicit function theorem, sharing the conditional-mode search with the value | gradient **13.4x** faster, and more accurate — no step size |
+| 2 | **Removed `BSharedVector::operator/` from `Sigmoid` and `Log`** | `Sigmoid` **7.8x** faster; one objective evaluation 4.0x |
+| 3 | **Inner Newton loop 5 -> 3 iterations** | objective a further **1.43x**, no accuracy cost |
+| 4 | **Cached per-level scan group bits** | **~4%** locally; much larger on a latency-bound link |
+| 5 | **Hessian from gradient differences** instead of objective second differences | **2.5x** cheaper *and* far more accurate (see note 9) |
+
+Change 2 deserves a note: it was the plan's *first* named lever and it had been
+missed. `Div`/`Recip` were written and wired into the new code, but the divisions
+*inside* `Sigmoid` and `Log` were never replaced — so the 64-iteration
+non-restoring divider was still running six times per objective evaluation on
+every row. The isolated timings exposed it: `Exp` was 0.0068 s and `Div`
+0.0113 s, yet `Sigmoid` — which is just those two plus a sign multiplex — was
+0.0838 s. Accuracy after the swap is unchanged to the last printed digit
+(`Sigmoid` worst absolute error 3.0e-5 before and after), so the Newton
+reciprocal reproduces the divider exactly at a fraction of the cost.
+
+`Sigmoid` and `Log` both know their denominator's interval up front
+(`1 + exp(-|eta|)` is in `(1, 2]`; `m + 1` is in `[1.7071, 2.4142]` after Log's
+range reduction), so they use `RecipSeeded` — a minimax linear seed for that
+interval plus Newton steps, skipping `Div`'s ten-step normalisation ladder
+entirely.
+
+### Results
+
+Per objective evaluation and per gradient, at `r = 200` (1024 padded rows):
+
+| | 1PC before | 1PC after | 3PC before | 3PC after |
+|---|---|---|---|---|
+| `Sigmoid` over n rows | 0.0838 s | 0.0109 s | 0.1966 s | 0.0263 s |
+| one objective evaluation | 0.8016 s | 0.1360 s | 1.8595 s | 0.3263 s |
+| one gradient | 11.29 s | **0.176 s** | 26.27 s | **0.415 s** |
+| gradient speedup | | **64x** | | **63x** |
+
+End to end, all fourteen fits on a 400-patient / 1062-encounter cohort under
+`PROTOCOL=1`: **1807.7 s -> 162.5 s, an 11.1x reduction.** The gap between 64x
+on the gradient and 11.1x overall is the work that is not the BFGS loop: the
+observed-information Hessian (`2*dim` gradient evaluations per mixed model, now
+about a third of the run), the two IRLS fits, and the plaintext cross-check.
+
+### `--public-clusters`: measured, and declined
+
+The plan estimated a ~250x win from revealing the cluster boundaries. That
+estimate was built on the assumption that the segmented scans dominated, which
+measurement disproved. `-S bench` now reports the real ceiling directly: the
+per-cluster quantities computed on all n rows (the Newton-step reciprocal, `1/A`
+and `log A`) are **45% of an objective evaluation**, and with a mean cluster size
+of 2.65 compacting them to one row per cluster could reclaim at most **1.39x**.
+
+That is not worth revealing each patient's encounter count, so the fast path was
+**not implemented**. Node `d1a` publishes the visit-count *distribution*; the
+per-patient ordering is strictly more than that. The measurement, not a
+preference, is the reason — and it is printed by `-S bench` so the trade-off can
+be re-examined if the workload ever changes.
+
+### Still on the table
+
+- The Hessian is `2*dim` gradient evaluations. Forward instead of central
+  differences would make it `dim + 1` (about 1.2x overall) at the cost of O(h)
+  rather than O(h^2) accuracy — not obviously worth it while the standard errors
+  are the output under most scrutiny.
+- The cached scan's benefit here is bandwidth-shaped, not latency-shaped, because
+  everything ran on one machine. On a real cross-org link the equality plus
+  `b2a_bit` it removes is roughly ten rounds per network level against one for
+  the multiply that remains, and the scans are the bulk of the round count now
+  that the transcendental kernels no longer divide privately. That is an
+  inference from the construction, not a measurement, and it is the obvious thing
+  to check on the task 0008 deployment.
+
 ## Validation results
 
 - `Div` / `Recip` / `Sqrt` / `Rsqrt`: ~1 ulp across four orders of magnitude.
@@ -395,6 +485,15 @@ a well-determined answer to compare against:
   per-party ingestion path reproduces every node bit for bit.
 - `-S all` end-to-end: exit 0, both harnesses PASS, fourteen fits, 75 machine-
   readable RESULT lines.
+- After optimisation, re-validated unchanged: `-logL` excess worst 3.3e-2,
+  standard errors worst 6.3% under a single 10% tolerance, IRLS coefficients
+  1.6e-4, **VALIDATION: PASS**.
+- The analytic gradient is checked against central differences inside `-S bench`
+  on every run: agreement to 0.9-1.1% relative to the largest component, the
+  residual being the *numerical* gradient's step error.
+- The cached scan is checked against `aggregators::aggregate` row by row in
+  `TestSegmented`, to 1e-9, so an index slip in the reimplemented Brent-Kung
+  level geometry cannot pass silently.
 
 ## Change Log
 - 2026-09-10: Initial draft created and approved.

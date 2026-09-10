@@ -48,7 +48,7 @@ AGE_CENTRE: float = 40.0
 # two are the same estimator rather than merely similar ones.
 ETA_CLAMP: float = 10.0
 NEWTON_STEP_CLAMP: float = 4.0
-NEWTON_ITERATIONS: int = 5
+NEWTON_ITERATIONS: int = 3
 IRLS_ITERATIONS: int = 8
 IRLS_RIDGE: float = 1e-3
 
@@ -56,10 +56,11 @@ IRLS_RIDGE: float = 1e-3
 # argument; mirror the lower bound when scoring its parameters.
 SIGMA2_FLOOR: float = 1e-3
 
-# Finite-difference step for the observed-information Hessian. Matches
-# kHessianStep in the secure implementation so the two agree by construction
-# rather than by luck.
-HESSIAN_STEP: float = 0.1
+# Step for the REFERENCE Hessian. Small on purpose: this runs in double
+# precision, so truncation error dominates and a smaller step is strictly
+# better. It is deliberately NOT the secure code's step, which has to be large
+# to keep fixed-point noise from swamping the difference.
+REFERENCE_HESSIAN_STEP: float = 1e-3
 
 
 @dataclass
@@ -358,14 +359,22 @@ def fit_laplace_glmm(
 def observed_information_se(
     objective: Callable[[np.ndarray], float], point: np.ndarray, reported: int
 ) -> np.ndarray:
-    """Standard errors from a finite-difference Hessian at ``point``.
+    """Accurate standard errors from the observed information at ``point``.
 
-    The same construction the secure code uses -- central second differences on
-    the diagonal, forward mixed differences off it, at the same step size -- so
-    the two are comparable term by term.
+    This is a *reference*, not a mirror of the secure construction. It runs in
+    double precision, where the objective is good to about 1e-15, so it can
+    afford a small step and take second differences of the objective directly.
+
+    The secure code cannot do that: at 16-bit fixed point the objective is good
+    to only about 1e-4, and dividing that by ``step**2`` is what made its
+    earlier objective-difference Hessian unusable -- 17% to 46% off the truth,
+    and indefinite in some directions purely from noise. It now takes first
+    differences of its analytic gradient instead, which divides the noise by
+    ``step`` only once. It is scored here against the accurate answer rather
+    than against a deliberately degraded copy of its own method.
     """
     dim = point.size
-    step = HESSIAN_STEP
+    step = REFERENCE_HESSIAN_STEP
     base = objective(point)
 
     plus = np.empty(dim)
@@ -512,7 +521,6 @@ def compare(
     coefficient_tolerance: float,
     objective_tolerance: float,
     se_tolerance: float,
-    nuisance_se_tolerance: float,
 ) -> bool:
     """Score the secure fits against the plaintext oracle.
 
@@ -573,16 +581,7 @@ def compare(
         # Standard errors are scored at the SECURE optimum, so this measures the
         # finite-difference machinery rather than the gap between the two optima.
         #
-        # The time coefficient and the nuisance terms are held to different
-        # standards, for a reason that shows up clearly in the data rather than
-        # being a convenience. The Hessian is near-singular in the collinear
-        # directions -- `hispanic` is about 90% ones and so nearly the intercept
-        # -- and inverting it there amplifies the objective's fixed-point noise
-        # without bound. Both implementations suffer, and they suffer
-        # differently. The time term sits in a well-determined direction and
-        # must agree closely; the intercept and the sparse dummies get a loose
-        # bound, and the secure program prints an ill-conditioning warning
-        # alongside them.
+        # The reference above is accurate, so one tolerance covers every term.
         if fit.standard_errors and not all(np.isnan(fit.standard_errors)):
             oracle_se = observed_information_se(objective, point, len(fit.estimates))
             scored = [
@@ -590,35 +589,27 @@ def compare(
                 for index, (secure, plain) in enumerate(zip(fit.standard_errors, oracle_se))
                 if np.isfinite(secure) and np.isfinite(plain)
             ]
-            # Index 1 is the time axis; index 0 is the intercept.
-            time_errors = [
-                abs(secure - plain) / max(plain, 1e-6)
-                for index, secure, plain in scored
-                if index == 1
-            ]
-            other_errors = [
-                abs(secure - plain) / max(plain, 1e-6)
-                for index, secure, plain in scored
-                if index != 1
-            ]
-            if time_errors:
-                worst = max(time_errors)
-                ok_se = worst <= se_tolerance
-                passed &= ok_se
-                print(
-                    f"{step:<7}{population:<12}{'time-term SE, rel. diff':<26}"
-                    f"{worst:<14.3e}{se_tolerance:<12.1e}"
-                    f"{'' if ok_se else '  <-- FAIL'}"
-                )
-            if other_errors:
-                worst = max(other_errors)
-                ok_se = worst <= nuisance_se_tolerance
-                passed &= ok_se
-                print(
-                    f"{step:<7}{population:<12}{'other SEs, rel. diff':<26}"
-                    f"{worst:<14.3e}{nuisance_se_tolerance:<12.1e}"
-                    f"{'' if ok_se else '  <-- FAIL'}"
-                )
+            # A single tolerance now covers every term. The split that used to
+            # be here -- tight on the time coefficient, loose on the intercept
+            # and the near-collinear dummies -- was an artefact of the old
+            # objective-difference Hessian. Differencing the analytic gradient
+            # divides the noise by the step once instead of twice, and the
+            # weakly determined directions came back inside the same bound as
+            # everything else.
+            worst = max(
+                abs(secure - plain) / max(plain, 1e-6) for _i, secure, plain in scored
+            )
+            ok_se = worst <= se_tolerance
+            passed &= ok_se
+            missing = len(fit.estimates) - len(scored)
+            label = "max relative SE difference"
+            if missing:
+                label += f" ({missing} n/a)"
+            print(
+                f"{step:<7}{population:<12}{label:<26}"
+                f"{worst:<14.3e}{se_tolerance:<12.1e}"
+                f"{'' if ok_se else '  <-- FAIL'}"
+            )
 
     print("\nVALIDATION: PASS" if passed else "\nVALIDATION: *** FAIL ***")
     return passed
@@ -652,16 +643,7 @@ def main() -> None:
         "--se-tolerance",
         type=float,
         default=0.10,
-        help="max relative SE difference on the time coefficient (default 0.10)",
-    )
-    parser.add_argument(
-        "--nuisance-se-tolerance",
-        type=float,
-        default=0.40,
-        help=(
-            "max relative SE difference on the intercept and covariate dummies, whose "
-            "Hessian directions are near-singular (default 0.40)"
-        ),
+        help="max relative standard-error difference for the mixed models (default 0.10)",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -686,7 +668,6 @@ def main() -> None:
             args.coefficient_tolerance,
             args.objective_tolerance,
             args.se_tolerance,
-            args.nuisance_se_tolerance,
         )
         raise SystemExit(0 if ok else 1)
 
