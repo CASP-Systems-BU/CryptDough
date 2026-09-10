@@ -425,6 +425,49 @@ PlainCohort ReadCohortCsv(const std::string& path, SystemScope scope) {
     return c;
 }
 
+// A placeholder cohort of `rows` zero-filled rows, for a party that does not own
+// this table.
+//
+// Only the owner ever holds the plaintext. Every other party still has to
+// allocate share vectors of exactly the same length, so the row count is public
+// and comes from the run manifest rather than from the file. The contents are
+// irrelevant: secret_share_* distributes the OWNER's vector, and a non-owner's
+// copy is read only for its shape.
+PlainCohort PlaceholderCohort(SystemScope scope, size_t rows) {
+    PlainCohort c;
+    c.scope = scope;
+    auto fill = [rows](std::vector<DataType>& v) { v.assign(rows, DataType{0}); };
+    fill(c.subject_id); fill(c.newage); fill(c.gender); fill(c.hispanic);
+    fill(c.index_visit); fill(c.visit_num); fill(c.final_visit);
+    fill(c.fu_month); fill(c.fu_month_present); fill(c.data_source);
+    fill(c.sisa); fill(c.sa);
+    return c;
+}
+
+// Load one table for a cross-organizational run: the owner opens the file, every
+// other party allocates a placeholder of the agreed length.
+//
+// This is the same contract as EncodedTable::inputCSVTableData
+// (encoded_table.h:492) -- every party calls it, only the owner touches the
+// plaintext, and the plaintext never crosses the network.
+PlainCohort LoadOwnedCohort(const std::string& data_dir, SystemScope scope, int owner,
+                            int party_id, size_t declared_rows) {
+    if (party_id != owner) return PlaceholderCohort(scope, declared_rows);
+
+    PlainCohort c = ReadCohortCsv(data_dir + "/" + CohortCsvName(scope), scope);
+    if (declared_rows != 0 && c.rows() != declared_rows) {
+        // A row-count mismatch does not fail cleanly further on: the parties would
+        // allocate different vector lengths and the shares would not line up.
+        std::cerr << "FATAL: " << CohortCsvName(scope) << " has " << c.rows()
+                  << " rows but the manifest declares " << declared_rows
+                  << ". Every party sizes its share vectors from the manifest, so "
+                     "these must agree exactly."
+                  << std::endl;
+        std::exit(1);
+    }
+    return c;
+}
+
 // Secret share a plaintext cohort from `input_party`. Non-owning parties pass a
 // PlainCohort of the same shape with zero contents; only the row count and the
 // schema have to agree across parties.
@@ -434,10 +477,6 @@ SecureCohort ShareCohort(EngineRef engine, const PlainCohort& c, int input_party
     SecureCohort sc(engine, n, np);
     sc.scope = c.scope;
 
-    {
-        std::set<DataType> subjects(c.subject_id.begin(), c.subject_id.end());
-        sc.num_subjects = subjects.size();
-    }
 
     // Pad rows carry the key sentinel (so they form their own segment under both
     // scan directions) and zeros everywhere else (so they contribute nothing).
@@ -507,6 +546,16 @@ SecureCohort ShareCohort(EngineRef engine, const PlainCohort& c, int input_party
     sc.first_of_subject.setPrecision(0);
 
     sc.scan_plan = BuildScanPlan(sc.subject_key);
+
+    // Derived from the shares rather than counted in the local plaintext: in a
+    // cross-organizational run only the owning party has the plaintext, and this
+    // value has to be identical on every party. It is a legitimate disclosure --
+    // the patient count is the first column both descriptive nodes publish.
+    {
+        AV first_count = sc.first_of_subject.chunkedSum(np);
+        first_count.setPrecision(0);
+        sc.num_subjects = static_cast<size_t>(std::llround(OpenScalar(first_count, false)));
+    }
 
     return sc;
 }

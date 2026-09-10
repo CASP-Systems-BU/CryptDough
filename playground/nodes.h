@@ -192,6 +192,14 @@ void PrintFrequency(const std::string& label, const std::string& value_header,
 //
 // final_visit = 1 keeps exactly one row per patient -- their last encounter --
 // and visit_num on that row is a running count, so it equals the patient total.
+//
+// `max_visits` is the PUBLIC upper bound of the histogram sweep and of the
+// quantile binary search. It must be a run parameter, not a property of the
+// data: it sets how many collective operations this node performs, so if the
+// parties disagree about it they perform different numbers of rounds and the
+// protocol desynchronises. Deriving it from a local plaintext maximum -- which
+// only the owning party has -- produced exactly that failure. Sweeping past the
+// largest actual value is harmless: empty buckets are dropped from the output.
 void ReportD1a(const SecureCohort& c, int party_id, long max_visits) {
     AV mask = *(c.final_visit * c.valid);
     Univariate u = SecureUnivariate(c.visit_num, mask, 1, max_visits);

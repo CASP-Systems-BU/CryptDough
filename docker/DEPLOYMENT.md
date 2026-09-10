@@ -157,6 +157,32 @@ for a worked three-party program. The schema is public and must be identical on 
 party — keep it in the manifest. Note that columns parse as integers, so values where
 leading zeros matter (ZIP codes, identifiers) must be encoded numerically beforehand.
 
+### Public values must not be read off private data
+
+A subtle failure mode, and the one most likely to bite a new program. Anything
+that decides **how many collective operations a party performs** -- a loop bound,
+an iteration count, a vector length -- has to be identical on every party. If it
+is derived from a table only one party can see, that party runs a different
+number of rounds from the others. The protocol does not report this as an error:
+it desynchronises, and the symptom is either a hang, a truncated-message abort,
+or opened values that are silently garbage.
+
+Two concrete cases from porting the analysis pipeline to this deployment:
+
+- Every party read all three input CSVs, so each organization would have needed
+  the others' data. The fix is the `inputCSVTableData` contract: the owner opens
+  the file, everyone else allocates a same-sized placeholder. That in turn makes
+  the **row count** a public value, which is why it belongs in the manifest --
+  a non-owner cannot read the length of a file it is not allowed to see.
+- A histogram's upper bound was computed as the maximum of a private column. The
+  owning party swept 15 buckets and the others swept 1, so the parties issued
+  different numbers of collective operations and the opened counts came back as
+  nonsense. The fix is to make the bound a public run parameter; sweeping past
+  the true maximum is harmless, since empty buckets are dropped from the output.
+
+The rule of thumb: if removing a party's data directory would change how many
+times a loop runs on that party, the loop bound belongs in the manifest.
+
 Open only the aggregate the parties agreed to learn. Opening a table reveals it to
 everyone.
 

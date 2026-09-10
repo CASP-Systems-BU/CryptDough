@@ -586,9 +586,88 @@ is exactly the branch's `AV t(x.size(), engine); t = x;` idiom).
 Both binaries build warning-free under `PROTOCOL=1` and `PROTOCOL=3`, and
 `mpc-analysis`'s 75 `RESULT` lines are byte-identical to before the merge.
 
+## Cross-organizational deployment (task 0008 path)
+
+Run across blinky / pinky / inky as three mutually-distrusting organizations:
+separate Docker images built independently on each host, mutual TLS with pinned
+self-signed certificates, no SSH between parties, and each party mounting only
+its own table read-only.
+
+Rank 0 = blinky (owns `any_system`), rank 1 = pinky (`umass_system`), rank 2 =
+inky (`nonumass_system`), `base_port` 26000, `-t 1`, `PROTOCOL=3 COMM=NOCOPY
+TLS=ON`.
+
+### Two bugs this surfaced, both in the pipeline rather than the deployment
+
+Neither is reachable from a single-host run, because both are about parties
+disagreeing about something they each derive locally.
+
+1. **Every party read all three CSVs.** `ReadCohortCsv` was called
+   unconditionally for all three tables and `exit(1)`s on a missing file, so each
+   organization would have had to hold the other two organizations' data --
+   defeating the entire point. Replaced with `LoadOwnedCohort`: the owner opens
+   the file, every other party allocates a same-sized placeholder, mirroring the
+   `inputCSVTableData` contract. Row counts move into the manifest
+   (`--rows-any/--rows-umass/--rows-nonumass`), because a party that does not own
+   a table cannot read its length from a file it may not see. `num_subjects` is
+   now derived from the shares rather than counted in the local plaintext, for
+   the same reason.
+
+2. **A public loop bound was read off private data.** `max_visits` was the
+   maximum of `any_system.visit_num` computed on the local plaintext. The owner
+   got 15 and the placeholder-holding parties got 1, so node d1a issued 15
+   collective operations on one party and 1 on the others. The protocol
+   desynchronised: under MPI it aborted with `MPI_ERR_TRUNCATE`, and over the
+   nocopy transport it produced opened counts like
+   `-85349505764425267205528817037758716928` before failing in `Conn::send_all`.
+   Now a public run parameter (`--max-visits`, default 64). Sweeping past the
+   true maximum is free -- empty buckets are dropped.
+
+   The generalizable rule is now in `docker/DEPLOYMENT.md`: if removing a party's
+   data directory would change how many times a loop runs on that party, the
+   bound belongs in the manifest.
+
+### Result
+
+With both fixed, all three parties completed and every published number matched
+the independent Python oracle exactly -- `d1a` moments and the full visit
+distribution, `d1b` demographics, and all three `sisa_perct_cnt` tables across
+all three follow-up windows -- computed over mutual TLS between three hosts that
+each held only one of the three tables.
+
+### Certificate pinning is enforced, not decorative
+
+Verified by a negative test rather than assumed. Replacing blinky's copy of
+`party2.crt` with a different valid certificate made rank 0 refuse the
+connection outright:
+
+```
+what():  Peer certificate is not pinned (to rank 2 thread 0); SHA-256
+0590be9e...b39f7d. Refusing the connection rather than falling back.
+```
+
+That is the right failure: it names the rank, reports the fingerprint actually
+presented, and explicitly declines to downgrade. Restoring the correct
+certificate reproduced the earlier results identically.
+
+### Also worth recording
+
+- The `-S kernels` stage ran across all three hosts over TLS before either bug
+  was fixed, which is what localised the fault to the ingestion path rather than
+  the transport.
+- An apparent rank-1 hang early on was self-inflicted: overlapping launches left
+  by timed-out orchestration commands, plus leftover listeners from a manual
+  connectivity test. A clean re-run had all three parties complete. Worth naming
+  because it looked exactly like a protocol deadlock.
+- `check-manifest.sh` predicted inbound ports 26001 (rank 1) and 26002 / 26005
+  (rank 2), which matched the ports measured as reachable beforehand and the
+  ports actually opened during the run.
+
 ## Change Log
 - 2026-09-10: Initial draft created and approved.
 - 2026-09-10: Implementation notes and validation results added.
 - 2026-09-10: Cost optimisation (11.1x end to end); see that section.
 - 2026-09-10: Merged `logistic-regression` and split the program into headers;
   both programs and every branch symbol retained.
+- 2026-09-10: Cross-organizational TLS deployment across three hosts; two
+  ingestion bugs found and fixed (see that section).

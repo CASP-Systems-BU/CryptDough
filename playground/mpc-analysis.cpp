@@ -44,7 +44,11 @@
 //   ./mpc-analysis -S models -r 200           # the fourteen fits
 //   ./mpc-analysis -S bench -r 200            # cost breakdown of one fit
 //   ./mpc-analysis -S models -r 200 -C 0      # ... with uncached segmented scans
-//   ./mpc-analysis -D /data                   # read per-party CSVs instead
+//   ./mpc-analysis -D /data -ra N -ru N -rn N  # per-party CSVs; only the owning
+//                                             # party opens each table, so the row
+//                                             # counts come from the manifest
+//   ./mpc-analysis -pa 0 -pu 1 -pn 2          # who owns which table
+//   ./mpc-analysis -mv 64                     # public d1a histogram bound
 //   ./mpc-analysis -O /tmp/dump               # dump the synthetic cohort to CSV
 
 #include "cdough.h"
@@ -145,6 +149,18 @@ int main(int argc, char** argv) {
     const int party_any = engine.getArg<int>("party-any", "pa", 0);
     const int party_umass = engine.getArg<int>("party-umass", "pu", 0);
     const int party_nonumass = engine.getArg<int>("party-nonumass", "pn", 0);
+    // Row counts, agreed in the run manifest. Required in CSV mode: a party that
+    // does not own a table still has to size its share vectors for it, and it
+    // cannot read the file to find out how long it is.
+    const int rows_any = engine.getArg<int>("rows-any", "ra", 0);
+    const int rows_umass = engine.getArg<int>("rows-umass", "ru", 0);
+    const int rows_nonumass = engine.getArg<int>("rows-nonumass", "rn", 0);
+    // Upper bound of the visits-per-patient histogram in node d1a. Public and
+    // identical on every party -- see the note in ReportD1a. Raise it if any
+    // patient could have more encounters than this; sweeping past the true
+    // maximum only costs a few cheap rounds and drops the empty buckets.
+    const long max_visits_sweep =
+        static_cast<long>(engine.getArg<int>("max-visits", "mv", 64));
     // 0 routes the segmented scans through aggregators::aggregate instead of the
     // cached per-level group bits, for A/B measurement.
     g_use_cached_scans = engine.getArg<int>("cached-scans", "C", 1) != 0;
@@ -172,12 +188,22 @@ int main(int argc, char** argv) {
             std::cout << "wrote the synthetic cohort to " << out_dir << std::endl;
         }
     } else {
-        any_plain = ReadCohortCsv(data_dir + "/" + CohortCsvName(SystemScope::Any),
-                                  SystemScope::Any);
-        umass_plain = ReadCohortCsv(data_dir + "/" + CohortCsvName(SystemScope::UMass),
-                                    SystemScope::UMass);
-        nonumass_plain = ReadCohortCsv(data_dir + "/" + CohortCsvName(SystemScope::NonUMass),
-                                       SystemScope::NonUMass);
+        // Cross-organizational path: each party opens only the table it owns.
+        if (rows_any <= 0 || rows_umass <= 0 || rows_nonumass <= 0) {
+            if (pID == 0)
+                std::cerr << "FATAL: --data-dir needs --rows-any/--rows-umass/"
+                             "--rows-nonumass (the manifest row counts). A party that "
+                             "does not own a table cannot read its length from a file "
+                             "it is not allowed to see."
+                          << std::endl;
+            return 1;
+        }
+        any_plain = LoadOwnedCohort(data_dir, SystemScope::Any, party_any, pID,
+                                    static_cast<size_t>(rows_any));
+        umass_plain = LoadOwnedCohort(data_dir, SystemScope::UMass, party_umass, pID,
+                                      static_cast<size_t>(rows_umass));
+        nonumass_plain = LoadOwnedCohort(data_dir, SystemScope::NonUMass, party_nonumass,
+                                         pID, static_cast<size_t>(rows_nonumass));
     }
 
     SecureCohort any = ShareCohort(engine, any_plain, party_any);
@@ -207,12 +233,11 @@ int main(int argc, char** argv) {
 
     // ------------------------------------------------- descriptive and counts
     if (print_describe) {
-        long max_visits = 1;
-        for (size_t i = 0; i < any_plain.rows(); ++i)
-            max_visits = std::max<long>(max_visits, static_cast<long>(any_plain.visit_num[i]));
-        // A public upper bound for the histogram sweep. The counts themselves are
-        // the published output of the node.
-        ReportD1a(any, pID, max_visits);
+        // PUBLIC bound, identical on every party. It cannot be read off the local
+        // plaintext: only the owning party has that, and this value decides how
+        // many collective operations node d1a performs. A disagreement
+        // desynchronises the protocol rather than producing a clean error.
+        ReportD1a(any, pID, max_visits_sweep);
         ReportD1b(any, pID);
         ReportSisaCounts(any, pID);
         ReportSisaCounts(umass, pID);
