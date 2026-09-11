@@ -350,14 +350,111 @@ SMatrix BfgsInverseUpdateBatched(const SMatrix& h_inv, const AV& s, const AV& y,
     return updated;
 }
 
-// Vectorized BFGS with a backtracking (Armijo) line search and a batched
-// central-difference gradient.
+// Armijo sufficient-decrease constant. Matches the pre-oblivious value.
 //
-// Logic is identical to the pre-vectorization implementation (semantic task
-// 0014), including every convergence test and the plaintext values those tests
-// branch on. What changes is the representation: the state is one AV of length
-// dim, so each vector update is a single operation, and each `open()` that the
-// serial version performed dim times now happens once.
+// At `precision` 16 the fixed-point representation of 1e-4 is
+// llround(1e-4 * 65536) = 7, i.e. 1.068e-4, a 7% error on the constant itself.
+// That is harmless: c1 only sets how much of the predicted decrease a step must
+// actually deliver, and no line search is sensitive to it at the third digit.
+const double kArmijoC1 = 1e-4;
+
+// Number of step sizes in the oblivious line search ladder: alpha_l = 2^-l for
+// l in [0, kLineSearchSteps).
+//
+// Seventeen reproduces the pre-oblivious backtracking loop exactly. That loop
+// started at alpha = 1, halved on rejection, and gave up once alpha < 1e-5, so
+// the alphas it could ever try were 2^-l with 2^-l >= 1e-5, i.e. l <= 16 --
+// seventeen candidates, the smallest being 2^-16 = 1.526e-5.
+//
+// Seventeen is also the ceiling the number format allows: 2^-16 is exactly 1 at
+// `precision` 16, and 2^-17 truncates to zero, which would make the last rung a
+// zero step rather than a small one.
+constexpr int kLineSearchSteps = 17;
+
+// Public constants for the oblivious line search. They depend only on
+// kLineSearchSteps and kArmijoC1, so they are shared once per optimization and
+// reused by every iteration.
+//
+// They have to be secret-shared rather than applied as public vectors because
+// the library has no elementwise multiply against a public vector -- the same
+// reason MakeCentralDifferenceSelector shares its pattern. Nothing about them is
+// secret; sharing is a calling-convention detail.
+struct LineSearchConstants {
+    AV alpha;          // length L: 2^-l in fixed point
+    AV armijo_slack;   // length L: c1 * 2^-l in fixed point
+    AV strict_prefix;  // length L*L: raw 1 at (l, m) iff m < l
+};
+
+LineSearchConstants MakeLineSearchConstants(EngineRef engine) {
+    constexpr size_t kSteps = static_cast<size_t>(kLineSearchSteps);
+
+    cdough::Vector<DataType> alpha(kSteps, 0);
+    cdough::Vector<DataType> slack(kSteps, 0);
+    for (size_t l = 0; l < kSteps; ++l) {
+        alpha[l] = scale >> l;
+        slack[l] = std::llround(kArmijoC1 * std::ldexp(1.0, -static_cast<int>(l)) * scale);
+    }
+
+    // Strictly-lower-triangular pattern, so summing row l of a tiled copy of a
+    // 0/1 vector counts its set entries strictly before l.
+    cdough::Vector<DataType> prefix(kSteps * kSteps, 0);
+    for (size_t l = 0; l < kSteps; ++l) {
+        for (size_t m = 0; m < l; ++m) {
+            prefix[l * kSteps + m] = 1;
+        }
+    }
+
+    // Every one of these is only ever used as a multiplication operand, and
+    // multiply_a throws unless both operands carry the SAME precision (see
+    // protocol.h handle_precision). They are pinned at 0 here and every operand
+    // derived from them is pinned at 0 at its point of use, so the pairing is
+    // checkable locally rather than by tracing precision across the loop.
+    LineSearchConstants constants{engine.secret_share_a(alpha, 0, 0),
+                                  engine.secret_share_a(slack, 0, 0),
+                                  engine.secret_share_a(prefix, 0, 0)};
+    constants.alpha.setPrecision(0);
+    constants.armijo_slack.setPrecision(0);
+    constants.strict_prefix.setPrecision(0);
+    return constants;
+}
+
+// Oblivious BFGS with a batched central-difference gradient and a branch-free
+// line search.
+//
+// OBLIVIOUSNESS CONTRACT (semantic task 0017)
+// -------------------------------------------
+// The loop opens exactly ONE value per iteration: a single bit saying whether to
+// keep going. Every convergence test that bit is computed from -- the gradient
+// magnitude, the objective values, the curvature sign, the backtracking depth --
+// is evaluated on shares and never leaves the protocol. The information content
+// of the opened bit is the iteration count, which a loop that terminates early
+// reveals through its own wall clock in any case.
+//
+// Everything else that used to drive a branch is now multiplexed: both arms are
+// evaluated and the result selected with `Multiplex`, so the sequence of
+// operations, and therefore the communication pattern, depends only on the
+// public values `dim`, `kLineSearchSteps`, and `max_iterations`.
+//
+// The per-iteration diagnostic log opens considerably more than one bit, which
+// is why it is behind LOGISTIC_REGRESSION_LAYER_PRINT and why that flag defaults
+// to OFF. A build with the flag on is a debugging build and makes no privacy
+// claim.
+//
+// Numerically this is the same optimizer as before. The line search is the one
+// place where the arithmetic differs in form: it evaluates all seventeen
+// candidate step sizes in a single batched objective call instead of walking
+// them in sequence, which is both oblivious and shallower -- depth one
+// evaluation regardless of how much backtracking a step needs, where the old
+// loop paid one sequential evaluation per halving.
+//
+// Two deliberate differences from the old loop, both documented in task 0017:
+//   1. The old `std::isfinite(fx_new)` guard has no fixed-point equivalent;
+//      there is no infinity to test for, and an overflowed candidate fails the
+//      Armijo comparison on its own.
+//   2. A line search that finds no acceptable step is detected at the top of the
+//      following iteration rather than at the end of the failing one, so that it
+//      shares the single opened flag. `result.iterations` is therefore one
+//      higher than before on that path. The returned parameters are unaffected.
 BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
                                      int max_iterations = 20) {
     const size_t n = x0.size();
@@ -368,145 +465,237 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
     AV fx = f(x, 1);
     fx.setPrecision(precision);
 
-    // The central-difference scatter pattern depends only on dim, so it is
-    // shared once and reused by every gradient.
+    // Patterns that depend only on `dim`, shared once and reused every iteration.
     AV selector = MakeCentralDifferenceSelector(n, engine);
+    const LineSearchConstants ls = MakeLineSearchConstants(engine);
+    const SMatrix eye = Identity(n, engine);
+
+    AV one(1, engine);
+    one += scale;
 
     AV gradient = NumericalGradientBatched(f, x, selector);
     SMatrix h_inv = Identity(n, engine);
+
+    // 1 while the previous iteration's line search succeeded. Starts at 1: there
+    // is no previous iteration to have failed.
+    AV line_search_ok(1, engine);
+    line_search_ok += DataType(1);
+    line_search_ok.setPrecision(0);
 
     BatchedOptResult result(x, fx, 0, false);
 
     for (int iteration = 0; iteration < max_iterations; ++iteration) {
         result.iterations = iteration + 1;
 
-        // One open for the whole gradient, where the serial version did n.
-        auto opened_g = gradient.open();
-        double max_grad = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            max_grad = std::max(max_grad, std::abs(static_cast<double>(opened_g[i]) / scale));
-        }
+        // -------------------------------------------------------------------
+        // The one declassification. `grad_big` is 1 iff some |gradient_i| has
+        // not yet fallen below kSmallEpsilon; `line_search_ok` is 1 iff the
+        // previous iteration made progress. Their product is the continue bit.
+        //
+        // The pre-oblivious code opened the whole gradient vector here and
+        // reduced it to a max in plaintext, which leaked every component to
+        // decide one bit.
+        // -------------------------------------------------------------------
+        AV grad_big = AnyAbsAtLeast(gradient, kSmallEpsilon_scaled);
+        AV keep_going = *(grad_big * line_search_ok);
+        auto opened_flag = keep_going.open();
 
-        if (max_grad < kSmallEpsilon) {
-            result.converged = true;
-            break;
-        }
-
-        // Search direction d = -H_inv * gradient
-        AV direction = -MatVecBatched(h_inv, gradient);
-        direction.setPrecision(precision);
-
-        AV directional_derivative = *gradient.dot_product(direction, n);
-        directional_derivative.setPrecision(precision);
-        auto opened_dd = directional_derivative.open();
-        double dd_val = static_cast<double>(opened_dd[0]) / scale;
-
-        if (dd_val >= 0.0) {
-            // Not a descent direction: reset to steepest descent.
-            h_inv = Identity(n, engine);
-            direction = -gradient;
-            direction.setPrecision(precision);
-            directional_derivative = *gradient.dot_product(direction, n);
-            directional_derivative.setPrecision(precision);
-            auto opened_dd2 = directional_derivative.open();
-            dd_val = static_cast<double>(opened_dd2[0]) / scale;
-        }
-
-        const double c1 = 1e-4;
-        double alpha = 1.0;
-        bool line_search_failed = false;
-        AV x_new = Clone(x);
-        AV fx_new = Clone(fx);
-
-        auto opened_fx = fx.open();
-        double fx_val = static_cast<double>(opened_fx[0]) / scale;
-
-        while (true) {
-            // Clone, NOT `AV alpha_dir = direction;`. Copy-construction aliases
-            // the buffer (semantic topic 0001, C-05), so the copy-assignment
-            // below would write the scaled result back through the alias into
-            // `direction`, compounding alpha on every line-search halving.
-            AV alpha_dir = Clone(direction);
-            alpha_dir.setPrecision(0);
-            alpha_dir = (*(alpha_dir * static_cast<DataType>(alpha * scale))) / scale;
-            x_new = x + alpha_dir;
-            x_new.setPrecision(precision);
-
-            fx_new = f(x_new, 1);
-            fx_new.setPrecision(precision);
-
-            auto opened_fx_new = fx_new.open();
-            double fx_new_val = static_cast<double>(opened_fx_new[0]) / scale;
-
-            if (std::isfinite(fx_new_val) && fx_new_val <= fx_val + c1 * alpha * dd_val) {
-                break;
-            }
-            alpha *= 0.5;
-            if (alpha < 1e-5) {
-                x_new = Clone(x);
-                fx_new = Clone(fx);
-                line_search_failed = true;
-                break;
-            }
-        }
-
-        AV step = x_new - x;
-        step.setPrecision(precision);
-        auto opened_step = step.open();
-        double max_step = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            max_step = std::max(max_step, std::abs(static_cast<double>(opened_step[i]) / scale));
-        }
-
-        // A failed line search is a fixed point: x is unchanged, so the next
-        // iteration recomputes the same direction and fails identically
-        if (line_search_failed) {
+        if (static_cast<DataType>(opened_flag[0]) == 0) {
+#ifdef LOGISTIC_REGRESSION_LAYER_PRINT
+            // Diagnostic only, and only in a build that has already given up on
+            // privacy: separate the two reasons the flag can be clear.
+            auto opened_grad_big = grad_big.open();
             if (engine.getPartyID() == 0) {
-                std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                          << "  no descent found along search direction; stopping at"
-                          << " neg_log_lik=" << std::fixed << std::setprecision(6) << fx_val
-                          << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
-                          << std::endl;
+                if (static_cast<DataType>(opened_grad_big[0]) == 0) {
+                    std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
+                              << "  gradient below tolerance; stopping" << std::endl;
+                } else {
+                    std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
+                              << "  no descent found along search direction; stopping"
+                              << std::endl;
+                }
             }
+#endif
             result.converged = true;
             break;
         }
 
+        // -------------------------------------------------------------------
+        // Search direction. Both arms are computed: the BFGS direction and the
+        // steepest-descent fallback the old code only built when it saw a
+        // non-descent direction in the clear. `dir_sd` is local arithmetic and
+        // `dd_sd` one dot product, so evaluating the unused arm is cheap.
+        // -------------------------------------------------------------------
+        AV dir_bfgs = -MatVecBatched(h_inv, gradient);
+        dir_bfgs.setPrecision(precision);
+        AV dd_bfgs = *gradient.dot_product(dir_bfgs, n);
+        dd_bfgs.setPrecision(precision);
+
+        AV dir_sd = -gradient;
+        dir_sd.setPrecision(precision);
+        AV dd_sd = *gradient.dot_product(dir_sd, n);
+        dd_sd.setPrecision(precision);
+
+        // not_descent = 1 iff dd_bfgs >= 0, i.e. the approximation stopped
+        // producing a descent direction and H must be reset to the identity.
+        AV dd_bfgs_raw = Clone(dd_bfgs);
+        dd_bfgs_raw.setPrecision(0);
+        AV not_descent = *(dd_bfgs_raw.gtez());
+        not_descent.setPrecision(0);
+
+        AV direction = Multiplex(not_descent, dir_bfgs, dir_sd);
+        AV dd = Multiplex(not_descent, dd_bfgs, dd_sd);
+        h_inv = SMatrix(Multiplex(not_descent, h_inv.data(), eye.data()), n, n, false);
+        h_inv.setPrecision(precision);
+
+        // -------------------------------------------------------------------
+        // Line search. All kLineSearchSteps candidates at once: tile x and the
+        // direction across the ladder, scale by the per-rung alpha, and evaluate
+        // the objective once over the whole stack.
+        // -------------------------------------------------------------------
+        AV x_tiled = x.cyclic_subset_reference(kLineSearchSteps);
+        AV dir_tiled = direction.cyclic_subset_reference(kLineSearchSteps);
+        dir_tiled.setPrecision(0);
+        AV alpha_rows = ls.alpha.repeated_subset_reference(n);
+        alpha_rows.setPrecision(0);
+        AV candidate_delta = (*(dir_tiled * alpha_rows)) / scale;
+        AV points = x_tiled + candidate_delta;
+        points.setPrecision(precision);
+
+        AV values = f(points, kLineSearchSteps);
+        AV values_raw = Clone(values);
+        values_raw.setPrecision(0);
+
+        // Armijo: accept rung l iff values_l <= fx + c1 * alpha_l * dd.
+        AV fx_rep = fx.repeated_subset_reference(kLineSearchSteps);
+        AV dd_rep = dd.repeated_subset_reference(kLineSearchSteps);
+        dd_rep.setPrecision(0);
+        AV armijo_slack = ls.armijo_slack;
+        armijo_slack.setPrecision(0);
+        AV slack = (*(dd_rep * armijo_slack)) / scale;
+        AV threshold = fx_rep + slack;
+        threshold.setPrecision(0);
+        AV accept = *((*(threshold - values_raw)).gtez());  // raw 0/1 per rung
+        accept.setPrecision(0);
+
+        // Take the FIRST accepting rung. Armijo acceptance is not monotone in
+        // alpha, so this needs a real prefix computation rather than a
+        // comparison against a count. Tiling `accept` and masking with the
+        // strictly-lower-triangular pattern gives, in one multiply plus a local
+        // reduction, the number of accepts strictly before each rung -- where a
+        // prefix product would have cost log2(L) sequential rounds.
+        AV accept_tiled = accept.cyclic_subset_reference(kLineSearchSteps);
+        accept_tiled.setPrecision(0);
+        AV strict_prefix = ls.strict_prefix;
+        strict_prefix.setPrecision(0);
+        AV before = (*(accept_tiled * strict_prefix)).chunkedSum(kLineSearchSteps);
+        before.setPrecision(0);
+        before -= DataType(1);
+        AV any_before = *(before.gtez());
+        AV none_before = -any_before;
+        none_before += DataType(1);
+        none_before.setPrecision(0);
+        AV take = *(accept * none_before);  // at most one entry set
+        take.setPrecision(0);
+
+        AV accept_count = accept.chunkedSum(kLineSearchSteps);
+        accept_count -= DataType(1);
+        AV found = *(accept_count.gtez());  // 1 iff any rung qualified
+        found.setPrecision(0);
+
+        // Selecting with `take` yields 0 when no rung qualified, so alpha is 0
+        // on failure -- which reproduces the old behaviour exactly, since the
+        // old loop restored x on giving up and x + 0 * direction == x.
+        AV ladder = ls.alpha;
+        ladder.setPrecision(0);
+        AV alpha = (*(take * ladder)).chunkedSum(kLineSearchSteps);
+        alpha.setPrecision(precision);
+
+        AV fx_selected = (*(take * values_raw)).chunkedSum(kLineSearchSteps);
+        fx_selected.setPrecision(precision);
+
+        // Rebuilding the step from the selected alpha is the same arithmetic as
+        // the candidate above, so x_new is bit-identical to the chosen candidate
+        // point and `fx_selected` is its objective, not an approximation of it.
+        AV alpha_rep = alpha.repeated_subset_reference(n);
+        alpha_rep.setPrecision(0);
+        AV dir_raw = Clone(direction);
+        dir_raw.setPrecision(0);
+        AV step = (*(dir_raw * alpha_rep)) / scale;
+        step.setPrecision(precision);
+
+        AV x_new = x + step;
+        x_new.setPrecision(precision);
+        AV fx_new = Multiplex(found, fx, fx_selected);
+
+        // -------------------------------------------------------------------
+        // Curvature-gated inverse-Hessian update. Both arms again: the update is
+        // always computed, then kept or discarded by multiplex.
+        // -------------------------------------------------------------------
         AV gradient_new = NumericalGradientBatched(f, x_new, selector);
         AV gradient_delta = gradient_new - gradient;
         gradient_delta.setPrecision(precision);
 
         AV curvature = *step.dot_product(gradient_delta, n);
         curvature.setPrecision(precision);
-        auto opened_curv = curvature.open();
-        double curv_val = static_cast<double>(opened_curv[0]) / scale;
 
-        if (curv_val > kSmallEpsilon) {
-            AV rho = SecureReciprocal(curvature);
-            h_inv = BfgsInverseUpdateBatched(h_inv, step, gradient_delta, rho);
-            h_inv.setPrecision(precision);
+        // curvature > kSmallEpsilon, as integers: curvature >= eps + 1.
+        AV curv_raw = Clone(curvature);
+        curv_raw.setPrecision(0);
+        curv_raw -= (kSmallEpsilon_scaled + 1);
+        AV curv_ok = *(curv_raw.gtez());
+        curv_ok.setPrecision(0);
+
+        // The denominator is multiplexed to 1.0 BEFORE the reciprocal, not
+        // after. SecureReciprocal routes through a non-restoring division
+        // circuit that assumes a non-negative operand, so handing it the raw
+        // curvature when the guard fails would be undefined behaviour inside the
+        // circuit, not merely a discarded result.
+        AV safe_curvature = Multiplex(curv_ok, one, curvature);
+        AV rho = SecureReciprocal(safe_curvature);
+
+        SMatrix h_updated = BfgsInverseUpdateBatched(h_inv, step, gradient_delta, rho);
+        h_inv = SMatrix(Multiplex(curv_ok, h_inv.data(), h_updated.data()), n, n, false);
+        h_inv.setPrecision(precision);
+
+#ifdef LOGISTIC_REGRESSION_LAYER_PRINT
+        // Diagnostics. Every open below exists only to print; none of it feeds
+        // control flow. This block is why the flag defaults to OFF.
+        {
+            auto opened_g = gradient.open();
+            auto opened_step = step.open();
+            auto opened_alpha = alpha.open();
+            auto opened_fx = fx.open();
+            auto opened_fx_new = fx_new.open();
+
+            double max_grad = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                max_grad = std::max(max_grad, std::abs(static_cast<double>(opened_g[i]) / scale));
+            }
+            double max_step = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                max_step =
+                    std::max(max_step, std::abs(static_cast<double>(opened_step[i]) / scale));
+            }
+            const double fx_val = static_cast<double>(opened_fx[0]) / scale;
+            const double fx_new_val = static_cast<double>(opened_fx_new[0]) / scale;
+
+            if (engine.getPartyID() == 0) {
+                std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
+                          << "  neg_log_lik=" << std::fixed << std::setprecision(6) << fx_new_val
+                          << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
+                          << "  alpha=" << std::fixed << std::setprecision(4)
+                          << static_cast<double>(opened_alpha[0]) / scale
+                          << "  |step|=" << std::scientific << std::setprecision(3) << max_step
+                          << "  d_obj=" << std::abs(fx_val - fx_new_val) << std::endl;
+            }
         }
+#endif
 
         x = Clone(x_new);
         gradient = Clone(gradient_new);
-        auto opened_new_fx = fx_new.open();
-        double obj_change = std::abs(fx_val - static_cast<double>(opened_new_fx[0]) / scale);
         fx = Clone(fx_new);
-
-        if (engine.getPartyID() == 0) {
-            std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                      << "  neg_log_lik=" << std::fixed << std::setprecision(6)
-                      << static_cast<double>(opened_new_fx[0]) / scale
-                      << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
-                      << "  alpha=" << std::fixed << std::setprecision(4) << alpha
-                      << "  |step|=" << std::scientific << std::setprecision(3) << max_step
-                      << "  d_obj=" << obj_change << std::endl;
-        }
-
-        if (max_step < kSmallEpsilon && max_grad < kSmallEpsilon) {
-            result.converged = true;
-            break;
-        }
+        line_search_ok = Clone(found);
     }
 
     result.params = Clone(x);

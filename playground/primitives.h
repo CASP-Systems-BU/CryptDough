@@ -96,6 +96,70 @@ AV ClampAbs(const AV& x, DataType bound_scaled) {
     return x_;
 }
 
+// Oblivious selection: `if_false` where sel == 0, `if_true` where sel == 1.
+//
+// This is the same `cond * delta` arithmetic written inline throughout Exp, Log,
+// Sigmoid, LogOnePlusExp, and ClampAbs. It is named here because the optimizer
+// applies it to eight different quantities per iteration, and the whole security
+// argument rests on this one expression being right -- an auditor should be able
+// to check it once rather than eight times.
+//
+// `sel` must hold a raw 0/1 (what gtez() returns), and is either the same length
+// as the operands or a single element broadcast across them. Note the argument
+// order: `if_false` first, matching operators::multiplex in
+// include/core/operators/common.h, which computes the same a + sel * (b - a).
+AV Multiplex(const AV& sel, const AV& if_false, const AV& if_true) {
+    assert(if_false.size() == if_true.size());
+    assert(sel.size() == if_false.size() || sel.size() == 1);
+
+    AV a = Clone(if_false);
+    a.setPrecision(0);
+    AV b = Clone(if_true);
+    b.setPrecision(0);
+    AV delta = b - a;
+    delta.setPrecision(0);
+
+    // A raw 0/1 times a fixed-point delta is already at the operand's scale, so
+    // there is no division by `scale` here. Getting that wrong is silent.
+    AV s = (sel.size() == if_false.size())
+               ? Clone(sel)
+               : Clone(sel.repeated_subset_reference(if_false.size()));
+    s.setPrecision(0);
+
+    AV out = a + *(s * delta);
+    out.setPrecision(precision);
+    return out;
+}
+
+// Secure `max_i |x_i| >= bound_scaled`, as a 1-element raw 0/1.
+//
+// This replaces the pattern of opening a vector, reducing it to a max in
+// plaintext, and comparing -- which leaks every element, not just the answer.
+// Depth is two comparisons regardless of the length of x: one elementwise, one
+// over the count. chunkedSum is local, so the reduction itself is free.
+AV AnyAbsAtLeast(const AV& x, DataType bound_scaled) {
+    AV x_raw = Clone(x);
+    x_raw.setPrecision(0);
+
+    // |x| with no division: sign = 2 * gtez(x) - 1 is an unscaled +-1, so
+    // sign * x is already |x| at the original scale.
+    AV sign = *(x_raw.gtez());
+    sign.setPrecision(0);
+    AV two_sign = *(sign * DataType(2));
+    two_sign -= DataType(1);
+    two_sign.setPrecision(0);
+    AV abs_x = *(two_sign * x_raw);
+    abs_x.setPrecision(0);
+
+    AV excess = abs_x - bound_scaled;
+    AV at_least = *(excess.gtez());  // raw 0/1 per element
+    AV count = at_least.chunkedSum(at_least.size());
+    count -= DataType(1);
+    AV any = *(count.gtez());  // 1 iff at least one element reached the bound
+    any.setPrecision(0);
+    return any;
+}
+
 // Sum of all elements in an arithmetic shared vector (returns size 1 AV).
 AV Sum(const AV& x) {
     return x.chunkedSum(x.size());

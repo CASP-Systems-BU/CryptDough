@@ -86,6 +86,20 @@ if(NOT DIVISION_CORRECTION)
     add_compile_definitions(NO_DIVISION_CORRECTION)
 endif()
 
+# Option: per-iteration BFGS diagnostics in the playground regression targets.
+#
+# DECLASSIFIES OPTIMIZER STATE. The oblivious optimizer in playground/optimizer.h
+# opens exactly one bit per iteration (the termination flag). Enabling this opens
+# the gradient, the step, the selected alpha, and the objective on every
+# iteration in order to print them, so a build with it on makes no privacy claim.
+# Defaults to OFF so that an unconfigured build is private by construction.
+option(LOGISTIC_REGRESSION_LAYER_PRINT
+       "Open and print per-iteration BFGS diagnostics (declassifies optimizer state)"
+       OFF)
+if(LOGISTIC_REGRESSION_LAYER_PRINT)
+    add_compile_definitions(LOGISTIC_REGRESSION_LAYER_PRINT)
+endif()
+
 # Option: choose the default sorting protocol (see include/core/operators/sorting.h).
 # Passed through as CONFIG_DEFAULT_SORT_PROTO; defaults to QUICKSORT.
 set(SORT_PROTO "QUICKSORT" CACHE STRING "Default sorting protocol")
