@@ -10,7 +10,7 @@
 #   ./docker/run-party-external.sh \
 #       --rank 0 --hosts mpc-a.example.edu,mpc-b.example.org,mpc-c.example.com \
 #       --base-port 20000 --tls-dir /scratch/adam/tls --data-dir /srv/private \
-#       -- ./micro_primitives -f /run/manifest.args
+#       -- ./mpc-analysis -f /run/manifest.args
 #
 # LAUNCH ORDER MATTERS. Party i connects to every j > i and listens for every j < i.
 # Listeners block in accept() indefinitely; only connectors time out. So start in

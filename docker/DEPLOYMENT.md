@@ -91,7 +91,7 @@ passes.
 
 ```bash
 docker run --rm -v cdough-run:/opt/cryptdough/build cryptdough:tls bash -c \
-  'cmake .. -DPROTOCOL=3 -DCOMM=NOCOPY -DCOMM_THREADS=4 -DTLS=ON -Wno-dev && make -j micro_primitives'
+  'cmake .. -DPROTOCOL=3 -DCOMM=NOCOPY -DCOMM_THREADS=4 -DTLS=ON -Wno-dev && make -j mpc-analysis'
 ```
 
 Use the flags from the manifest.
@@ -108,7 +108,7 @@ starts first and rank 0 starts last. Higher ranks may start minutes early at no 
     --hosts mpc-a.example.edu,mpc-b.example.org,mpc-c.example.com \
     --base-port 20000 --tls-dir /secure/tls --data-dir /srv/private \
     --image cryptdough:tls --build-volume cdough-run \
-    -- ./micro_primitives -t 8 -b -12 -r 1048576 -s lan
+    -- ./mpc-analysis -S models -D /data -pa 0 -pb 1 -ra 240 -rb 256
 
 # then party 1, then party 0, with the same --hosts and --base-port.
 ```
@@ -157,6 +157,75 @@ for a worked three-party program. The schema is public and must be identical on 
 party — keep it in the manifest. Note that columns parse as integers, so values where
 leading zeros matter (ZIP codes, identifiers) must be encoded numerically beforehand.
 
+### The analysis pipeline's data layout
+
+`mpc-analysis` starts at the **top** of the lineage. Each owner stages its own half of
+`cdrcatsse_match_pcc`, diagnosis text intact:
+
+```
+/srv/org-a/private/base_owner_a.csv     # org A mounts this directory at /data
+/srv/org-b/private/base_owner_b.csv     # org B mounts its own at /data
+```
+
+```bash
+./mpc-analysis -D /data -pa 0 -pb 1 -ra 240 -rb 256
+```
+
+`-pa` / `-pb` name the owning ranks and `-fa` / `-fb` override the file names. Each
+party opens only its own file. `pcc_mrn` and the `flagged_dx` pass-1 flag parsing then
+run **locally, in the clear**, over that half — every column they produce is a function
+of a single row, so no party needs anyone else's data for them, and it keeps the
+free-text `LIKE` matching out of MPC entirely. Only the merge, the visit sequencing and
+the `conflict_list` check are collective.
+
+Do not stage finished analysis tables. `visit_num`, `index_visit`, `final_visit` and
+`fu_month` are window functions over a patient's whole history, and a patient's history
+spans both organizations, so no owner can compute any of them from its own rows. They
+are produced by the protocol, from the base tables, and exist only in shares.
+
+#### `--rows-a` / `--rows-b` are post-filter counts
+
+Pass 1 keeps only Emergency and Acute Care encounters, so the manifest declares what
+**survives** that filter, not the file's line count. Get the number from your own half,
+before the manifest is agreed:
+
+```bash
+./docker/count-analysis-rows.py /srv/org-a/private/base_owner_a.csv    # -> 240
+./docker/count-analysis-rows.py --verbose base_owner_a.csv             # 290 rows, 240 kept
+```
+
+It runs standalone and touches no network, which matters because the counts are needed
+*before* the ports are fixed, and `mpc-analysis` connects to its peers at startup.
+Nothing leaves the machine but the single integer you put in the manifest.
+
+A file whose surviving count disagrees with its declared count is a **fatal** error, not
+a silent one — both halves pad to one common length, so a mismatch would leave the
+parties allocating different vector sizes. The error names the count it actually found.
+
+For a synthetic dry run, `-O` writes both halves and prints the two numbers:
+
+```bash
+./mpc-analysis -S describe -r 200 -O /tmp/dump   # prints: --rows-a 240 --rows-b 256
+./mpc-analysis -S describe -D /tmp/dump -ra 240 -rb 256
+```
+
+#### The MRN conflict check is opt-in, and it discloses a count
+
+`-cl 1` runs `conflict_list`: medical record numbers that carry a different study ID at
+each owner. Neither organization can see that disagreement alone, so it is a genuine
+reason to compute something jointly — but it opens **one number**, how many such MRNs
+exist. Nothing identifies which patients are involved. It is off by default because it
+needs its own ordering pass, and because opening anything is a decision the parties
+should make deliberately rather than inherit.
+
+#### No plaintext cross-check exists in a real run
+
+The pipeline carries a plaintext oracle that recomputes the sequencing and scores the
+model fits against it. That oracle needs the **union** of both halves, which is exactly
+what no party holds, so it is available only on synthetic data. Under `-D` the pipeline
+reports its own results and says the cross-check is absent. Do not read its silence as
+agreement.
+
 ### Public values must not be read off private data
 
 A subtle failure mode, and the one most likely to bite a new program. Anything
@@ -167,18 +236,24 @@ number of rounds from the others. The protocol does not report this as an error:
 it desynchronises, and the symptom is either a hang, a truncated-message abort,
 or opened values that are silently garbage.
 
-Two concrete cases from porting the analysis pipeline to this deployment:
+Three ways it bites:
 
-- Every party read all three input CSVs, so each organization would have needed
-  the others' data. The fix is the `inputCSVTableData` contract: the owner opens
-  the file, everyone else allocates a same-sized placeholder. That in turn makes
-  the **row count** a public value, which is why it belongs in the manifest --
-  a non-owner cannot read the length of a file it is not allowed to see.
-- A histogram's upper bound was computed as the maximum of a private column. The
-  owning party swept 15 buckets and the others swept 1, so the parties issued
-  different numbers of collective operations and the opened counts came back as
-  nonsense. The fix is to make the bound a public run parameter; sweeping past
-  the true maximum is harmless, since empty buckets are dropped from the output.
+- **Row counts.** Only the owner opens its file; every other party allocates a
+  placeholder and receives shares. That makes the row count a public value, and
+  it is why it belongs in the manifest -- a non-owner cannot read the length of a
+  file it is not allowed to see.
+- **Counts after a filter.** The number that matters is what survives the
+  pass-1 visit-type filter, not the file's length, and both halves are padded to
+  one common length derived from both counts. So the published number is itself a
+  function of private data. That is the point: it is computed locally and then
+  deliberately disclosed, never inferred. `docker/count-analysis-rows.py`
+  computes it without touching the network.
+- **Sweep bounds.** Any bound that decides how many buckets or steps a party
+  iterates -- a histogram range, a quantile search -- must be a public run
+  parameter, never the maximum of a private column. Derive it from private data
+  and the owning party sweeps a different number of buckets from everyone else;
+  the opened counts come back as nonsense rather than as an error. Sweeping past
+  the true maximum is harmless, since empty buckets drop out of the output.
 
 The rule of thumb: if removing a party's data directory would change how many
 times a loop runs on that party, the loop bound belongs in the manifest.

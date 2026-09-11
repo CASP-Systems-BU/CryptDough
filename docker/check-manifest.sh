@@ -116,7 +116,16 @@ fi
 # --- the port range this party must open ------------------------------------
 base_port="$(value_of base_port)"
 threads="$(value_of threads)"
-nparties="$(grep -c '^[[:space:]]*-[[:space:]]*rank:' "${MANIFEST}" || echo 0)"
+# Count `- rank:` entries ONLY inside the top-level `parties:` block. A bare
+# grep over the whole file also catches list entries elsewhere -- the data
+# owners, for one -- and an inflated party count silently produces the wrong
+# port arithmetic, which is the single thing this script exists to get right.
+nparties="$(awk '
+    /^parties:[[:space:]]*(#.*)?$/ { in_parties = 1; next }
+    /^[^[:space:]#]/         { in_parties = 0 }
+    in_parties && /^[[:space:]]*-[[:space:]]*rank:/ { n++ }
+    END { print n + 0 }
+' "${MANIFEST}")"
 if [[ -n "${base_port}" && -n "${threads}" && "${nparties}" -gt 0 ]]; then
     echo
     echo "Inbound ports each party must accept (num_parties=${nparties}, threads=${threads}):"

@@ -316,6 +316,30 @@ is more than one party. Verified: `-O` then `-D` reproduces the synthetic run
 byte-for-byte apart from the generating-parameters line, which has no meaning
 when the input is real data.
 
+## Deployment documentation
+
+`docker/DEPLOYMENT.md` and `docker/manifest.example.yaml` now describe only the
+two-owner layout: the data staging, the post-filter row-count rule, the `conflict_list`
+disclosure, and the fact that no plaintext cross-check is possible in a real run. The
+per-table CSV descriptions were **replaced**, not annotated, so nothing in the
+deployment docs refers to a layout the code no longer has. The build and launch
+examples name `mpc-analysis`, and the manifest's `runtime_args` and `data` blocks
+describe that run.
+
+`docker/count-analysis-rows.py` is new. The manifest needs each owner's post-pass-1 row
+count, but `mpc-analysis` connects to its peers during startup and the counts are needed
+*before* the ports are agreed — so the count cannot come from the binary itself. The
+script applies the pass-1 visit-type filter to one owner's half and prints the number,
+with no network access. It returns 240 / 256 on the dumped halves, matching what `-O`
+reports, and `--verbose` shows 290 raw rows against 240 kept.
+
+`docker/check-manifest.sh` needed a fix to go with this. It counted `- rank:` lines
+anywhere in the manifest, so the new `data.owners` list inflated the party count from 3
+to 5 and printed the wrong inbound port ranges — the one thing that script exists to
+get right. The count is now scoped to the top-level `parties:` block (comment-tolerant),
+and the owners list uses `owner_rank:` so the two cannot be confused. Verified: the
+example manifest reports `num_parties=3` and ports matching `base + H*T*i + T*j`.
+
 ## Related change
 
 The two gray (`slate`) lineage nodes — `d1a` (visits per patient) and `d1b`

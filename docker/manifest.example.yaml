@@ -38,13 +38,13 @@ base_port: 20000
 # --- Runtime arguments (identical for every party) --------------------------
 # Written verbatim into a file consumed with the framework's own -f/--file-args
 # mechanism (include/backend/common/setup.h), so no party can drift.
-program: micro_primitives
+program: mpc-analysis
 runtime_args:
   threads: 8          # -t   MUST match: the port arithmetic depends on it
-  batch: -12          # -b
-  rows: 1048576       # -r
-  setting: lan        # -s
   num_engines: 1      # -neng
+  stage: models       # -S   kernels | describe | models | bench
+  data_dir: /data     # -D   each party's own mount; see the data block below
+  conflict_list: 0    # -cl  1 also runs the MRN cross-check, which opens a count
 
 # --- Compile-time options (identical for every party) -----------------------
 # These change the wire protocol or the computation; a mismatch is silent.
@@ -63,10 +63,37 @@ cmake:
 #   OPT_LEVEL, and the -march=native the compiler selects.
 
 # --- Data -------------------------------------------------------------------
-# Only the owning party ever opens its file; the others allocate zeros and receive
-# shares (encoded_table.h inputCSVTableData). Schema must be identical everywhere
-# because all parties construct the same table.
+#
+# TWO data owners, each holding its own half of cdrcatsse_match_pcc -- the top of
+# the lineage, with the diagnosis text intact. Only the owning party ever opens
+# its file; the others allocate placeholders and receive shares. The plaintext
+# never crosses the network.
+#
+# A three-party run has two data owners and one compute party. Rank 2 below
+# contributes no data and still participates in the protocol.
+#
+# Do NOT stage finished analysis tables here. visit_num, index_visit,
+# final_visit and fu_month are window functions over a patient's whole history,
+# and that history spans both organizations, so no owner can compute them from
+# its own rows. The protocol produces them, in shares.
 data:
-  mount: /data                     # each party mounts ITS OWN directory here
-  file: patients.csv
-  schema: ["id", "zip", "age", "score"]
+  mount: /data                     # each owner mounts ITS OWN directory here
+  owners:
+    - owner_rank: 0                # -pa
+      file: base_owner_a.csv       # -fa
+      rows: 240                    # -ra   POST-FILTER count, see below
+    - owner_rank: 1                # -pb
+      file: base_owner_b.csv       # -fb
+      rows: 256                    # -rb
+
+  # `rows` is NOT the file's line count. flagged_dx pass 1 keeps only Emergency
+  # and Acute Care encounters, so this is what survives that filter: the number
+  # of rows the owner actually contributes. Both halves are padded to one common
+  # length derived from both counts, so a party owning neither still needs them,
+  # and a file disagreeing with its declared count is a fatal error.
+  #
+  # Each owner computes its own number locally, before this file is agreed:
+  #     ./docker/count-analysis-rows.py /srv/org-a/private/base_owner_a.csv
+  #
+  # The pipeline's plaintext cross-check needs both halves at once and therefore
+  # does not exist in a real run. See DEPLOYMENT.md, "Private data".
