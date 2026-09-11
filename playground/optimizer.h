@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "./primitives.h"
 
 namespace cdough::regression {
@@ -484,7 +486,20 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
 
     BatchedOptResult result(x, fx, 0, false);
 
+    // Per-iteration wall clock. Deliberately NOT the repository's
+    // `stopwatch::timepoint`: that prints its own `[ SW]` format, keeps a single
+    // static `then` shared by every caller (so interleaving it with the
+    // harness's phase timepoints would corrupt both sets of intervals), and
+    // records one map entry per label, which at 300 iterations is 300 entries.
+    //
+    // Timing is printed unconditionally, unlike the value fields below. It costs
+    // nothing in privacy terms: elapsed time is not derived from any share, so
+    // printing it is not a declassification, and every party can measure it with
+    // its own clock regardless. It is also never branched on.
+    using Clock = std::chrono::steady_clock;
+
     for (int iteration = 0; iteration < max_iterations; ++iteration) {
+        const Clock::time_point iteration_start = Clock::now();
         result.iterations = iteration + 1;
 
         // -------------------------------------------------------------------
@@ -501,21 +516,28 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
         auto opened_flag = keep_going.open();
 
         if (static_cast<DataType>(opened_flag[0]) == 0) {
+            const double elapsed =
+                std::chrono::duration<double>(Clock::now() - iteration_start).count();
+
+            // Which of the two conditions cleared the flag is a *second* fact
+            // about the shares, so recovering it needs another open and stays
+            // behind the guard. The index and the time do not.
 #ifdef LOGISTIC_REGRESSION_LAYER_PRINT
-            // Diagnostic only, and only in a build that has already given up on
-            // privacy: separate the two reasons the flag can be clear.
             auto opened_grad_big = grad_big.open();
-            if (engine.getPartyID() == 0) {
-                if (static_cast<DataType>(opened_grad_big[0]) == 0) {
-                    std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                              << "  gradient below tolerance; stopping" << std::endl;
-                } else {
-                    std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                              << "  no descent found along search direction; stopping"
-                              << std::endl;
-                }
-            }
+            const bool stopped_on_gradient = (static_cast<DataType>(opened_grad_big[0]) == 0);
 #endif
+            if (engine.getPartyID() == 0) {
+                std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
+                          << "  time=" << std::fixed << std::setprecision(3) << elapsed << "s"
+#ifdef LOGISTIC_REGRESSION_LAYER_PRINT
+                          << (stopped_on_gradient
+                                  ? "  gradient below tolerance; stopping"
+                                  : "  no descent found along search direction; stopping")
+#else
+                          << "  stopping"
+#endif
+                          << std::endl;
+            }
             result.converged = true;
             break;
         }
@@ -658,39 +680,53 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
         h_inv = SMatrix(Multiplex(curv_ok, h_inv.data(), h_updated.data()), n, n, false);
         h_inv.setPrecision(precision);
 
+        // ---------------------------------------------------------------------
+        // Per-iteration log.
+        //
+        // The index and the elapsed time print unconditionally: neither is
+        // derived from a share, so neither is a declassification. The value
+        // fields below need `open()` and stay behind the compile-time flag, so
+        // the flag-ON format is a strict superset of the flag-OFF one.
+        //
+        // Note where the opens sit. They are OUTSIDE the party guard, because
+        // `open()` is a communication round and every party must reach it;
+        // only the printing is party 0's. Moving an open inside the guard
+        // deadlocks all three parties.
+        // ---------------------------------------------------------------------
+        const double elapsed =
+            std::chrono::duration<double>(Clock::now() - iteration_start).count();
+
 #ifdef LOGISTIC_REGRESSION_LAYER_PRINT
-        // Diagnostics. Every open below exists only to print; none of it feeds
-        // control flow. This block is why the flag defaults to OFF.
-        {
-            auto opened_g = gradient.open();
-            auto opened_step = step.open();
-            auto opened_alpha = alpha.open();
-            auto opened_fx = fx.open();
-            auto opened_fx_new = fx_new.open();
+        auto opened_g = gradient.open();
+        auto opened_step = step.open();
+        auto opened_alpha = alpha.open();
+        auto opened_fx = fx.open();
+        auto opened_fx_new = fx_new.open();
 
-            double max_grad = 0.0;
-            for (size_t i = 0; i < n; ++i) {
-                max_grad = std::max(max_grad, std::abs(static_cast<double>(opened_g[i]) / scale));
-            }
-            double max_step = 0.0;
-            for (size_t i = 0; i < n; ++i) {
-                max_step =
-                    std::max(max_step, std::abs(static_cast<double>(opened_step[i]) / scale));
-            }
-            const double fx_val = static_cast<double>(opened_fx[0]) / scale;
-            const double fx_new_val = static_cast<double>(opened_fx_new[0]) / scale;
-
-            if (engine.getPartyID() == 0) {
-                std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                          << "  neg_log_lik=" << std::fixed << std::setprecision(6) << fx_new_val
-                          << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
-                          << "  alpha=" << std::fixed << std::setprecision(4)
-                          << static_cast<double>(opened_alpha[0]) / scale
-                          << "  |step|=" << std::scientific << std::setprecision(3) << max_step
-                          << "  d_obj=" << std::abs(fx_val - fx_new_val) << std::endl;
-            }
+        double max_grad = 0.0;
+        double max_step = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            max_grad = std::max(max_grad, std::abs(static_cast<double>(opened_g[i]) / scale));
+            max_step = std::max(max_step, std::abs(static_cast<double>(opened_step[i]) / scale));
         }
+        const double fx_val = static_cast<double>(opened_fx[0]) / scale;
+        const double fx_new_val = static_cast<double>(opened_fx_new[0]) / scale;
 #endif
+
+        if (engine.getPartyID() == 0) {
+            std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
+                      << "  time=" << std::fixed << std::setprecision(3) << elapsed << "s"
+#ifdef LOGISTIC_REGRESSION_LAYER_PRINT
+                      << "  neg_log_lik=" << std::fixed << std::setprecision(6) << fx_new_val
+                      << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
+                      << "  alpha=" << std::fixed << std::setprecision(4)
+                      << static_cast<double>(opened_alpha[0]) / scale
+                      << "  |step|=" << std::scientific << std::setprecision(3) << max_step
+                      << "  d_obj=" << std::scientific << std::setprecision(3)
+                      << std::abs(fx_val - fx_new_val)
+#endif
+                      << std::endl;
+        }
 
         x = Clone(x_new);
         gradient = Clone(gradient_new);
