@@ -10,6 +10,7 @@ Short list of all tasks so far.
 - 0006 — Make Taylor math compatible with SimulatedFloat — Status: Done — [tasks/0006_simulated-float-taylor-math.md](0006_simulated-float-taylor-math.md)
 - 0007 — Dockerize CryptDough for portable experiment execution — Status: Done — [tasks/0007_dockerize-cryptdough.md](0007_dockerize-cryptdough.md)
 - 0008 — Real 3PC across three organizations (mTLS, SSH-free launch, per-party data) — Status: Done — [tasks/0008_cross-org-3pc-deployment.md](0008_cross-org-3pc-deployment.md)
-- 0009 — MPC analysis pipeline: full SISA acute-care port (19 lineage nodes, 14 model fits) — Status: Done — [tasks/0009_mpc-analysis-pipeline.md](0009_mpc-analysis-pipeline.md)
+- 0009 — MPC analysis pipeline: full SISA acute-care port (17 terminal outputs after 0011, 14 model fits) — Status: Done — [tasks/0009_mpc-analysis-pipeline.md](0009_mpc-analysis-pipeline.md)
 - 0010 — Secure matrix inversion via Newton–Schulz iterations — Status: Done — [tasks/0010_secure-matrix-inversion-newton-schulz.md](0010_secure-matrix-inversion-newton-schulz.md)
 - 0011 — Full pipeline from cdrcatsse_match_pcc across two owners: oblivious merge + in-MPC rank/sequencing — Status: Done — [tasks/0011_two-owner-merge-and-oblivious-rank.md](0011_two-owner-merge-and-oblivious-rank.md)
+- 0012 — SQLite cross-check for the relational stage (`flagged_dx` pass 2 + per-system re-sequencing); restore the stale Python oracle — Status: Done — [tasks/0012_sqlite-relational-verification.md](0012_sqlite-relational-verification.md)

@@ -1,5 +1,19 @@
 # 0009 — MPC analysis pipeline (`playground/mpc-analysis.cpp` + headers)
 
+> **Partly superseded by [tasks/0011](0011_two-owner-merge-and-oblivious-rank.md).**
+> This document records the pipeline as first built, and is kept as history.
+> Read it with these changes in mind:
+> - The input is no longer three per-owner analysis tables (`any_system` etc.).
+>   It is two owners' halves of `cdrcatsse_match_pcc`, merged and sequenced under
+>   MPC — the oblivious sort and merge this document scopes out below.
+> - Nodes `d1a` and `d1b` were removed; 17 terminal outputs remain, not 19.
+> - The three-party deployment section describes a data layout that no longer
+>   exists (`--rows-any` / `--rows-umass` / `--rows-nonumass`, `--max-visits`).
+>   See `docker/DEPLOYMENT.md` for the current one.
+> - `scripts/testing/validate_mpc_analysis.py` was dead from 0011 until
+>   [tasks/0012](0012_sqlite-relational-verification.md), which rebuilt its
+>   front end on the two-owner dump. The "How to verify" recipe below is current.
+
 ## Metadata
 - Task ID: 0009
 - Title: Full MPC port of the SISA acute-care analysis pipeline
@@ -66,7 +80,7 @@
   sort by `subject_id` and the categorical coding happen locally in plaintext — this matches
   `examples/ex6_three_party_private_input.cpp` and `docker/DEPLOYMENT.md`, and reveals nothing the
   owner does not already have. A deployment where *no* party holds `any_system` would need an
-  oblivious sort and merge, which is out of scope here. (b) `MinimizeBFGS` opens scalars to steer its
+  oblivious sort and merge, which is out of scope here. *(Later built by task 0011.)* (b) `MinimizeBFGS` opens scalars to steer its
   line search — inherited from the existing code, not introduced by this task, and worth a follow-up.
   The quantile search opens one comparison bit per step, which discloses exactly the published
   quantile and nothing further.
@@ -330,20 +344,23 @@ code ran.
 # fast: kernels, segmented scans, dense linear algebra
 ./mpc-analysis -S kernels
 
-# ingestion plus the descriptive and aggregate nodes; dump the cohort
+# ingestion plus the aggregate nodes; dump both owners' halves of the base
+# table (base_owner_{a,b}.csv, flagged_dx_owner_{a,b}.csv). Synthetic path only.
 ./mpc-analysis -S describe -r 200 -O /tmp/dump
 
 # the fourteen fits, captured for the oracle to diff (about 30 min at r=400
 # under PROTOCOL=1; scale down while iterating)
 ./mpc-analysis -S models -r 200 > /tmp/models.txt
 
-# independent plaintext oracle: exact on the counting nodes, and it scores the
-# fits on the RESULT lines the run above emitted
+# independent plaintext oracle: rebuilds the three cohorts from the two halves
+# with playground/sql/sequencing.sql (the same query the C++ SQL oracle embeds),
+# is exact on the counting nodes, and scores the fits on the RESULT lines
 python3 scripts/testing/validate_mpc_analysis.py /tmp/dump
 python3 scripts/testing/validate_mpc_analysis.py /tmp/dump --compare /tmp/models.txt
 
-# read the dumped CSVs back through the per-party ingestion path
-./mpc-analysis -S describe -D /tmp/dump
+# read the dumped halves back through the per-owner ingestion path; the row
+# counts are the post-pass-1 manifest counts that -O printed
+./mpc-analysis -S describe -D /tmp/dump -ra <rows-a> -rb <rows-b>
 ```
 
 The comparison applies two different criteria, because only one model family has

@@ -1,11 +1,16 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
+#include <iomanip>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "./regression.h"
 #include "./secure.h"
+#include "./sqlite_oracle.h"  // no-op unless HAVE_SQLITE3
 
 // Accuracy harnesses and the cost breakdown. Every kernel added by this
 // pipeline is checked against a plaintext oracle here before anything is
@@ -301,13 +306,208 @@ void TestSegmented(EngineRef engine, int party_id) {
               << std::endl;
 }
 
-// Checks the whole cross-party half -- oblivious merge, then both sequencing
-// passes -- against a plaintext run over the union.
+// =============================================================================
+// Comparing two sequencings
 //
-// This is the test that matters for tasks/0011. The MPC table ends up sorted by
-// (subject_id, data_source, encounter_dt) while the oracle is in
-// (subject_id, encounter_dt) order, so the two are aligned by sorting the
-// opened rows on the oracle's key rather than compared positionally.
+// The three sources -- MPC, SequencePlain, SQLite -- must agree, but NOT
+// positionally. Bitonic sort is not stable, and SQLite's ROW_NUMBER over rows
+// tied on (subject_id, encounter_dt) is likewise arbitrary, so "row i of one
+// equals row i of the other" is not a well-formed claim on a patient with two
+// encounters on one date.
+//
+// What IS determined is the value at each RANK. Fix a patient and a scope, let
+// the sorted date sequence be d(1) <= ... <= d(n). Whichever tied row lands at
+// position k gets visit_num = k, index_visit = [k == 1], final_visit = [k == n],
+// index_dt = d(1), and fu_month = band(d(k) - d(1)). Every one of those is a
+// function of k and of the sorted sequence alone, and the sorted sequence of a
+// multiset is unique -- so the whole tuple at rank k is identical across all
+// legal tie orders.
+//
+// Hence: group by subject_id, order each group by visit_num, compare
+// element-wise, and additionally assert visit_num is exactly 1..n. That last
+// check is why this is stronger than comparing multisets -- a multiset compare
+// cannot see a duplicated or skipped rank, which is exactly what a wrong
+// Brent-Kung group bit would produce.
+//
+// This replaces an earlier positional alignment that tiebroke on data_source.
+// That only helped when the tied rows were in different systems, and gave false
+// confidence otherwise.
+// =============================================================================
+
+struct SeqDiff {
+    long lhs_rows = 0, rhs_rows = 0;
+    long missing_subjects = 0;  // in lhs, absent from rhs
+    long extra_subjects = 0;    // in rhs, absent from lhs
+    long ragged_runs = 0;       // same patient, different number of encounters
+    long bad_rank = 0;          // visit_num was not 1..n
+    long bad_dt = 0, bad_index = 0, bad_final = 0, bad_fu = 0;
+    long bad_payload = 0;
+    long tie_groups = 0;  // (subject, date) pairs carrying more than one row
+
+    bool ok() const {
+        return lhs_rows == rhs_rows && missing_subjects == 0 && extra_subjects == 0 &&
+               ragged_runs == 0 && bad_rank == 0 && bad_dt == 0 && bad_index == 0 &&
+               bad_final == 0 && bad_fu == 0 && bad_payload == 0;
+    }
+};
+
+// Group row indices by subject, each group ordered by visit_num.
+inline std::map<DataType, std::vector<size_t>> GroupBySubject(const PlainCohort& c) {
+    std::map<DataType, std::vector<size_t>> by_subject;
+    for (size_t i = 0; i < c.rows(); ++i) by_subject[c.subject_id[i]].push_back(i);
+    for (auto& [sid, rows] : by_subject)
+        std::sort(rows.begin(), rows.end(),
+                  [&](size_t x, size_t y) { return c.visit_num[x] < c.visit_num[y]; });
+    return by_subject;
+}
+
+// `strict_payload` additionally compares newage / data_source / sisa / sa. Off by
+// default, and it should stay off on tied data: the pairing of a RANK to a
+// PAYLOAD is genuinely ambiguous there. Two same-day rows with different sisa
+// get ranks k and k+1 in whichever order the sort happened to pick, and no
+// implementation is more right than the other. (gender and hispanic are one-hot
+// in SecureCohort and are not reconstructed, so they are never compared.)
+SeqDiff CompareSequencing(const PlainCohort& lhs, const PlainCohort& rhs,
+                          bool strict_payload = false) {
+    SeqDiff d;
+    d.lhs_rows = static_cast<long>(lhs.rows());
+    d.rhs_rows = static_cast<long>(rhs.rows());
+
+    std::map<std::pair<DataType, DataType>, long> seen;
+    for (size_t i = 0; i < lhs.rows(); ++i) ++seen[{lhs.subject_id[i], lhs.encounter_dt[i]}];
+    for (const auto& [key, n] : seen)
+        if (n > 1) ++d.tie_groups;
+
+    const auto l_by = GroupBySubject(lhs);
+    const auto r_by = GroupBySubject(rhs);
+
+    for (const auto& [sid, l_rows] : l_by) {
+        const auto it = r_by.find(sid);
+        if (it == r_by.end()) {
+            ++d.missing_subjects;
+            continue;
+        }
+        const std::vector<size_t>& r_rows = it->second;
+        if (l_rows.size() != r_rows.size()) {
+            ++d.ragged_runs;
+            continue;
+        }
+        const long n = static_cast<long>(l_rows.size());
+        for (long k = 0; k < n; ++k) {
+            const size_t li = l_rows[k], ri = r_rows[k];
+
+            // The ranks must be a permutation-free 1..n on BOTH sides.
+            if (lhs.visit_num[li] != k + 1 || rhs.visit_num[ri] != k + 1) ++d.bad_rank;
+
+            if (lhs.encounter_dt[li] != rhs.encounter_dt[ri]) ++d.bad_dt;
+            if (lhs.index_visit[li] != rhs.index_visit[ri]) ++d.bad_index;
+            if (lhs.final_visit[li] != rhs.final_visit[ri]) ++d.bad_final;
+
+            // Compare fu_month as `present ? value : NULL`, so the value is
+            // ignored wherever the pipeline calls it absent.
+            const DataType l_fu = lhs.fu_month_present[li] ? lhs.fu_month[li] : -1;
+            const DataType r_fu = rhs.fu_month_present[ri] ? rhs.fu_month[ri] : -1;
+            if (l_fu != r_fu) ++d.bad_fu;
+
+            if (strict_payload) {
+                if (lhs.newage[li] != rhs.newage[ri] ||
+                    lhs.data_source[li] != rhs.data_source[ri] ||
+                    lhs.sisa[li] != rhs.sisa[ri] || lhs.sa[li] != rhs.sa[ri])
+                    ++d.bad_payload;
+            }
+        }
+    }
+    for (const auto& [sid, r_rows] : r_by)
+        if (l_by.find(sid) == l_by.end()) ++d.extra_subjects;
+
+    return d;
+}
+
+// Party 0 only. Prints one line when clean, the offending counters when not.
+void ReportSeqDiff(const std::string& label, const SeqDiff& d) {
+    if (d.ok()) {
+        std::cout << "  " << std::left << std::setw(34) << label << "MATCH  (" << d.lhs_rows
+                  << " rows)" << std::endl;
+        return;
+    }
+    std::cout << "  " << std::left << std::setw(34) << label << "*** MISMATCH ***"
+              << "\n    rows " << d.lhs_rows << " vs " << d.rhs_rows;
+    auto field = [](const char* name, long v) {
+        if (v) std::cout << "\n    " << name << " " << v;
+    };
+    field("subjects missing from rhs", d.missing_subjects);
+    field("subjects only in rhs     ", d.extra_subjects);
+    field("ragged patient runs      ", d.ragged_runs);
+    field("visit_num not 1..n       ", d.bad_rank);
+    field("encounter_dt mismatches  ", d.bad_dt);
+    field("index_visit mismatches   ", d.bad_index);
+    field("final_visit mismatches   ", d.bad_final);
+    field("fu_month mismatches      ", d.bad_fu);
+    field("payload mismatches       ", d.bad_payload);
+    std::cout << std::endl;
+}
+
+// Open a secret-shared cohort into the plaintext layout the comparator takes.
+//
+// COLLECTIVE: open() is a protocol operation, so EVERY party must call this or
+// the run deadlocks. Only party 0 gets a populated result.
+//
+// Descaling lives here rather than at each call site. Per primitives.h, visit_num,
+// fu_month and newage are scaled by `scale`; encounter_dt, valid and the 0/1
+// flags are not.
+PlainCohort CohortFromSecure(const SecureCohort& sc, int party_id) {
+    auto o_subject = sc.subject_key.open();
+    auto o_dt = sc.encounter_dt.open();
+    auto o_valid = sc.valid.open();
+    auto o_visit = sc.visit_num.open();
+    auto o_index = sc.index_visit.open();
+    auto o_final = sc.final_visit.open();
+    auto o_fu = sc.fu_month.open();
+    auto o_present = sc.fu_present.open();
+    auto o_umass = sc.umass.open();
+    auto o_newage = sc.newage.open();
+    auto o_sisa = sc.sisa.open();
+    auto o_sa = sc.sa.open();
+
+    PlainCohort c;
+    c.scope = sc.scope;
+    if (party_id != 0) return c;
+
+    const auto S = static_cast<DataType>(scale);
+    for (size_t i = 0; i < o_valid.size(); ++i) {
+        if (static_cast<DataType>(o_valid[i]) != 1) continue;  // pad row
+        c.subject_id.push_back(static_cast<DataType>(o_subject[i]));
+        c.encounter_dt.push_back(static_cast<DataType>(o_dt[i]));
+        c.newage.push_back(static_cast<DataType>(o_newage[i]) / S);
+        c.gender.push_back(0);    // one-hot in SecureCohort; not reconstructed
+        c.hispanic.push_back(0);  // likewise
+        c.index_visit.push_back(static_cast<DataType>(o_index[i]));
+        c.visit_num.push_back(static_cast<DataType>(o_visit[i]) / S);
+        c.final_visit.push_back(static_cast<DataType>(o_final[i]));
+        c.fu_month.push_back(static_cast<DataType>(o_fu[i]) / S);
+        c.fu_month_present.push_back(static_cast<DataType>(o_present[i]));
+        c.data_source.push_back(static_cast<DataType>(o_umass[i]) == 1 ? 1 : 2);
+        c.sisa.push_back(static_cast<DataType>(o_sisa[i]));
+        c.sa.push_back(static_cast<DataType>(o_sa[i]));
+    }
+    return c;
+}
+
+// Checks the whole cross-party half -- oblivious merge, then both sequencing
+// passes -- against TWO independent oracles.
+//
+// This is the test that matters for tasks/0011, and since tasks/0012 it is also
+// where the SQL cross-check lives. SequencePlain and the MPC implementation were
+// written from the same reading of the same upstream query, so agreement between
+// them is weaker evidence than it looks; SQLite executes that query AS SQL and
+// is independent of both. Each scope is therefore checked three ways:
+//
+//     SQL  vs SequencePlain    -- audits the hand-written oracle
+//     SQL  vs MPC              -- audits the secure implementation
+//     MPC  vs SequencePlain    -- the original check, retained
+//
+// Always on the synthetic path: it generates and splits its own base table, so
+// the union both oracles need genuinely exists here.
 void TestTwoOwnerPipeline(EngineRef engine, int party_id, size_t subjects, int party_a,
                           int party_b) {
     single_cout("\n================ two-owner merge and sequencing ================");
@@ -323,112 +523,59 @@ void TestTwoOwnerPipeline(EngineRef engine, int party_id, size_t subjects, int p
     SecurePipeline sp =
         RunSecurePipeline(engine, fa, party_a, fb, party_b, fa.rows(), fb.rows());
 
-    auto o_subject = sp.any.subject_key.open();
-    auto o_dt = sp.any.encounter_dt.open();
-    auto o_valid = sp.any.valid.open();
-    auto o_visit = sp.any.visit_num.open();
-    auto o_index = sp.any.index_visit.open();
-    auto o_final = sp.any.final_visit.open();
-    auto o_fu = sp.any.fu_month.open();
-    auto o_present = sp.any.fu_present.open();
-    auto o_umass = sp.any.umass.open();
-
-    // The per-system pass, read off the UMass cohort.
-    auto u_valid = sp.umass.valid.open();
-    auto u_visit = sp.umass.visit_num.open();
-    auto u_index = sp.umass.index_visit.open();
+    // Collective: every party must reach all three, in this order.
+    const PlainCohort mpc_any = CohortFromSecure(sp.any, party_id);
+    const PlainCohort mpc_umass = CohortFromSecure(sp.umass, party_id);
+    const PlainCohort mpc_nonumass = CohortFromSecure(sp.nonumass, party_id);
 
     if (party_id != 0) return;
 
-    struct Got {
-        long sid, dt, visit, index, fin, fu, present, umass;
+    bool ok = true;
+    const std::pair<SystemScope, const PlainCohort*> scopes[] = {
+        {SystemScope::Any, &mpc_any},
+        {SystemScope::UMass, &mpc_umass},
+        {SystemScope::NonUMass, &mpc_nonumass},
     };
-    std::vector<Got> got;
-    for (size_t i = 0; i < o_valid.size(); ++i) {
-        if (static_cast<long>(o_valid[i]) != 1) continue;
-        got.push_back(Got{static_cast<long>(o_subject[i]),
-                          static_cast<long>(o_dt[i]),  // unscaled: a day count
-                          static_cast<long>(o_visit[i]) / static_cast<long>(scale),
-                          static_cast<long>(o_index[i]), static_cast<long>(o_final[i]),
-                          static_cast<long>(o_fu[i]) / static_cast<long>(scale),
-                          static_cast<long>(o_present[i]), static_cast<long>(o_umass[i])});
+
+#if defined(HAVE_SQLITE3)
+    SqlOracle sql(fa, fb);
+    if (!sql.ok()) {
+        std::cout << "  *** the SQL oracle failed to build; SQL cross-check skipped ***"
+                  << std::endl;
+        ok = false;
     }
-    std::stable_sort(got.begin(), got.end(), [](const Got& x, const Got& y) {
-        if (x.sid != y.sid) return x.sid < y.sid;
-        if (x.dt != y.dt) return x.dt < y.dt;
-        return x.umass > y.umass;
-    });
-
-    PlainCohort exp = SequencePlain(fa, fb, SystemScope::Any);
-    std::vector<size_t> ord(exp.rows());
-    std::iota(ord.begin(), ord.end(), size_t{0});
-    std::stable_sort(ord.begin(), ord.end(), [&](size_t x, size_t y) {
-        if (exp.subject_id[x] != exp.subject_id[y]) return exp.subject_id[x] < exp.subject_id[y];
-        if (exp.encounter_dt[x] != exp.encounter_dt[y])
-            return exp.encounter_dt[x] < exp.encounter_dt[y];
-        return exp.data_source[x] < exp.data_source[y];
-    });
-
-    bool ok = (got.size() == exp.rows());
-    std::cout << "  rows: merged " << got.size() << ", plaintext union " << exp.rows()
-              << (ok ? "  MATCH" : "  *** MISMATCH ***") << std::endl;
-
-    long bad_visit = 0, bad_index = 0, bad_final = 0, bad_fu = 0;
-    const size_t lim = std::min(got.size(), exp.rows());
-    for (size_t i = 0; i < lim; ++i) {
-        const size_t e = ord[i];
-        if (got[i].sid != static_cast<long>(exp.subject_id[e])) { ok = false; continue; }
-        if (got[i].visit != static_cast<long>(exp.visit_num[e])) ++bad_visit;
-        if (got[i].index != static_cast<long>(exp.index_visit[e])) ++bad_index;
-        if (got[i].fin != static_cast<long>(exp.final_visit[e])) ++bad_final;
-        const long exp_fu =
-            exp.fu_month_present[e] ? static_cast<long>(exp.fu_month[e]) : -1;
-        const long got_fu = got[i].present ? got[i].fu : -1;
-        if (exp_fu != got_fu) ++bad_fu;
-    }
-    ok &= (bad_visit == 0 && bad_index == 0 && bad_final == 0 && bad_fu == 0);
-
-    std::cout << "  visit_num mismatches   " << bad_visit << "\n"
-              << "  index_visit mismatches " << bad_index << "\n"
-              << "  final_visit mismatches " << bad_final << "\n"
-              << "  fu_month mismatches    " << bad_fu << std::endl;
-
-    // Per-system: every UMass row's visit_num must be its rank inside that
-    // patient's UMass history, which is strictly <= its global visit_num.
-    PlainCohort exp_u = SequencePlain(fa, fb, SystemScope::UMass);
-    std::map<long, long> umass_visits;
-    for (size_t i = 0; i < exp_u.rows(); ++i)
-        umass_visits[static_cast<long>(exp_u.subject_id[i])] =
-            std::max<long>(umass_visits[static_cast<long>(exp_u.subject_id[i])],
-                           static_cast<long>(exp_u.visit_num[i]));
-
-    std::map<long, long> got_umass_max;
-    long umass_rows = 0;
-    for (size_t i = 0; i < u_valid.size(); ++i) {
-        if (static_cast<long>(u_valid[i]) != 1) continue;
-        ++umass_rows;
-        const long sid = static_cast<long>(o_subject[i]);
-        got_umass_max[sid] = std::max<long>(
-            got_umass_max[sid], static_cast<long>(u_visit[i]) / static_cast<long>(scale));
-    }
-    bool umass_ok = (umass_rows == static_cast<long>(exp_u.rows()));
-    long bad_max = 0;
-    for (const auto& [sid, m] : umass_visits)
-        if (got_umass_max[sid] != m) ++bad_max;
-    umass_ok &= (bad_max == 0);
-
-    long idx_count = 0;
-    for (size_t i = 0; i < u_valid.size(); ++i)
-        if (static_cast<long>(u_valid[i]) == 1 && static_cast<long>(u_index[i]) == 1)
-            ++idx_count;
-    const long exp_idx = static_cast<long>(umass_visits.size());
-    umass_ok &= (idx_count == exp_idx);
-
-    std::cout << "  umass rows: merged " << umass_rows << ", plaintext " << exp_u.rows()
-              << "\n  umass per-patient visit totals wrong: " << bad_max
-              << "\n  umass index_visit rows " << idx_count << ", patients " << exp_idx
+    const long same_date_ties = sql.ok() ? sql.CountSameDateTies() : -1;
+#else
+    std::cout << "  NOTE: built without SQLite (HAVE_SQLITE3 undefined), so the SQL\n"
+                 "        cross-check is ABSENT. Only MPC vs SequencePlain runs below."
               << std::endl;
-    ok &= umass_ok;
+#endif
+
+    for (const auto& [scope, mpc] : scopes) {
+        std::cout << "\n  --- " << ScopeName(scope) << " ---" << std::endl;
+        const PlainCohort plain = SequencePlain(fa, fb, scope);
+
+#if defined(HAVE_SQLITE3)
+        if (sql.ok()) {
+            const PlainCohort q = sql.Sequence(scope);
+            const SeqDiff d_plain = CompareSequencing(q, plain);
+            const SeqDiff d_mpc = CompareSequencing(q, *mpc);
+            ReportSeqDiff("SQL vs SequencePlain", d_plain);
+            ReportSeqDiff("SQL vs MPC", d_mpc);
+            ok &= d_plain.ok() && d_mpc.ok();
+        }
+#endif
+        const SeqDiff d_both = CompareSequencing(plain, *mpc);
+        ReportSeqDiff("SequencePlain vs MPC", d_both);
+        ok &= d_both.ok();
+    }
+
+#if defined(HAVE_SQLITE3)
+    // A PASS on a run that contained no ties is no evidence that tie handling
+    // works, so say how much tie coverage this run actually had.
+    std::cout << "\n  tie coverage: " << same_date_ties
+              << " (patient, date) pairs carrying more than one encounter" << std::endl;
+#endif
 
     std::cout << (ok ? "TWO-OWNER PIPELINE: PASS" : "TWO-OWNER PIPELINE: *** FAIL ***")
               << std::endl;

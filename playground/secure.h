@@ -168,7 +168,7 @@ SecureColumns MergeTwoOwners(EngineRef engine, const PlainFlagged& half_a, int p
     for (size_t k = 0; k < kHispanicLevels.size(); ++k) c.hispanic_is.emplace_back(n, engine);
 
     // Each owner shares its own half; only the owning party's vector carries
-    // real values, exactly as ShareCohort already does per table.
+    // real values, and every other party passes an empty placeholder.
     auto share_b_half = [&](BV& dst, cdough::Vector<DataType>& va,
                             cdough::Vector<DataType>& vb) {
         BV sa = engine.template secret_share_b<DataType>(va, party_a);

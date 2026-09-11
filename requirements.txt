@@ -4,3 +4,4 @@ pandas
 sphinx_rtd_theme
 breathe
 myst_parser
+scipy

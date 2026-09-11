@@ -1,10 +1,13 @@
 // MPC port of the SISA acute-care analysis pipeline.
 //   https://cs-people.bu.edu/liagos/pilot/mpc_analysis_lineage.html
 //
-// Three patient-encounter tables in (any_system, umass_system, nonumass_system);
-// seventeen terminal outputs out -- three one-row aggregate tables and fourteen
-// fitted regression models (six specifications across three populations, minus
-// the four interaction fits that can only run on the pooled table). Nothing downstream consumes anything else:
+// Two owners' halves of cdrcatsse_match_pcc in; seventeen terminal outputs out --
+// three one-row aggregate tables and fourteen fitted regression models (six
+// specifications across three populations, minus the four interaction fits that
+// can only run on the pooled table). The three analysis tables (any_system,
+// umass_system, nonumass_system) are OUTPUTS of the relational stage, not
+// inputs: no single owner can compute the sequencing columns they carry, which
+// is what task 0011 exists to fix. Nothing downstream consumes anything else:
 // the pipeline is a wide fan-out, and every node reads a source table directly.
 //
 // This file holds only the driver: stage selection, ingestion, and the loop over
@@ -174,6 +177,10 @@ int main(int argc, char** argv) {
     // Run the cross-party conflict_list check. Off by default: it needs its own
     // ordering, because MRN runs are not contiguous in a subject-sorted table.
     const bool check_conflicts = engine.getArg<int>("conflict-list", "cl", 0) != 0;
+    // Re-run the relational stage's SQL cross-check at the production row count.
+    // Off by default: -S kernels already covers the same code path, and this
+    // costs three extra full-cohort opens on every describe/models run.
+    const bool check_sql = engine.getArg<int>("check-sql", "Q", 0) != 0;
     // 0 routes the segmented scans through aggregators::aggregate instead of the
     // cached per-level group bits, for A/B measurement.
     g_use_cached_scans = engine.getArg<int>("cached-scans", "C", 1) != 0;
@@ -181,7 +188,11 @@ int main(int argc, char** argv) {
     if (run_kernels) {
         TestNewKernels(engine, pID);
         TestSegmented(engine, pID);
-        TestTwoOwnerPipeline(engine, pID, 60, party_a, party_b);
+        // -r drives this too: the max-date ties that distinguish a correct
+        // final_visit from the naive `ROW_NUMBER() OVER w_desc = 1` reading
+        // occur in ~0.16% of patients, so a fixed 60 almost never sees one.
+        TestTwoOwnerPipeline(engine, pID, static_cast<size_t>(num_subjects), party_a,
+                             party_b);
         TestLinearAlgebra(engine, pID);
     }
     if (!run_describe && !run_bench) return 0;
@@ -326,6 +337,51 @@ int main(int argc, char** argv) {
     SecureCohort& any = pipeline.any;
     SecureCohort& umass = pipeline.umass;
     SecureCohort& nonumass = pipeline.nonumass;
+
+    // --- the relational stage against SQL, at the production row count -------
+    //
+    // Same three-way comparison -S kernels runs, but on this run's data. Needs
+    // the union of both halves, so it is gated on have_oracle exactly as
+    // SequencePlain is -- and the skip is printed rather than silent, because a
+    // verification layer that quietly stops verifying is worse than none.
+    if (check_sql) {
+        // Collective: every party must open, whatever it will do with the result.
+        const PlainCohort sql_mpc[] = {CohortFromSecure(any, pID),
+                                       CohortFromSecure(umass, pID),
+                                       CohortFromSecure(nonumass, pID)};
+        if (pID == 0) {
+            std::cout << "\n=== relational stage vs SQL ===" << std::endl;
+#if defined(HAVE_SQLITE3)
+            if (!have_oracle) {
+                std::cout << "  SKIPPED: no plaintext oracle on the CSV path. The SQL\n"
+                             "  oracle needs the union of both owners' halves, which is\n"
+                             "  precisely what no party holds in a real deployment."
+                          << std::endl;
+            } else {
+                SqlOracle sql(flagged_a, flagged_b);
+                const PlainCohort* plain[] = {&any_plain, &umass_plain, &nonumass_plain};
+                const SystemScope scopes[] = {SystemScope::Any, SystemScope::UMass,
+                                              SystemScope::NonUMass};
+                bool sql_ok = sql.ok();
+                for (int i = 0; i < 3 && sql.ok(); ++i) {
+                    const PlainCohort q = sql.Sequence(scopes[i]);
+                    const SeqDiff d_plain = CompareSequencing(q, *plain[i]);
+                    const SeqDiff d_mpc = CompareSequencing(q, sql_mpc[i]);
+                    std::cout << "  " << ScopeName(scopes[i]) << std::endl;
+                    ReportSeqDiff("  SQL vs SequencePlain", d_plain);
+                    ReportSeqDiff("  SQL vs MPC", d_mpc);
+                    sql_ok &= d_plain.ok() && d_mpc.ok();
+                }
+                std::cout << (sql_ok ? "  SQL CROSS-CHECK: PASS"
+                                     : "  SQL CROSS-CHECK: *** FAIL ***")
+                          << std::endl;
+            }
+#else
+            std::cout << "  SKIPPED: built without SQLite (HAVE_SQLITE3 undefined)."
+                      << std::endl;
+#endif
+        }
+    }
 
     if (pID == 0) {
         std::cout << "\n################ MPC analysis pipeline ################\n"

@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
 """Independent plaintext oracle for ``playground/mpc-analysis.cpp``.
 
-The MPC program can dump the cohort it ran on::
+The MPC program can dump the two data owners' halves of the base table::
 
     ./mpc-analysis -S describe -r 200 -O /tmp/dump
 
-This script reads that dump and recomputes every node of the pipeline in double
-precision, so the secure results can be checked against an implementation that
-shares no code with them.
+This script reads that dump and recomputes every node of the pipeline, so the
+secure results can be checked against an implementation that shares no code with
+them.
 
-The descriptive and aggregate nodes are exact counting problems and must match
-to the last digit. The regression coefficients are compared with a tolerance,
-because the secure fits run in 16-bit fixed point.
+Two stages, two mechanisms:
+
+* The **relational** stage -- lineage node ``flagged_dx`` pass 2 and the per-system
+  re-sequencing -- is recomputed by running ``playground/sql/sequencing.sql``
+  through the standard-library ``sqlite3`` module. That is the same file
+  ``playground/sqlite_oracle.h`` embeds, so the C++ and Python oracles execute
+  identical SQL and cannot drift apart.
+* The **aggregate and model** nodes are recomputed here in double precision with
+  numpy.
+
+The aggregate nodes are exact counting problems and must match to the last digit.
+The regression coefficients are compared with a tolerance, because the secure
+fits run in 16-bit fixed point.
+
+Note this needs the UNION of both owners' halves, which only exists on the
+synthetic path -- ``-O`` is a no-op under ``-D``. In a real deployment no party
+holds the union, so neither this oracle nor the in-process C++ one can run.
 
 Usage::
 
     python3 validate_mpc_analysis.py /tmp/dump
-    python3 validate_mpc_analysis.py /tmp/dump --model 2a --scope any
+    python3 validate_mpc_analysis.py /tmp/dump --model 2a
+    python3 validate_mpc_analysis.py /tmp/dump --compare /tmp/models.txt
 """
 
 from __future__ import annotations
@@ -24,10 +39,10 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-import statistics
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -68,6 +83,9 @@ class Cohort:
     """One input table, as dumped by the MPC program."""
 
     subject_id: np.ndarray
+    # The ordering key the sequencing is defined on. The removed per-cohort CSVs
+    # did not carry it; it is needed now that the cohorts are derived here.
+    encounter_dt: np.ndarray
     newage: np.ndarray
     gender: np.ndarray
     hispanic: np.ndarray
@@ -89,85 +107,147 @@ class Cohort:
         return int(np.unique(self.subject_id).size)
 
 
-_COLUMNS: dict[str, str] = {
-    "[subject_id]": "subject_id",
+# Columns of flagged_dx_owner_{a,b}.csv (etl.h WriteFlaggedCsv). The sequencing
+# needs a subset; `sisa` and `sa` are renamed to the analysis names here, exactly
+# as playground/sqlite_oracle.h does when it fills the same table.
+_FLAGGED_COLUMNS: dict[str, str] = {
+    "subject_id": "subject_id",
+    "encounter_dt": "encounter_dt",
     "newage": "newage",
-    "[gender]": "gender",
-    "[hispanic]": "hispanic",
-    "[index_visit]": "index_visit",
-    "visit_num": "visit_num",
-    "[final_visit]": "final_visit",
-    "[fu_month]": "fu_month",
-    "[fu_month_present]": "fu_month_present",
-    "[data_source]": "data_source",
-    "[sisa]": "sisa",
-    "[sa]": "sa",
+    "gender": "gender",
+    "hispanic": "hispanic",
+    "data_source": "data_source",
+    "suicide_acutecare_icd_narrow": "sisa",
+    "sa_icd_narrow": "sa",
 }
 
+# Scope name -> the ?1 the queries bind. 0 selects every system.
+_SCOPE_PARAM: dict[str, int] = {"any": 0, "umass": 1, "nonumass": 2}
 
-def read_cohort(path: Path) -> Cohort:
-    """Read one dumped cohort CSV."""
+# Repository-relative location of the shared query. This file is the single
+# source of truth: playground/sqlite_oracle.h embeds the same text via cmake.
+DEFAULT_SQL_PATH = Path(__file__).resolve().parents[2] / "playground" / "sql" / "sequencing.sql"
+
+
+def read_flagged(path: Path) -> list[tuple[int, ...]]:
+    """Read one owner's post-pass-1 half, as rows ready for the sqlite insert."""
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     if not rows:
         raise ValueError(f"{path} has no data rows")
-    missing = [name for name in _COLUMNS if name not in rows[0]]
+    missing = [name for name in _FLAGGED_COLUMNS if name not in rows[0]]
     if missing:
         raise ValueError(f"{path} is missing columns: {missing}")
-    columns = {
-        field_name: np.array([int(row[header]) for row in rows], dtype=np.int64)
-        for header, field_name in _COLUMNS.items()
-    }
-    return Cohort(**columns)
+    return [tuple(int(row[header]) for header in _FLAGGED_COLUMNS) for row in rows]
+
+
+def build_cohorts(dump_dir: Path, sql_path: Path) -> dict[str, Cohort]:
+    """Derive the three analysis cohorts from the two owners' halves.
+
+    This is the relational stage -- lineage node ``flagged_dx`` pass 2 plus the
+    ``umass`` / ``nonumass`` re-sequencing -- and it is deliberately NOT
+    reimplemented here. The query in ``sql_path`` is the same text
+    ``playground/sqlite_oracle.h`` runs, so this is a genuine second execution of
+    one oracle rather than a third hand-transcription that could drift.
+
+    The query is run once per scope. That matters: applying the scope filter
+    before the window is what produces the per-system re-sequencing, so
+    ``visit_num`` and ``fu_month`` genuinely differ between the three cohorts.
+    """
+    query = sql_path.read_text()
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        # No PRIMARY KEY or UNIQUE on (subject_id, encounter_dt): same-day
+        # repeat encounters are legitimate and a constraint would drop them.
+        connection.execute(
+            """
+            CREATE TABLE flagged_dx (
+                owner        INTEGER NOT NULL,
+                rid          INTEGER NOT NULL,
+                subject_id   INTEGER NOT NULL,
+                encounter_dt INTEGER NOT NULL,
+                newage       INTEGER NOT NULL,
+                gender       INTEGER NOT NULL,
+                hispanic     INTEGER NOT NULL,
+                data_source  INTEGER NOT NULL,
+                sisa         INTEGER NOT NULL,
+                sa           INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX ix_flagged ON flagged_dx (subject_id, encounter_dt)")
+        for owner, name in enumerate(("flagged_dx_owner_a.csv", "flagged_dx_owner_b.csv")):
+            path = dump_dir / name
+            if not path.exists():
+                raise SystemExit(
+                    f"{path} not found. Write it with `mpc-analysis -S describe -O {dump_dir}`; "
+                    "note -O only fires on the synthetic path."
+                )
+            rows = read_flagged(path)
+            LOGGER.info("%s: %d rows", name, len(rows))
+            connection.executemany(
+                "INSERT INTO flagged_dx (owner, rid, subject_id, encounter_dt, newage,"
+                " gender, hispanic, data_source, sisa, sa)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                [(owner, rid, *row) for rid, row in enumerate(rows)],
+            )
+
+        cohorts: dict[str, Cohort] = {}
+        for scope, param in _SCOPE_PARAM.items():
+            # The query uses the numbered placeholder ?1 (it appears twice, and the
+            # C++ side binds it by index). Python's sqlite3 treats ?NNN as a NAMED
+            # parameter, so it must be bound by mapping: a positional sequence is
+            # deprecated since 3.12.
+            result = connection.execute(query, {"1": param}).fetchall()
+            cohorts[scope] = _cohort_from_rows(result)
+        return cohorts
+    finally:
+        connection.close()
+
+
+# Column order is fixed by the SELECT list in sequencing.sql, and is the same
+# order playground/sqlite_oracle.h reads.
+_SQL_COLUMNS: tuple[str, ...] = (
+    "subject_id", "encounter_dt", "newage", "gender", "hispanic",
+    "index_visit", "visit_num", "final_visit", "fu_month", "data_source",
+    "sisa", "sa",
+)
+
+
+def _cohort_from_rows(rows: Sequence[Sequence[int | None]]) -> Cohort:
+    """Turn the query result into a Cohort, translating SQL NULL."""
+    index = {name: position for position, name in enumerate(_SQL_COLUMNS)}
+
+    def column(name: str) -> np.ndarray:
+        return np.array([row[index[name]] for row in rows], dtype=np.int64)
+
+    # fu_month arrives as a genuine SQL NULL. MPC has no NULL, so the pipeline
+    # carries presence in its own column; mirror that here.
+    raw_fu = [row[index["fu_month"]] for row in rows]
+    fu_present = np.array([0 if value is None else 1 for value in raw_fu], dtype=np.int64)
+    fu_month = np.array([0 if value is None else value for value in raw_fu], dtype=np.int64)
+
+    return Cohort(
+        subject_id=column("subject_id"),
+        encounter_dt=column("encounter_dt"),
+        newage=column("newage"),
+        gender=column("gender"),
+        hispanic=column("hispanic"),
+        index_visit=column("index_visit"),
+        visit_num=column("visit_num"),
+        final_visit=column("final_visit"),
+        fu_month=fu_month,
+        fu_month_present=fu_present,
+        data_source=column("data_source"),
+        sisa=column("sisa"),
+        sa=column("sa"),
+    )
 
 
 # --------------------------------------------------------------------------
 # Descriptive and aggregate nodes
 # --------------------------------------------------------------------------
-
-
-def univariate(values: np.ndarray) -> dict[str, float]:
-    """Moments and PCTLDEF=4 quantiles, matching the secure implementation."""
-    ordered = np.sort(values.astype(float))
-    n = ordered.size
-
-    def percentile(q: float) -> float:
-        position = (n - 1) * q
-        low = int(np.floor(position))
-        frac = position - low
-        if frac <= 0.0 or low + 1 >= n:
-            return float(ordered[low])
-        return float(ordered[low] + frac * (ordered[low + 1] - ordered[low]))
-
-    return {
-        "n": float(n),
-        "mean": float(np.mean(ordered)),
-        "sd": float(statistics.stdev(ordered.tolist())) if n > 1 else 0.0,
-        "min": float(ordered[0]),
-        "q1": percentile(0.25),
-        "median": percentile(0.50),
-        "q3": percentile(0.75),
-        "max": float(ordered[-1]),
-    }
-
-
-def frequency(values: np.ndarray, levels: Iterable[int]) -> list[tuple[int, int, float]]:
-    """One-way frequency table over a public level set."""
-    counts = [(level, int(np.count_nonzero(values == level))) for level in levels]
-    total = sum(count for _, count in counts)
-    return [
-        (level, count, 100.0 * count / total if total else 0.0) for level, count in counts
-    ]
-
-
-def value_histogram(values: np.ndarray) -> list[tuple[int, int, float]]:
-    """Full distribution of a small-integer column."""
-    unique, counts = np.unique(values, return_counts=True)
-    total = int(counts.sum())
-    return [
-        (int(value), int(count), 100.0 * int(count) / total if total else 0.0)
-        for value, count in zip(unique, counts)
-    ]
 
 
 def sisa_counts(cohort: Cohort) -> list[dict[str, float]]:
@@ -404,29 +484,6 @@ def observed_information_se(
     return np.where(variances > 0.0, np.sqrt(np.abs(variances)), np.nan)
 
 
-def report_descriptive(cohort: Cohort) -> None:
-    """Print the d1a and d1b nodes."""
-    print("\n=== d1a  visits per patient  [any_system, final_visit = 1] ===")
-    stats = univariate(cohort.visit_num[cohort.final_visit == 1])
-    for key, value in stats.items():
-        print(f"    {key:8s}{value:.4f}")
-    print("\n    distribution")
-    for value, count, percent in value_histogram(cohort.visit_num[cohort.final_visit == 1]):
-        print(f"    {value:<22}{count:<12}{percent:.2f}")
-
-    print("\n=== d1b  demographics  [any_system, index_visit = 1] ===")
-    at_index = cohort.index_visit == 1
-    for key, value in univariate(cohort.newage[at_index]).items():
-        print(f"    {key:8s}{value:.4f}")
-    for label, values, levels in (
-        ("gender", cohort.gender[at_index], GENDER_LEVELS),
-        ("hispanic", cohort.hispanic[at_index], HISPANIC_LEVELS),
-    ):
-        print(f"\n    {label}")
-        for level, count, percent in frequency(values, levels):
-            print(f"    {level:<22}{count:<12}{percent:.2f}")
-
-
 def report_counts(cohort: Cohort, label: str) -> None:
     """Print one sisa_perct_cnt table."""
     print(f"\n=== sisa_perct_cnt  [{label}] ===")
@@ -438,26 +495,6 @@ def report_counts(cohort: Cohort, label: str) -> None:
         )
     nulls = int(np.count_nonzero(cohort.fu_month_present == 0))
     print(f"  ({nulls} rows have a null fu_month and appear in neither numerator nor denominator)")
-
-
-def fit_all(
-    cohorts: dict[str, Cohort], only_step: str | None
-) -> dict[tuple[str, str, str], float]:
-    """Fit every model this oracle covers, keyed by (step, population, term)."""
-    out: dict[tuple[str, str, str], float] = {}
-    for scope, cohort in cohorts.items():
-        for spec in all_specs(scope):
-            if only_step and spec.step != only_step:
-                continue
-            matrix, outcome, mask, names = design(cohort, spec)
-            if spec.random_intercept:
-                beta, sigma2, _ = fit_laplace_glmm(matrix, outcome, mask, cohort.subject_id)
-                out[(spec.step, scope, "random_intercept_variance")] = sigma2
-            else:
-                beta, _ = fit_irls(matrix, outcome, mask)
-            for name, estimate in zip(names, beta):
-                out[(spec.step, scope, name)] = float(estimate)
-    return out
 
 
 def report_models(cohorts: dict[str, Cohort], only_step: str | None) -> None:
@@ -645,15 +682,19 @@ def main() -> None:
         default=0.10,
         help="max relative standard-error difference for the mixed models (default 0.10)",
     )
+    parser.add_argument(
+        "--sql",
+        type=Path,
+        default=DEFAULT_SQL_PATH,
+        help=f"the sequencing query shared with the C++ oracle (default {DEFAULT_SQL_PATH})",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    cohorts = {
-        "any": read_cohort(args.dump_dir / "any_system.csv"),
-        "umass": read_cohort(args.dump_dir / "umass_system.csv"),
-        "nonumass": read_cohort(args.dump_dir / "nonumass_system.csv"),
-    }
+    if not args.sql.exists():
+        raise SystemExit(f"sequencing query not found: {args.sql}")
+    cohorts = build_cohorts(args.dump_dir, args.sql)
     for name, cohort in cohorts.items():
         LOGGER.info("%s: %d rows, %d patients", name, cohort.rows, cohort.patients)
 
@@ -671,7 +712,6 @@ def main() -> None:
         )
         raise SystemExit(0 if ok else 1)
 
-    report_descriptive(cohorts["any"])
     for name, label in (
         ("any", "all systems"),
         ("umass", "UMass only"),
