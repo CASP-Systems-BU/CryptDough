@@ -192,6 +192,63 @@ ScanPlan BuildScanPlan(const BV& key) {
     return plan;
 }
 
+// Multi-key plan: the per-level "same group" bit is the AND over every key
+// column of that column's equality. The bits are arithmetic 0/1, so the AND is
+// a multiply -- one extra multiply per level per extra key, paid once when the
+// plan is built and then reused by every scan over that key.
+//
+// This is what lets the per-system re-sequencing keep the cached fast path: its
+// group key is the compound {subject_id, data_source}, not a single column.
+ScanPlan BuildScanPlan(const std::vector<BV>& keys) {
+    assert(!keys.empty());
+    if (keys.size() == 1) return BuildScanPlan(keys[0]);
+
+    EngineRef engine = keys[0].engine;
+    ScanPlan plan;
+    plan.n = keys[0].size();
+    plan.depth = ScanDepth(plan.n);
+
+    const std::vector<cdough::VectorSizeType> rev = ReverseMap(plan.n);
+    std::vector<BV> key_rev;
+    key_rev.reserve(keys.size());
+    for (const BV& k : keys) {
+        BV r(plan.n, engine);
+        r = k.mapping_reference(rev);
+        key_rev.push_back(r);
+    }
+
+    for (int pass = 0; pass < 2; ++pass) {
+        const std::vector<BV>& ks = (pass == 0) ? keys : key_rev;
+        std::vector<AV>& into = (pass == 0) ? plan.forward : plan.reverse;
+        for (int level = 0; level < plan.depth; ++level) {
+            const ScanLevel geom = PlanLevel(plan.n, level);
+            if (geom.count == 0) {
+                into.emplace_back(1, engine);
+                continue;
+            }
+            AV same(geom.count, engine);
+            for (size_t c = 0; c < ks.size(); ++c) {
+                BV a = ks[c].simple_subset_reference(
+                    geom.a_start, geom.step, geom.a_start + (geom.count - 1) * geom.step);
+                BV b = ks[c].simple_subset_reference(
+                    geom.b_start, geom.step, geom.b_start + (geom.count - 1) * geom.step);
+                AV eq = *((a == b)->b2a_bit());
+                eq.setPrecision(0);
+                if (c == 0) {
+                    same = eq;
+                } else {
+                    AV both = *(same * eq);
+                    both.setPrecision(0);
+                    same = both;
+                }
+                same.setPrecision(0);
+            }
+            into.push_back(same);
+        }
+    }
+    return plan;
+}
+
 // Per-group inclusive scan using a precomputed plan. Same contract as SegScan.
 void SegScanPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vector<AV>& out,
                     SegDirection dir) {
@@ -249,6 +306,24 @@ void SegTotalPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vecto
     }
 }
 
+// Single-column convenience wrapper for the planned scan, mirroring the
+// SegScan/SegTotal pair above.
+AV SegScanPlanned(const ScanPlan& plan, const AV& in, SegDirection dir) {
+    std::vector<AV> ins{in};
+    std::vector<AV> outs;
+    outs.emplace_back(in.size(), in.engine);
+    SegScanPlanned(plan, ins, outs, dir);
+    return outs[0];
+}
+
+AV SegTotalPlanned(const ScanPlan& plan, const AV& in) {
+    std::vector<AV> ins{in};
+    std::vector<AV> outs;
+    outs.emplace_back(in.size(), in.engine);
+    SegTotalPlanned(plan, ins, outs);
+    return outs[0];
+}
+
 // 1 on the first row of each run of equal keys (operators::distinct marks
 // exactly that, and always marks row 0).
 BV FirstOfGroup(std::vector<BV>& keys) {
@@ -282,6 +357,53 @@ AV LastOfGroupArith(std::vector<BV>& keys) {
     AV out = *(last.b2a_bit());
     out.setPrecision(0);
     return out;
+}
+
+// =============================================================================
+// Oblivious rank
+//
+// ROW_NUMBER() OVER (PARTITION BY keys ORDER BY <the order the rows already
+// sit in>). The table must ALREADY be sorted by (key, time) -- ranking does not
+// order anything, it only counts -- and the rank is then a segmented prefix sum
+// over a column of ones.
+// =============================================================================
+
+AV SegRank(std::vector<BV>& keys, const AV& ones, SegDirection dir = SegDirection::Forward) {
+    AV out = SegScan(keys, ones, dir);
+    out.setPrecision(0);
+    return out;
+}
+
+AV SegRankPlanned(const ScanPlan& plan, const AV& ones,
+                  SegDirection dir = SegDirection::Forward) {
+    AV out = SegScanPlanned(plan, ones, dir);
+    out.setPrecision(0);
+    return out;
+}
+
+// FIRST_VALUE(col) OVER (PARTITION BY keys ORDER BY ...) -- the value on each
+// group's first row, broadcast to every row of that group. `first` is the
+// arithmetic first-of-group indicator; zeroing every other row and taking the
+// group total leaves that one value everywhere. Used for index_dt, from which
+// the follow-up bands are measured.
+AV FirstValueSeed(const AV& col, const AV& first) {
+    AV c = Clone(col);
+    c.setPrecision(0);
+    AV f = Clone(first);
+    f.setPrecision(0);
+    AV seed = *(c * f);
+    seed.setPrecision(0);
+    return seed;
+}
+
+AV SegFirstValue(std::vector<BV>& keys, const AV& col, const AV& first) {
+    AV seed = FirstValueSeed(col, first);
+    return SegTotal(keys, seed);
+}
+
+AV SegFirstValuePlanned(const ScanPlan& plan, const AV& col, const AV& first) {
+    AV seed = FirstValueSeed(col, first);
+    return SegTotalPlanned(plan, seed);
 }
 
 // COUNT(DISTINCT key) over the rows where `mask` is 1.

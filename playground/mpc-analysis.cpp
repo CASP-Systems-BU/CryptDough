@@ -2,10 +2,9 @@
 //   https://cs-people.bu.edu/liagos/pilot/mpc_analysis_lineage.html
 //
 // Three patient-encounter tables in (any_system, umass_system, nonumass_system);
-// nineteen terminal outputs out -- two printed descriptive reports, three
-// one-row aggregate tables, and fourteen fitted regression models (six
-// specifications across three populations, minus the four interaction fits that
-// can only run on the pooled table). Nothing downstream consumes anything else:
+// seventeen terminal outputs out -- three one-row aggregate tables and fourteen
+// fitted regression models (six specifications across three populations, minus
+// the four interaction fits that can only run on the pooled table). Nothing downstream consumes anything else:
 // the pipeline is a wide fan-out, and every node reads a source table directly.
 //
 // This file holds only the driver: stage selection, ingestion, and the loop over
@@ -25,7 +24,7 @@
 //                  value-plus-gradient objective and an Armijo line search
 //   cohort.h       plaintext and secret-shared row layouts; synthetic
 //                  generator; per-party CSV ingestion
-//   nodes.h        d1a, d1b and sisa_perct_cnt x3
+//   nodes.h        sisa_perct_cnt x3
 //   regression.h   design matrices; IRLS (steps 6a/6b); flat ragged-cluster
 //                  Laplace mixed model with an analytic gradient
 //   reporting.h    coefficient tables and the plaintext IRLS oracle
@@ -40,21 +39,25 @@
 // Run:
 //   ../scripts/run_experiment.py -p 3 -r 200 mpc-analysis
 //   ./mpc-analysis -S kernels                 # accuracy harnesses only (fast)
-//   ./mpc-analysis -S describe -r 200         # ingestion + descriptive nodes
+//   ./mpc-analysis -S describe -r 200         # ingestion + aggregate nodes
 //   ./mpc-analysis -S models -r 200           # the fourteen fits
 //   ./mpc-analysis -S bench -r 200            # cost breakdown of one fit
 //   ./mpc-analysis -S models -r 200 -C 0      # ... with uncached segmented scans
-//   ./mpc-analysis -D /data -ra N -ru N -rn N  # per-party CSVs; only the owning
-//                                             # party opens each table, so the row
+//   ./mpc-analysis -O /tmp/dump               # dump both owners' halves of
+//                                             # cdrcatsse_match_pcc, and print the
+//                                             # manifest row counts to use with -D
+//   ./mpc-analysis -D /data -ra N -rb N       # read those halves back; each party
+//                                             # opens only its own file, so the row
 //                                             # counts come from the manifest
-//   ./mpc-analysis -pa 0 -pu 1 -pn 2          # who owns which table
-//   ./mpc-analysis -mv 64                     # public d1a histogram bound
-//   ./mpc-analysis -O /tmp/dump               # dump the synthetic cohort to CSV
+//   ./mpc-analysis -pa 0 -pb 1                # which party owns which half
+//   ./mpc-analysis -cc 50 -ic 5 -cl 1         # even split, 5% ID conflicts, and
+//                                             # run the conflict_list check
 
 #include "cdough.h"
 
 #include "./harness.h"
 #include "./reporting.h"
+#include "./secure.h"
 
 using namespace COMPILED_MPC_PROTOCOL_NAMESPACE;
 using namespace cdough::debug;
@@ -127,7 +130,7 @@ int main(int argc, char** argv) {
     // Which part of the program to run. The kernel and segmented-scan harnesses
     // are fast; the model fits are not, so they are separately selectable.
     //   kernels  - fixed-point, segmented-scan and linear-algebra accuracy only
-    //   describe - ingestion plus the descriptive and aggregate nodes
+    //   describe - ingestion plus the aggregate nodes
     //   bench    - cost breakdown of one mixed-model fit
     //   models   - the fourteen regression fits
     //   all      - everything (default)
@@ -140,27 +143,37 @@ int main(int argc, char** argv) {
 
     // Number of patients in the synthetic cohort. Ignored in CSV mode.
     const int num_subjects = engine.getArg<int>("subjects", "r", 200);
-    // Directory holding any_system.csv / umass_system.csv / nonumass_system.csv.
-    // Empty means "use the synthetic generator".
+    // Directory holding the two owners' halves of cdrcatsse_match_pcc. Empty
+    // means "use the synthetic generator". Each party opens only its own file.
     const std::string data_dir = engine.getArg<std::string>("data-dir", "D", "");
+    const std::string file_a = engine.getArg<std::string>("file-a", "fa", "base_owner_a.csv");
+    const std::string file_b = engine.getArg<std::string>("file-b", "fb", "base_owner_b.csv");
+    // Post-filter row counts, agreed in the run manifest. Required in CSV mode:
+    // both halves are padded to one public length, and a party that does not own
+    // a half cannot read its length from a file it is not allowed to see. These
+    // are the counts AFTER the flagged_dx pass-1 visit_type filter, which is the
+    // number of rows the owner actually contributes.
+    const int rows_a = engine.getArg<int>("rows-a", "ra", 0);
+    const int rows_b = engine.getArg<int>("rows-b", "rb", 0);
     // Where to dump the synthetic cohort for the R / Python / SQLite cross-checks.
     const std::string out_dir = engine.getArg<std::string>("out-dir", "O", "");
-    // Which party holds each table in the clear.
-    const int party_any = engine.getArg<int>("party-any", "pa", 0);
-    const int party_umass = engine.getArg<int>("party-umass", "pu", 0);
-    const int party_nonumass = engine.getArg<int>("party-nonumass", "pn", 0);
-    // Row counts, agreed in the run manifest. Required in CSV mode: a party that
-    // does not own a table still has to size its share vectors for it, and it
-    // cannot read the file to find out how long it is.
-    const int rows_any = engine.getArg<int>("rows-any", "ra", 0);
-    const int rows_umass = engine.getArg<int>("rows-umass", "ru", 0);
-    const int rows_nonumass = engine.getArg<int>("rows-nonumass", "rn", 0);
-    // Upper bound of the visits-per-patient histogram in node d1a. Public and
-    // identical on every party -- see the note in ReportD1a. Raise it if any
-    // patient could have more encounters than this; sweeping past the true
-    // maximum only costs a few cheap rounds and drops the empty buckets.
-    const long max_visits_sweep =
-        static_cast<long>(engine.getArg<int>("max-visits", "mv", 64));
+    // The two data owners. Each holds part of cdrcatsse_match_pcc in the clear
+    // and neither holds the union, so the merge and every window function run
+    // under MPC (tasks/0011).
+    const int party_a = engine.getArg<int>("party-a", "pa", 0);
+    const int party_b = engine.getArg<int>("party-b", "pb", 1);
+    // How strongly a patient's encounters concentrate at one owner. 1.0 gives
+    // each patient entirely to one side -- no overlap, and the merge is
+    // pointless; 0.5 splits every patient's history evenly.
+    const double concentration =
+        static_cast<double>(engine.getArg<int>("concentration", "cc", 70)) / 100.0;
+    // Fraction of patients carrying a DIFFERENT study ID at the second owner.
+    // This is what conflict_list exists to find and what neither owner can see.
+    const double id_conflict_rate =
+        static_cast<double>(engine.getArg<int>("id-conflicts", "ic", 0)) / 100.0;
+    // Run the cross-party conflict_list check. Off by default: it needs its own
+    // ordering, because MRN runs are not contiguous in a subject-sorted table.
+    const bool check_conflicts = engine.getArg<int>("conflict-list", "cl", 0) != 0;
     // 0 routes the segmented scans through aggregators::aggregate instead of the
     // cached per-level group bits, for A/B measurement.
     g_use_cached_scans = engine.getArg<int>("cached-scans", "C", 1) != 0;
@@ -168,51 +181,158 @@ int main(int argc, char** argv) {
     if (run_kernels) {
         TestNewKernels(engine, pID);
         TestSegmented(engine, pID);
+        TestTwoOwnerPipeline(engine, pID, 60, party_a, party_b);
         TestLinearAlgebra(engine, pID);
     }
     if (!run_describe && !run_bench) return 0;
 
     // ---------------------------------------------------------------- ingest
-    SyntheticTruth truth;
-    PlainCohort any_plain, umass_plain, nonumass_plain;
+    //
+    // The full lineage, starting at cdrcatsse_match_pcc:
+    //
+    //   cdrcatsse_match_pcc   generated, then split across two owners
+    //   pcc_mrn               MRN repair          -- row-local, at each owner
+    //   flagged_dx pass 1     filter + flags      -- row-local, at each owner
+    //   conflict_list         cross-party, under MPC
+    //   flagged_dx pass 2     cross-party, under MPC
+    //   umass / nonumass      cross-party, under MPC
+    //   the three *_system    projections, folded into the cohorts
+    GenTruth truth;
+    OwnerSplit split;
+    // Only the synthetic path can build the plaintext oracle, because the oracle
+    // needs the UNION -- which is exactly what no party holds in a real run.
+    const bool have_oracle = data_dir.empty();
 
     if (data_dir.empty()) {
-        any_plain = MakeSyntheticCohort(static_cast<size_t>(num_subjects), truth);
-        umass_plain = DeriveSystemCohort(any_plain, SystemScope::UMass);
-        nonumass_plain = DeriveSystemCohort(any_plain, SystemScope::NonUMass);
-        if (pID == 0 && !out_dir.empty()) {
-            WriteCohortCsv(any_plain, out_dir + "/" + CohortCsvName(SystemScope::Any));
-            WriteCohortCsv(umass_plain, out_dir + "/" + CohortCsvName(SystemScope::UMass));
-            WriteCohortCsv(nonumass_plain,
-                           out_dir + "/" + CohortCsvName(SystemScope::NonUMass));
-            std::cout << "wrote the synthetic cohort to " << out_dir << std::endl;
-        }
+        PlainBaseTable base = GenerateBaseTable(static_cast<size_t>(num_subjects), truth);
+        split = SplitAcrossOwners(base, concentration, id_conflict_rate);
     } else {
-        // Cross-organizational path: each party opens only the table it owns.
-        if (rows_any <= 0 || rows_umass <= 0 || rows_nonumass <= 0) {
+        if (rows_a <= 0 || rows_b <= 0) {
             if (pID == 0)
-                std::cerr << "FATAL: --data-dir needs --rows-any/--rows-umass/"
-                             "--rows-nonumass (the manifest row counts). A party that "
-                             "does not own a table cannot read its length from a file "
-                             "it is not allowed to see."
+                std::cerr << "FATAL: --data-dir needs --rows-a/--rows-b (the manifest "
+                             "row counts, after the pass-1 visit_type filter). Both "
+                             "halves are padded to one public length, and a party that "
+                             "does not own a half cannot read its length from a file it "
+                             "is not allowed to see."
                           << std::endl;
             return 1;
         }
-        any_plain = LoadOwnedCohort(data_dir, SystemScope::Any, party_any, pID,
-                                    static_cast<size_t>(rows_any));
-        umass_plain = LoadOwnedCohort(data_dir, SystemScope::UMass, party_umass, pID,
-                                      static_cast<size_t>(rows_umass));
-        nonumass_plain = LoadOwnedCohort(data_dir, SystemScope::NonUMass, party_nonumass,
-                                         pID, static_cast<size_t>(rows_nonumass));
+        // With a single party in the protocol this process stands in for every
+        // owner, so it must open both halves; otherwise each party opens only
+        // its own and the other stays empty until the shares arrive.
+        const bool simulate_all = (engine.getNumParties() <= 1);
+        split.a = LoadOwnedBaseTable(data_dir, file_a, party_a, pID, simulate_all);
+        split.b = LoadOwnedBaseTable(data_dir, file_b, party_b, pID, simulate_all);
     }
 
-    SecureCohort any = ShareCohort(engine, any_plain, party_any);
-    SecureCohort umass = ShareCohort(engine, umass_plain, party_umass);
-    SecureCohort nonumass = ShareCohort(engine, nonumass_plain, party_nonumass);
+    // --- each owner, over its own rows, in the clear -------------------------
+    // pcc_mrn and flagged_dx pass 1. Row-local, so this is the owner's own
+    // plaintext and nothing here crosses the wire.
+    ApplyMrnRepair(split.a);
+    ApplyMrnRepair(split.b);
+    PlainFlagged flagged_a = DeriveFlagged(split.a);
+    PlainFlagged flagged_b = DeriveFlagged(split.b);
+
+    size_t n_a = flagged_a.rows(), n_b = flagged_b.rows();
+    if (!data_dir.empty()) {
+        // A row-count disagreement does not fail cleanly later: the parties would
+        // pad to different lengths and the shares would not line up.
+        const bool simulate_all = (engine.getNumParties() <= 1);
+        auto check = [&](int owner, size_t got, int declared, const char* which) {
+            if ((simulate_all || pID == owner) && got != static_cast<size_t>(declared)) {
+                std::cerr << "FATAL: owner " << which << "'s half has " << got
+                          << " rows after the pass-1 filter but the manifest declares "
+                          << declared << ". Every party pads from the manifest, so these "
+                             "must agree exactly."
+                          << std::endl;
+                std::exit(1);
+            }
+        };
+        check(party_a, flagged_a.rows(), rows_a, "A");
+        check(party_b, flagged_b.rows(), rows_b, "B");
+        n_a = static_cast<size_t>(rows_a);
+        n_b = static_cast<size_t>(rows_b);
+    }
+
+    if (pID == 0 && !out_dir.empty() && have_oracle) {
+        // Dump the two halves as the owners would hold them, so -O then -D is a
+        // round trip.
+        WriteBaseTableCsv(split.a, out_dir + "/base_owner_a.csv");
+        WriteBaseTableCsv(split.b, out_dir + "/base_owner_b.csv");
+        WriteFlaggedCsv(flagged_a, out_dir + "/flagged_dx_owner_a.csv");
+        WriteFlaggedCsv(flagged_b, out_dir + "/flagged_dx_owner_b.csv");
+        std::cout << "wrote both owners' halves of cdrcatsse_match_pcc to " << out_dir
+                  << "\n  manifest row counts: --rows-a " << flagged_a.rows()
+                  << " --rows-b " << flagged_b.rows() << std::endl;
+    }
+
+    // --- conflict_list, under MPC -------------------------------------------
+    if (check_conflicts) {
+        std::vector<DataType> ma, sa_, mb, sb_;
+        for (size_t i = 0; i < split.a.rows(); ++i) {
+            ma.push_back(MrnToInt(split.a.pat_mrn[i]));
+            sa_.push_back(split.a.subject_id[i]);
+        }
+        for (size_t i = 0; i < split.b.rows(); ++i) {
+            mb.push_back(MrnToInt(split.b.pat_mrn[i]));
+            sb_.push_back(split.b.subject_id[i]);
+        }
+        const long secure_n =
+            SecureConflictCount(engine, ma, sa_, party_a, mb, sb_, party_b);
+        if (pID == 0 && !have_oracle) {
+            std::cout << "\n=== conflict_list ===\n"
+                      << "  MRNs mapping to more than one subject_id: " << secure_n
+                      << "  (no plaintext cross-check: it would need both owners' rows)"
+                      << std::endl;
+        }
+        if (pID == 0 && have_oracle) {
+            // The oracle has to be the UNION OF WHAT THE OWNERS HOLD, after the
+            // repair -- not the pre-split base table. A study-ID disagreement
+            // between the two owners does not exist until the split creates it,
+            // which is the whole reason this node cannot run at one owner.
+            PlainBaseTable union_held;
+            auto append = [&](const PlainBaseTable& t) {
+                for (size_t i = 0; i < t.rows(); ++i)
+                    union_held.PushRow(t.pat_mrn[i], t.subject_id[i], t.visit_type_pcc[i],
+                                       t.visit_major_type_pccc[i], t.admit_date_pcc[i],
+                                       t.diagnoses_pcc[i], t.visit_facility_pcc[i], t.dob[i],
+                                       t.gender_pcc[i], t.hispanic[i]);
+            };
+            append(split.a);
+            append(split.b);
+            const long plain_n = static_cast<long>(ConflictList(union_held).size());
+            std::cout << "\n=== conflict_list ===\n"
+                      << "  MRNs mapping to more than one subject_id: " << secure_n
+                      << "  (plaintext oracle over the union: " << plain_n << ")"
+                      << (secure_n == plain_n ? "  MATCH" : "  *** MISMATCH ***")
+                      << std::endl;
+        }
+    }
+
+    // The plaintext mirror of the cross-party half, over the union. NOTHING in a
+    // real deployment can compute this: it needs both halves, which is exactly
+    // what no party holds. It exists only in the synthetic path, where every
+    // party derives the same table from the same seed.
+    PlainCohort any_plain, umass_plain, nonumass_plain;
+    if (have_oracle) {
+        any_plain = SequencePlain(flagged_a, flagged_b, SystemScope::Any);
+        umass_plain = SequencePlain(flagged_a, flagged_b, SystemScope::UMass);
+        nonumass_plain = SequencePlain(flagged_a, flagged_b, SystemScope::NonUMass);
+    }
+
+    // --- merge, sequence, re-sequence per system -----------------------------
+    SecurePipeline pipeline =
+        RunSecurePipeline(engine, flagged_a, party_a, flagged_b, party_b, n_a, n_b);
+    SecureCohort& any = pipeline.any;
+    SecureCohort& umass = pipeline.umass;
+    SecureCohort& nonumass = pipeline.nonumass;
 
     if (pID == 0) {
         std::cout << "\n################ MPC analysis pipeline ################\n"
-                  << "source: " << (data_dir.empty() ? "synthetic cohort" : data_dir) << "\n"
+                  << "source: " << (data_dir.empty() ? "synthetic base table" : data_dir)
+                  << "\n"
+                  << "owner A rows " << n_a << " (party " << party_a << "), "
+                  << "owner B rows " << n_b << " (party " << party_b << ")\n"
                   << std::left << std::setw(20) << "table" << std::setw(12) << "rows"
                   << std::setw(12) << "padded" << std::setw(12) << "patients" << std::endl;
         for (const SecureCohort* c : {&any, &umass, &nonumass})
@@ -231,14 +351,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // ------------------------------------------------- descriptive and counts
+    // ------------------------------------------------------------- the counts
     if (print_describe) {
-        // PUBLIC bound, identical on every party. It cannot be read off the local
-        // plaintext: only the owning party has that, and this value decides how
-        // many collective operations node d1a performs. A disagreement
-        // desynchronises the protocol rather than producing a clean error.
-        ReportD1a(any, pID, max_visits_sweep);
-        ReportD1b(any, pID);
         ReportSisaCounts(any, pID);
         ReportSisaCounts(umass, pID);
         ReportSisaCounts(nonumass, pID);
@@ -267,7 +381,8 @@ int main(int argc, char** argv) {
         // the fixed-point floor. For the mixed models it is NOT the same
         // estimand -- it ignores the random intercept -- so it is reported as
         // context, with the generating parameters as the real reference.
-        if (pID == 0) {
+        // The oracle needs both halves, so it only exists in the synthetic path.
+        if (pID == 0 && have_oracle) {
             const PlainCohort& pc = PickPlain(any_plain, umass_plain, nonumass_plain, spec.scope);
             std::vector<double> x_rm, y, mask;
             size_t pp = 0;

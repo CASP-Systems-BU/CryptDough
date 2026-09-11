@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "./regression.h"
+#include "./secure.h"
 
 // Accuracy harnesses and the cost breakdown. Every kernel added by this
 // pipeline is checked against a plaintext oracle here before anything is
@@ -154,10 +155,13 @@ void TestSegmented(EngineRef engine, int party_id) {
     // --- expected values, in the clear ---
     std::map<DataType, double> group_sum;
     std::map<DataType, int> group_count;
+    std::map<DataType, double> group_first;
     std::set<DataType> distinct_masked;
     for (size_t i = 0; i < n_real; ++i) {
         group_sum[plain_keys_real[i]] += plain_vals_real[i];
         group_count[plain_keys_real[i]]++;
+        if (group_count[plain_keys_real[i]] == 1)
+            group_first[plain_keys_real[i]] = plain_vals_real[i];
         if (plain_mask_real[i]) distinct_masked.insert(plain_keys_real[i]);
     }
 
@@ -185,6 +189,29 @@ void TestSegmented(EngineRef engine, int party_id) {
     auto opened_first = first_b.open();
     AV n_distinct = CountDistinct(keys, mask_col);
     auto opened_nd = n_distinct.open();
+
+    // --- oblivious rank (ROW_NUMBER within key) ---
+    // A column of ones on the real rows is the entire input: forward leaves the
+    // 1-based position from the start of the group, reverse from the far end.
+    cdough::Vector<DataType> ov(n, 0);
+    for (size_t i = 0; i < n; ++i) ov[i] = i < n_real ? 1 : 0;
+    AV ones_col = engine.template secret_share_a<DataType>(ov, 0, 0);
+    ones_col.setPrecision(0);
+
+    AV rank_fwd = SegRank(keys, ones_col, SegDirection::Forward);
+    AV rank_rev = SegRank(keys, ones_col, SegDirection::Reverse);
+    AV rank_plan = SegRankPlanned(plan, ones_col, SegDirection::Forward);
+
+    AV first_bit = *(first_b.b2a_bit());
+    first_bit.setPrecision(0);
+    AV first_arith = *(first_bit * ones_col);
+    first_arith.setPrecision(0);
+    AV first_val = SegFirstValue(keys, val_col, first_arith);
+
+    auto opened_rank_fwd = rank_fwd.open();
+    auto opened_rank_rev = rank_rev.open();
+    auto opened_rank_plan = rank_plan.open();
+    auto opened_first_val = first_val.open();
 
     if (party_id != 0) return;
 
@@ -228,6 +255,37 @@ void TestSegmented(EngineRef engine, int party_id) {
                   << static_cast<int>(opened_last[i]) << std::endl;
     }
 
+    std::cout << "\n--- SegRank / SegFirstValue (ROW_NUMBER within key) ---\n"
+              << std::left << std::setw(6) << "row" << std::setw(6) << "key"
+              << std::setw(10) << "fwd(exp)" << std::setw(10) << "fwd(mpc)"
+              << std::setw(10) << "rev(exp)" << std::setw(10) << "rev(mpc)"
+              << std::setw(12) << "first(exp)" << std::setw(12) << "first(mpc)"
+              << std::endl;
+
+    long fwd = 0;
+    for (size_t i = 0; i < n_real; ++i) {
+        if (i == 0 || plain_keys_real[i] != plain_keys_real[i - 1]) fwd = 0;
+        ++fwd;
+        const long m = static_cast<long>(group_count[plain_keys_real[i]]);
+        const long exp_rev = m - fwd + 1;  // rank_fwd + rank_rev == m + 1
+        const long got_fwd = static_cast<long>(opened_rank_fwd[i]);
+        const long got_rev = static_cast<long>(opened_rank_rev[i]);
+        const long got_plan = static_cast<long>(opened_rank_plan[i]);
+        const double exp_fv = group_first[plain_keys_real[i]];
+        const double got_fv = static_cast<double>(opened_first_val[i]) / scale;
+
+        ok &= (got_fwd == fwd);
+        ok &= (got_rev == exp_rev);
+        // The cached Brent-Kung network must agree with aggregate() exactly.
+        ok &= (got_plan == got_fwd);
+        ok &= std::abs(exp_fv - got_fv) < 1e-3;
+
+        std::cout << std::left << std::setw(6) << i << std::setw(6) << plain_keys_real[i]
+                  << std::setw(10) << fwd << std::setw(10) << got_fwd
+                  << std::setw(10) << exp_rev << std::setw(10) << got_rev
+                  << std::setw(12) << exp_fv << std::setw(12) << got_fv << std::endl;
+    }
+
     const long got_nd = static_cast<long>(opened_nd[0]);
     const long exp_nd = static_cast<long>(distinct_masked.size());
     ok &= (got_nd == exp_nd);
@@ -240,6 +298,139 @@ void TestSegmented(EngineRef engine, int party_id) {
                       : "NO")
               << std::endl;
     std::cout << (ok ? "SEGMENTED HELPERS: PASS" : "SEGMENTED HELPERS: *** FAIL ***")
+              << std::endl;
+}
+
+// Checks the whole cross-party half -- oblivious merge, then both sequencing
+// passes -- against a plaintext run over the union.
+//
+// This is the test that matters for tasks/0011. The MPC table ends up sorted by
+// (subject_id, data_source, encounter_dt) while the oracle is in
+// (subject_id, encounter_dt) order, so the two are aligned by sorting the
+// opened rows on the oracle's key rather than compared positionally.
+void TestTwoOwnerPipeline(EngineRef engine, int party_id, size_t subjects, int party_a,
+                          int party_b) {
+    single_cout("\n================ two-owner merge and sequencing ================");
+
+    GenTruth truth;
+    PlainBaseTable base = GenerateBaseTable(subjects, truth, 424242);
+    OwnerSplit split = SplitAcrossOwners(base, 0.6, 0.0, 99);
+    ApplyMrnRepair(split.a);
+    ApplyMrnRepair(split.b);
+    PlainFlagged fa = DeriveFlagged(split.a);
+    PlainFlagged fb = DeriveFlagged(split.b);
+
+    SecurePipeline sp =
+        RunSecurePipeline(engine, fa, party_a, fb, party_b, fa.rows(), fb.rows());
+
+    auto o_subject = sp.any.subject_key.open();
+    auto o_dt = sp.any.encounter_dt.open();
+    auto o_valid = sp.any.valid.open();
+    auto o_visit = sp.any.visit_num.open();
+    auto o_index = sp.any.index_visit.open();
+    auto o_final = sp.any.final_visit.open();
+    auto o_fu = sp.any.fu_month.open();
+    auto o_present = sp.any.fu_present.open();
+    auto o_umass = sp.any.umass.open();
+
+    // The per-system pass, read off the UMass cohort.
+    auto u_valid = sp.umass.valid.open();
+    auto u_visit = sp.umass.visit_num.open();
+    auto u_index = sp.umass.index_visit.open();
+
+    if (party_id != 0) return;
+
+    struct Got {
+        long sid, dt, visit, index, fin, fu, present, umass;
+    };
+    std::vector<Got> got;
+    for (size_t i = 0; i < o_valid.size(); ++i) {
+        if (static_cast<long>(o_valid[i]) != 1) continue;
+        got.push_back(Got{static_cast<long>(o_subject[i]),
+                          static_cast<long>(o_dt[i]),  // unscaled: a day count
+                          static_cast<long>(o_visit[i]) / static_cast<long>(scale),
+                          static_cast<long>(o_index[i]), static_cast<long>(o_final[i]),
+                          static_cast<long>(o_fu[i]) / static_cast<long>(scale),
+                          static_cast<long>(o_present[i]), static_cast<long>(o_umass[i])});
+    }
+    std::stable_sort(got.begin(), got.end(), [](const Got& x, const Got& y) {
+        if (x.sid != y.sid) return x.sid < y.sid;
+        if (x.dt != y.dt) return x.dt < y.dt;
+        return x.umass > y.umass;
+    });
+
+    PlainCohort exp = SequencePlain(fa, fb, SystemScope::Any);
+    std::vector<size_t> ord(exp.rows());
+    std::iota(ord.begin(), ord.end(), size_t{0});
+    std::stable_sort(ord.begin(), ord.end(), [&](size_t x, size_t y) {
+        if (exp.subject_id[x] != exp.subject_id[y]) return exp.subject_id[x] < exp.subject_id[y];
+        if (exp.encounter_dt[x] != exp.encounter_dt[y])
+            return exp.encounter_dt[x] < exp.encounter_dt[y];
+        return exp.data_source[x] < exp.data_source[y];
+    });
+
+    bool ok = (got.size() == exp.rows());
+    std::cout << "  rows: merged " << got.size() << ", plaintext union " << exp.rows()
+              << (ok ? "  MATCH" : "  *** MISMATCH ***") << std::endl;
+
+    long bad_visit = 0, bad_index = 0, bad_final = 0, bad_fu = 0;
+    const size_t lim = std::min(got.size(), exp.rows());
+    for (size_t i = 0; i < lim; ++i) {
+        const size_t e = ord[i];
+        if (got[i].sid != static_cast<long>(exp.subject_id[e])) { ok = false; continue; }
+        if (got[i].visit != static_cast<long>(exp.visit_num[e])) ++bad_visit;
+        if (got[i].index != static_cast<long>(exp.index_visit[e])) ++bad_index;
+        if (got[i].fin != static_cast<long>(exp.final_visit[e])) ++bad_final;
+        const long exp_fu =
+            exp.fu_month_present[e] ? static_cast<long>(exp.fu_month[e]) : -1;
+        const long got_fu = got[i].present ? got[i].fu : -1;
+        if (exp_fu != got_fu) ++bad_fu;
+    }
+    ok &= (bad_visit == 0 && bad_index == 0 && bad_final == 0 && bad_fu == 0);
+
+    std::cout << "  visit_num mismatches   " << bad_visit << "\n"
+              << "  index_visit mismatches " << bad_index << "\n"
+              << "  final_visit mismatches " << bad_final << "\n"
+              << "  fu_month mismatches    " << bad_fu << std::endl;
+
+    // Per-system: every UMass row's visit_num must be its rank inside that
+    // patient's UMass history, which is strictly <= its global visit_num.
+    PlainCohort exp_u = SequencePlain(fa, fb, SystemScope::UMass);
+    std::map<long, long> umass_visits;
+    for (size_t i = 0; i < exp_u.rows(); ++i)
+        umass_visits[static_cast<long>(exp_u.subject_id[i])] =
+            std::max<long>(umass_visits[static_cast<long>(exp_u.subject_id[i])],
+                           static_cast<long>(exp_u.visit_num[i]));
+
+    std::map<long, long> got_umass_max;
+    long umass_rows = 0;
+    for (size_t i = 0; i < u_valid.size(); ++i) {
+        if (static_cast<long>(u_valid[i]) != 1) continue;
+        ++umass_rows;
+        const long sid = static_cast<long>(o_subject[i]);
+        got_umass_max[sid] = std::max<long>(
+            got_umass_max[sid], static_cast<long>(u_visit[i]) / static_cast<long>(scale));
+    }
+    bool umass_ok = (umass_rows == static_cast<long>(exp_u.rows()));
+    long bad_max = 0;
+    for (const auto& [sid, m] : umass_visits)
+        if (got_umass_max[sid] != m) ++bad_max;
+    umass_ok &= (bad_max == 0);
+
+    long idx_count = 0;
+    for (size_t i = 0; i < u_valid.size(); ++i)
+        if (static_cast<long>(u_valid[i]) == 1 && static_cast<long>(u_index[i]) == 1)
+            ++idx_count;
+    const long exp_idx = static_cast<long>(umass_visits.size());
+    umass_ok &= (idx_count == exp_idx);
+
+    std::cout << "  umass rows: merged " << umass_rows << ", plaintext " << exp_u.rows()
+              << "\n  umass per-patient visit totals wrong: " << bad_max
+              << "\n  umass index_visit rows " << idx_count << ", patients " << exp_idx
+              << std::endl;
+    ok &= umass_ok;
+
+    std::cout << (ok ? "TWO-OWNER PIPELINE: PASS" : "TWO-OWNER PIPELINE: *** FAIL ***")
               << std::endl;
 }
 

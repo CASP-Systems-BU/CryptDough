@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <fstream>
 #include <map>
+#include <numeric>
 #include <random>
 #include <set>
 #include <sstream>
@@ -68,6 +70,10 @@ const char* ScopeLabel(SystemScope s) {
 struct PlainCohort {
     SystemScope scope = SystemScope::Any;
     std::vector<DataType> subject_id;
+    // Encounter date as integer days from a fixed public epoch. This is the
+    // ordering key the sequencing is defined on; upstream it is
+    // admit_date_pcc / encounter_dt.
+    std::vector<DataType> encounter_dt;
     std::vector<DataType> newage;
     std::vector<DataType> gender;
     std::vector<DataType> hispanic;
@@ -82,25 +88,6 @@ struct PlainCohort {
 
     size_t rows() const { return subject_id.size(); }
 
-    // Sort by subject_id, then by visit_num within a patient. The segmented
-    // scans compare adjacent keys, so grouping is only correct once sorted.
-    void SortBySubject() {
-        std::vector<size_t> order(rows());
-        std::iota(order.begin(), order.end(), size_t{0});
-        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            if (subject_id[a] != subject_id[b]) return subject_id[a] < subject_id[b];
-            return visit_num[a] < visit_num[b];
-        });
-        auto permute = [&](std::vector<DataType>& v) {
-            std::vector<DataType> out(v.size());
-            for (size_t i = 0; i < order.size(); ++i) out[i] = v[order[i]];
-            v.swap(out);
-        };
-        permute(subject_id); permute(newage); permute(gender); permute(hispanic);
-        permute(index_visit); permute(visit_num); permute(final_visit);
-        permute(fu_month); permute(fu_month_present); permute(data_source);
-        permute(sisa); permute(sa);
-    }
 };
 
 // Secret-shared form. Flags and small integers are held as arithmetic 0/1 (or
@@ -115,6 +102,7 @@ struct SecureCohort {
 
     AV valid;         // 1 on real rows, 0 on pad rows (arithmetic)
     AV newage;        // scaled
+    AV encounter_dt;  // days from the public epoch, the ordering key
     AV visit_num;     // scaled
     AV fu_month;      // scaled
     AV fu_present;    // 0/1
@@ -123,7 +111,6 @@ struct SecureCohort {
     AV sisa;          // 0/1
     AV sa;            // 0/1
     AV umass;         // 0/1, 1 where data_source == 1
-    AV hispanic;      // 0/1 raw value (also used for the frequency table)
     std::vector<AV> gender_is;    // one 0/1 indicator per level in kGenderLevels
     std::vector<AV> hispanic_is;  // one 0/1 indicator per level in kHispanicLevels
 
@@ -137,6 +124,7 @@ struct SecureCohort {
           subject_key(padded, engine),
           valid(padded, engine),
           newage(padded, engine),
+          encounter_dt(padded, engine),
           visit_num(padded, engine),
           fu_month(padded, engine),
           fu_present(padded, engine),
@@ -145,7 +133,6 @@ struct SecureCohort {
           sisa(padded, engine),
           sa(padded, engine),
           umass(padded, engine),
-          hispanic(padded, engine),
           last_of_subject(padded, engine),
           first_of_subject(padded, engine) {}
 
@@ -159,406 +146,13 @@ struct SecureCohort {
     size_t num_subjects = 0;
 };
 
-// =============================================================================
-// Synthetic cohort
+// Everything downstream of PlainCohort -- the synthetic generator, the
+// three-table CSV schema, and ShareCohort -- was removed with task 0011. The
+// pipeline now starts at cdrcatsse_match_pcc (etl.h) and reaches shares
+// through the two-owner merge (secure.h), so a single-owner per-table import
+// no longer describes anything the pipeline does.
 //
-// Generated from a FIXED seed so every party derives an identical plaintext
-// table. That matters for more than reproducibility: the number of encounters
-// per patient is itself random, so a per-party RNG would give the parties
-// different row counts and the shares would not line up. Party 0's copy is the
-// one that gets secret shared; the others are used only as the oracle.
-// =============================================================================
-
-struct SyntheticTruth {
-    double beta0 = 0.0;
-    double beta_visit = 0.0;
-    double beta_fu = 0.0;
-    double beta_age = 0.0;
-    double sigma = 0.0;
-    double slope_diff = 0.0;  // the step 6 estimand: UMass vs non-UMass time slope
-};
-
-PlainCohort MakeSyntheticCohort(size_t num_subjects, SyntheticTruth& truth, uint64_t seed = 20260910ull) {
-    std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<double> uni(0.0, 1.0);
-    std::normal_distribution<double> gauss(0.0, 1.0);
-
-    truth.beta0 = -1.60;
-    truth.beta_visit = 0.11;
-    truth.beta_fu = 0.045;
-    truth.beta_age = -0.012;
-    truth.sigma = 0.70;
-    truth.slope_diff = 0.06;
-
-    PlainCohort c;
-    c.scope = SystemScope::Any;
-
-    for (size_t sid = 1; sid <= num_subjects; ++sid) {
-        // Right-skewed visit count. A large share of patients have exactly one
-        // encounter -- the lineage page notes those contribute no within-patient
-        // information to any of the trend models, so the distribution matters.
-        const double u = uni(rng);
-        int visits = 1;
-        if (u > 0.42) visits = 2;
-        if (u > 0.66) visits = 3;
-        if (u > 0.80) visits = 4;
-        if (u > 0.88) visits = 5 + static_cast<int>(uni(rng) * 4);
-        if (u > 0.97) visits = 9 + static_cast<int>(uni(rng) * 8);
-
-        const DataType gender = kGenderLevels[static_cast<size_t>(uni(rng) * 3.0) % 3];
-        const DataType hispanic = uni(rng) < 0.12 ? 1 : 0;
-        const int base_age = 14 + static_cast<int>(uni(rng) * 55.0);
-        const double u_subject = truth.sigma * gauss(rng);
-        // A patient's encounters mostly stay inside one system.
-        const double umass_propensity = uni(rng) < 0.55 ? 0.85 : 0.15;
-
-        for (int v = 1; v <= visits; ++v) {
-            const bool is_umass = uni(rng) < umass_propensity;
-            const DataType data_source = is_umass ? 1 : 2;
-
-            // fu_month is null outside the windows and on a same-day repeat.
-            DataType fu = 0, fu_present = 1;
-            if (v == 1) {
-                fu = 0;
-            } else {
-                const double f = uni(rng);
-                if (f < 0.28) fu = 1;
-                else if (f < 0.58) fu = 3;
-                else if (f < 0.82) fu = 6;
-                else fu_present = 0;  // beyond 182 days, or a same-day repeat
-            }
-
-            const double time_visit = static_cast<double>(v);
-            const double time_fu = static_cast<double>(fu);
-            const double age = base_age + (v - 1) * 0.4;
-            const double slope = truth.beta_visit + (is_umass ? truth.slope_diff : 0.0);
-            const double eta = truth.beta0 + slope * time_visit +
-                               truth.beta_fu * time_fu + truth.beta_age * (age - 40.0) +
-                               (gender == 1 ? 0.18 : 0.0) + (hispanic == 1 ? 0.10 : 0.0) +
-                               u_subject;
-            const double prob = 1.0 / (1.0 + std::exp(-eta));
-            const DataType sisa = uni(rng) < prob ? 1 : 0;
-            const DataType sa = (sisa == 1 && uni(rng) < 0.35) ? 1 : 0;
-
-            c.subject_id.push_back(static_cast<DataType>(sid));
-            c.newage.push_back(static_cast<DataType>(std::llround(age)));
-            c.gender.push_back(gender);
-            c.hispanic.push_back(hispanic);
-            c.index_visit.push_back(v == 1 ? 1 : 0);
-            c.visit_num.push_back(v);
-            c.final_visit.push_back(v == visits ? 1 : 0);
-            c.fu_month.push_back(fu);
-            c.fu_month_present.push_back(fu_present);
-            c.data_source.push_back(data_source);
-            c.sisa.push_back(sisa);
-            c.sa.push_back(sa);
-        }
-    }
-    c.SortBySubject();
-    return c;
-}
-
-// Derive umass_system / nonumass_system from any_system, the way the upstream
-// ETL does: filter on data_source, then RE-SEQUENCE the per-system columns,
-// because a patient's third encounter overall may be their first in this system.
-//
-// The `reproduce_etl_bug` flag deliberately reproduces the fault documented on
-// the lineage page: the ETL sets fu_month<sfx> = 0 by testing the GLOBAL
-// index_visit rather than index_visit<sfx>, so a patient whose history in this
-// system starts later than their overall history gets NULL on their first row
-// here. It is on by default because the point of the port is to match the
-// pipeline as it actually runs, not as it was meant to.
-PlainCohort DeriveSystemCohort(const PlainCohort& any, SystemScope scope,
-                               bool reproduce_etl_bug = true) {
-    const DataType want = (scope == SystemScope::UMass) ? 1 : 2;
-    PlainCohort c;
-    c.scope = scope;
-
-    // Rows for this system, in the order they already appear (sorted by subject).
-    std::vector<size_t> rows;
-    for (size_t i = 0; i < any.rows(); ++i)
-        if (any.data_source[i] == want) rows.push_back(i);
-
-    size_t i = 0;
-    while (i < rows.size()) {
-        size_t j = i;
-        while (j < rows.size() && any.subject_id[rows[j]] == any.subject_id[rows[i]]) ++j;
-        const size_t count = j - i;
-        for (size_t k = 0; k < count; ++k) {
-            const size_t src = rows[i + k];
-            const int v = static_cast<int>(k) + 1;
-
-            DataType fu = any.fu_month[src];
-            DataType fu_present = any.fu_month_present[src];
-            if (v == 1) {
-                if (reproduce_etl_bug && any.index_visit[src] != 1) {
-                    // First encounter in THIS system, but not the patient's first
-                    // overall: the upstream guard misses it and leaves it null.
-                    fu = 0;
-                    fu_present = 0;
-                } else {
-                    fu = 0;
-                    fu_present = 1;
-                }
-            }
-
-            c.subject_id.push_back(any.subject_id[src]);
-            c.newage.push_back(any.newage[src]);
-            c.gender.push_back(any.gender[src]);
-            c.hispanic.push_back(any.hispanic[src]);
-            c.index_visit.push_back(v == 1 ? 1 : 0);
-            c.visit_num.push_back(v);
-            c.final_visit.push_back(k + 1 == count ? 1 : 0);
-            c.fu_month.push_back(fu);
-            c.fu_month_present.push_back(fu_present);
-            c.data_source.push_back(any.data_source[src]);
-            c.sisa.push_back(any.sisa[src]);
-            c.sa.push_back(any.sa[src]);
-        }
-        i = j;
-    }
-    return c;
-}
-
-// =============================================================================
-// Ingestion
-//
-// Each of the three tables has a designated input party that holds it in the
-// clear, mirroring examples/ex6_three_party_private_input.cpp and
-// docker/DEPLOYMENT.md: every party calls the loader, only the owner opens the
-// file, and plaintext never crosses the wire.
-//
-// Because the owner holds the table, the sort by subject_id and the categorical
-// indicator coding are done locally in plaintext before sharing. That reveals
-// nothing the owner does not already know and avoids an oblivious sort over the
-// whole table. A deployment in which NO party holds any_system in the clear
-// would need an oblivious sort and merge instead; that is out of scope here.
-// =============================================================================
-
-// Column order of the CSV. Bracketed names mark the columns that would be
-// B-shared under the EncodedTable convention; kept here for documentation and
-// so the header check is exact.
-const std::vector<std::string> kCsvHeader = {
-    "[subject_id]", "newage",      "[gender]",       "[hispanic]",
-    "[index_visit]", "visit_num",  "[final_visit]",  "[fu_month]",
-    "[fu_month_present]", "[data_source]", "[sisa]", "[sa]"};
-
-std::string CohortCsvName(SystemScope scope) {
-    return std::string(ScopeName(scope)) + ".csv";
-}
-
-// Write a cohort out in the exact format the loader expects. Used to dump the
-// synthetic cohort for the R / Python / SQLite cross-checks.
-void WriteCohortCsv(const PlainCohort& c, const std::string& path) {
-    std::ofstream out(path);
-    if (!out) {
-        std::cerr << "could not open " << path << " for writing" << std::endl;
-        return;
-    }
-    for (size_t i = 0; i < kCsvHeader.size(); ++i)
-        out << kCsvHeader[i] << (i + 1 == kCsvHeader.size() ? '\n' : ',');
-    for (size_t i = 0; i < c.rows(); ++i) {
-        out << c.subject_id[i] << ',' << c.newage[i] << ',' << c.gender[i] << ','
-            << c.hispanic[i] << ',' << c.index_visit[i] << ',' << c.visit_num[i] << ','
-            << c.final_visit[i] << ',' << c.fu_month[i] << ',' << c.fu_month_present[i] << ','
-            << c.data_source[i] << ',' << c.sisa[i] << ',' << c.sa[i] << '\n';
-    }
-}
-
-// Read a cohort CSV. Header order is free -- columns are matched by name, as
-// EncodedTable::inputCSVTableData does -- but every expected name must be
-// present. Values are integers only.
-PlainCohort ReadCohortCsv(const std::string& path, SystemScope scope) {
-    PlainCohort c;
-    c.scope = scope;
-    std::ifstream in(path);
-    if (!in) {
-        std::cerr << "FATAL: could not open " << path << std::endl;
-        std::exit(1);
-    }
-
-    std::string line;
-    if (!std::getline(in, line)) {
-        std::cerr << "FATAL: " << path << " is empty" << std::endl;
-        std::exit(1);
-    }
-
-    std::vector<std::string> header;
-    {
-        std::stringstream ss(line);
-        std::string tok;
-        while (std::getline(ss, tok, ',')) {
-            while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' ')) tok.pop_back();
-            header.push_back(tok);
-        }
-    }
-    std::map<std::string, size_t> pos;
-    for (size_t i = 0; i < header.size(); ++i) pos[header[i]] = i;
-    for (const std::string& want : kCsvHeader) {
-        if (pos.find(want) == pos.end()) {
-            std::cerr << "FATAL: column " << want << " missing from " << path << std::endl;
-            std::exit(1);
-        }
-    }
-
-    auto* const targets = new std::vector<DataType>*[kCsvHeader.size()]{
-        &c.subject_id, &c.newage, &c.gender, &c.hispanic,
-        &c.index_visit, &c.visit_num, &c.final_visit, &c.fu_month,
-        &c.fu_month_present, &c.data_source, &c.sisa, &c.sa};
-
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        std::vector<std::string> fields;
-        std::stringstream ss(line);
-        std::string tok;
-        while (std::getline(ss, tok, ',')) fields.push_back(tok);
-        for (size_t k = 0; k < kCsvHeader.size(); ++k) {
-            const size_t idx = pos[kCsvHeader[k]];
-            targets[k]->push_back(idx < fields.size()
-                                      ? static_cast<DataType>(std::stoll(fields[idx]))
-                                      : DataType{0});
-        }
-    }
-    delete[] targets;
-
-    c.SortBySubject();
-    return c;
-}
-
-// A placeholder cohort of `rows` zero-filled rows, for a party that does not own
-// this table.
-//
-// Only the owner ever holds the plaintext. Every other party still has to
-// allocate share vectors of exactly the same length, so the row count is public
-// and comes from the run manifest rather than from the file. The contents are
-// irrelevant: secret_share_* distributes the OWNER's vector, and a non-owner's
-// copy is read only for its shape.
-PlainCohort PlaceholderCohort(SystemScope scope, size_t rows) {
-    PlainCohort c;
-    c.scope = scope;
-    auto fill = [rows](std::vector<DataType>& v) { v.assign(rows, DataType{0}); };
-    fill(c.subject_id); fill(c.newage); fill(c.gender); fill(c.hispanic);
-    fill(c.index_visit); fill(c.visit_num); fill(c.final_visit);
-    fill(c.fu_month); fill(c.fu_month_present); fill(c.data_source);
-    fill(c.sisa); fill(c.sa);
-    return c;
-}
-
-// Load one table for a cross-organizational run: the owner opens the file, every
-// other party allocates a placeholder of the agreed length.
-//
-// This is the same contract as EncodedTable::inputCSVTableData
-// (encoded_table.h:492) -- every party calls it, only the owner touches the
-// plaintext, and the plaintext never crosses the network.
-PlainCohort LoadOwnedCohort(const std::string& data_dir, SystemScope scope, int owner,
-                            int party_id, size_t declared_rows) {
-    if (party_id != owner) return PlaceholderCohort(scope, declared_rows);
-
-    PlainCohort c = ReadCohortCsv(data_dir + "/" + CohortCsvName(scope), scope);
-    if (declared_rows != 0 && c.rows() != declared_rows) {
-        // A row-count mismatch does not fail cleanly further on: the parties would
-        // allocate different vector lengths and the shares would not line up.
-        std::cerr << "FATAL: " << CohortCsvName(scope) << " has " << c.rows()
-                  << " rows but the manifest declares " << declared_rows
-                  << ". Every party sizes its share vectors from the manifest, so "
-                     "these must agree exactly."
-                  << std::endl;
-        std::exit(1);
-    }
-    return c;
-}
-
-// Secret share a plaintext cohort from `input_party`. Non-owning parties pass a
-// PlainCohort of the same shape with zero contents; only the row count and the
-// schema have to agree across parties.
-SecureCohort ShareCohort(EngineRef engine, const PlainCohort& c, int input_party) {
-    const size_t n = c.rows();
-    const size_t np = NextPowerOfTwo(std::max<size_t>(n, 2));
-    SecureCohort sc(engine, n, np);
-    sc.scope = c.scope;
-
-
-    // Pad rows carry the key sentinel (so they form their own segment under both
-    // scan directions) and zeros everywhere else (so they contribute nothing).
-    auto share_int = [&](const std::vector<DataType>& src) {
-        cdough::Vector<DataType> v(np, 0);
-        for (size_t i = 0; i < np; ++i) v[i] = i < n ? src[i] : DataType{0};
-        AV out = engine.template secret_share_a<DataType>(v, input_party, 0);
-        out.setPrecision(0);
-        return out;
-    };
-    auto share_scaled = [&](const std::vector<DataType>& src) {
-        cdough::Vector<DataType> v(np, precision);
-        for (size_t i = 0; i < np; ++i)
-            v[i] = i < n ? static_cast<DataType>(src[i]) * DataType(scale) : DataType{0};
-        AV out = engine.template secret_share_a<DataType>(v, input_party, precision);
-        out.setPrecision(0);
-        return out;
-    };
-    auto share_indicator = [&](const std::vector<DataType>& src, DataType level) {
-        cdough::Vector<DataType> v(np, 0);
-        for (size_t i = 0; i < np; ++i) v[i] = (i < n && src[i] == level) ? 1 : 0;
-        AV out = engine.template secret_share_a<DataType>(v, input_party, 0);
-        out.setPrecision(0);
-        return out;
-    };
-
-    {
-        cdough::Vector<DataType> kv(np, 0);
-        for (size_t i = 0; i < np; ++i) kv[i] = i < n ? c.subject_id[i] : kKeySentinel;
-        sc.subject_key = engine.template secret_share_b<DataType>(kv, input_party);
-    }
-    sc.keys.push_back(sc.subject_key);
-
-    {
-        cdough::Vector<DataType> vv(np, 0);
-        for (size_t i = 0; i < np; ++i) vv[i] = i < n ? 1 : 0;
-        sc.valid = engine.template secret_share_a<DataType>(vv, input_party, 0);
-        sc.valid.setPrecision(0);
-    }
-
-    sc.newage = share_scaled(c.newage);
-    sc.visit_num = share_scaled(c.visit_num);
-    sc.fu_month = share_scaled(c.fu_month);
-    sc.fu_present = share_int(c.fu_month_present);
-    sc.index_visit = share_int(c.index_visit);
-    sc.final_visit = share_int(c.final_visit);
-    sc.sisa = share_int(c.sisa);
-    sc.sa = share_int(c.sa);
-    sc.hispanic = share_int(c.hispanic);
-    sc.umass = share_indicator(c.data_source, 1);
-
-    for (DataType lvl : kGenderLevels) sc.gender_is.push_back(share_indicator(c.gender, lvl));
-    for (DataType lvl : kHispanicLevels)
-        sc.hispanic_is.push_back(share_indicator(c.hispanic, lvl));
-
-    // Group-boundary indicators, computed once and reused by every node. The
-    // AND with `valid` is what keeps the sentinel pad block from contributing a
-    // spurious final group.
-    AV last = LastOfGroupArith(sc.keys);
-    sc.last_of_subject = *(last * sc.valid);
-    sc.last_of_subject.setPrecision(0);
-
-    BV first_b = FirstOfGroup(sc.keys);
-    AV first = *(first_b.b2a_bit());
-    first.setPrecision(0);
-    sc.first_of_subject = *(first * sc.valid);
-    sc.first_of_subject.setPrecision(0);
-
-    sc.scan_plan = BuildScanPlan(sc.subject_key);
-
-    // Derived from the shares rather than counted in the local plaintext: in a
-    // cross-organizational run only the owning party has the plaintext, and this
-    // value has to be identical on every party. It is a legitimate disclosure --
-    // the patient count is the first column both descriptive nodes publish.
-    {
-        AV first_count = sc.first_of_subject.chunkedSum(np);
-        first_count.setPrecision(0);
-        sc.num_subjects = static_cast<size_t>(std::llround(OpenScalar(first_count, false)));
-    }
-
-    return sc;
-}
-
+// PlainCohort itself stays: SequencePlain (secure.h) builds one as the oracle
+// the fits are scored against in reporting.h.
 
 }  // namespace cdough::regression
