@@ -10,50 +10,49 @@
 // Run with:
 //   ../scripts/run_experiment.py -p 3 -s same long-lr
 //
-// CURRENT SETTING -- this file is checked out at kNumGroups = 5, kObsPerGroup =
-// 100, which is the configuration that was actually run to completion, NOT the
-// 300 x 25 of the plaintext reference. Set kNumGroups = 300 and kObsPerGroup =
-// 25 to get the reference workload; doing so also arms the hard tolerance
-// assertions (see kEnforceToleranceAsserts).
+// IMPLEMENTATION -- this program now uses the VECTORIZED objective and optimizer
+// (semantic task 0014). The whole dataset lives in one buffer and every
+// operation is applied to it at once, so circuit depth no longer scales with
+// group count or parameter count. The serial implementation it replaced is
+// preserved as `cdough::regression::reference` for differential testing and is
+// scheduled for deletion in semantic task 0015.
 //
-// COST -- read before launching at reference scale. `NegMarginalLogLik` walks
-// groups sequentially while observations within a group are vectorised, so
-// `kNumGroups` is what costs money and `kObsPerGroup` is nearly free. Measured
-// on the 3-party local setup at dim 13:
+// COST -- the numbers below are for the SERIAL implementation and are kept only
+// as the "before" side of the comparison. They are NOT valid for this program
+// any more.
 //
-//   groups  obs/group  total obs   per BFGS iteration
-//        4         25        100         ~44 s
-//        5        100        500         ~70 s   <- 4x the obs, only ~1.6x cost
-//       20         25        500        ~430 s   <- same total obs, 6x the cost
+//   serial, dim 13:  ~11-14 s per group per BFGS iteration; 500 observations in
+//                    20 groups cost ~6x the same 500 in 5 groups, because groups
+//                    were walked sequentially.
 //
-// The last two rows carry identical total observations and differ 6x in cost, so
-// do not size this workload by observation count. Roughly 11-14 s per group per
-// BFGS iteration.
+// Measured after vectorization, on the secure-logistic-regression differential
+// harness (8 groups x 16 obs, dim 3, 5 BFGS iterations):
 //
-// At the reference's 300 groups that is ~55 min per iteration if cost is linear
-// in group count, and the 20-group row hints it may be worse than linear. A
-// converged run took 30 iterations at 5 groups, so budget upward of ~27 hours
-// and treat that as a lower bound. `kNumGroups` below is the knob.
+//   serial  147.1 s      batched  12.9 s      ~11.4x
 //
-// VALIDATION STATE (see semantic task 0013 for the full record):
-//   Exercised   -- compiles clean at both 5 x 100 and 300 x 25. A 5 x 100 run
-//                  completed the whole program: dataset generation, secret
-//                  sharing, the secure objective, 30 BFGS iterations to
-//                  convergence, recovering the estimates, Exp(s_hat), the opens,
-//                  the estimate table, the tolerance report, and `return 0`. All
-//                  13 estimates landed inside the 0.25 tolerance on 500
-//                  observations.
-//   NOT exercised -- the reference's 300 x 25 configuration. No run at that
-//                  scale has completed, so its runtime, convergence, and
-//                  accumulated fixed-point error are projections, not
-//                  measurements. The hard tolerance assertions only bind there
-//                  (see kEnforceToleranceAsserts), so they have never fired.
-//   Watch item   -- the 5 x 100 run estimated sigma at 0.5273 against a truth of
-//                  0.7000, the only plainly systematic error in that fit. Most
-//                  likely the known downward bias of variance-component
-//                  estimation with few clusters, but unconfirmed: run the
-//                  plaintext reference at the same seed and group count to see
-//                  whether it agrees.
+// That is the *smallest* configuration measured; the serial side scales with
+// group count and parameter count while the batched side largely does not, so
+// the gap should widen at this program's scale. No measurement at 300 groups
+// exists yet, so treat the reference-scale runtime as unknown rather than
+// projected -- see semantic personality note 0004 P-01.
+//
+// VALIDATION STATE (see semantic tasks 0013 and 0014):
+//   Exercised   -- compiles clean. The batched objective, gradient, and BFGS are
+//                  differentially validated against the serial implementation on
+//                  identical secret values in secure-logistic-regression,
+//                  including ragged group sizes and a full 5-iteration fit that
+//                  tracks the serial trajectory step for step.
+//   NOT exercised -- this program at the reference's 300 x 25 configuration. No
+//                  run at that scale has completed, so its runtime, convergence,
+//                  and accumulated fixed-point error are unmeasured. The hard
+//                  tolerance assertions only bind there (see
+//                  kEnforceToleranceAsserts), so they have never fired.
+//   Watch item   -- an earlier serial run at 5 x 100 estimated sigma at 0.5273
+//                  against a truth of 0.7000, the only plainly systematic error
+//                  in that fit. Most likely the known downward bias of
+//                  variance-component estimation with few clusters, but
+//                  unconfirmed: run the plaintext reference at the same seed and
+//                  group count to see whether it agrees.
 
 #include <algorithm>
 #include <cassert>
@@ -73,7 +72,6 @@ using namespace COMPILED_MPC_PROTOCOL_NAMESPACE;
 using namespace cdough::debug;
 using namespace cdough::service;
 using namespace cdough::regression;
-using namespace cdough::regression::mixedeffects;
 
 namespace {
 
@@ -81,16 +79,16 @@ namespace {
 // Workload configuration
 // ---------------------------------------------------------------------------
 
-// Scale. `kNumGroups` dominates the run time -- see the COST note above.
-constexpr std::size_t kNumGroups = 300;
-constexpr std::size_t kObsPerGroup = 25;
+// Scale. After vectorization `kNumGroups` no longer drives circuit depth, but it
+// does drive vector width and memory -- see the COST note above.
+constexpr std::size_t kNumGroups = 5;
+constexpr std::size_t kObsPerGroup = 100;
 constexpr unsigned int kSeed = 20260730u;
 
-// BFGS iteration cap, matching the plaintext reference's default. MinimizeBFGS
-// normally exits on its convergence or "no descent found" branch well before
-// this (7-12 iterations in every run observed so far), so the cap is a safety
-// net rather than the expected count. At the shipped scale each iteration costs
-// ~25-30 min, so a run that genuinely reached this cap would take days.
+// BFGS iteration cap, matching the plaintext reference's default.
+// MinimizeBFGSBatched normally exits on its convergence or "no descent found"
+// branch well before this (7-30 iterations in every run observed so far), so the
+// cap is a safety net rather than the expected count.
 constexpr int kMaxBfgsIterations = 300;
 
 // Ground truth: an intercept plus eleven covariates, and a moderate
@@ -118,8 +116,8 @@ constexpr bool kEnforceToleranceAsserts =
 // ---------------------------------------------------------------------------
 
 // Row-wise synthetic dataset, matching the plaintext reference's `Dataset`.
-// Secret sharing transposes each group into the column-wise layout that
-// mixedeffects::ClusterGroup expects.
+// Secret sharing flattens it into the single group-major buffer that
+// mixedeffects::BatchedDataset expects.
 struct PlainDataset {
     std::vector<std::vector<std::vector<double>>> x;  // [group][obs][fixed]
     std::vector<std::vector<double>> y;               // [group][obs]
@@ -256,28 +254,28 @@ int main(int argc, char** argv) {
     //    column-wise, one AV of length kObsPerGroup per fixed effect, so each
     //    group's rows are transposed on the way in.
     // -----------------------------------------------------------------------
-    Dataset secure_dataset;
-    secure_dataset.num_fixed = num_fixed;
-    secure_dataset.groups.reserve(kNumGroups);
-
+    // One flat buffer for the whole design matrix, rows ordered group-major
+    // (row = g * kObsPerGroup + j), plus y and the padding mask. Groups here are
+    // uniform, so the mask is all ones -- it is carried anyway so that the one
+    // code path serves ragged data too.
+    cdough::Vector<DataType> x_flat(num_obs_total * num_fixed, precision);
+    cdough::Vector<DataType> y_flat(num_obs_total, precision);
+    cdough::Vector<DataType> mask_flat(num_obs_total, precision);
     for (std::size_t g = 0; g < kNumGroups; ++g) {
-        cdough::Vector<DataType> plain_y(kObsPerGroup, precision);
         for (std::size_t j = 0; j < kObsPerGroup; ++j) {
-            plain_y[j] = static_cast<DataType>(std::llround(data.y[g][j] * scale));
-        }
-        AV group_y = engine.secret_share_a(plain_y, 0, precision);
-
-        std::vector<AV> group_x_cols;
-        group_x_cols.reserve(num_fixed);
-        for (std::size_t k = 0; k < num_fixed; ++k) {
-            cdough::Vector<DataType> plain_col(kObsPerGroup, precision);
-            for (std::size_t j = 0; j < kObsPerGroup; ++j) {
-                plain_col[j] = static_cast<DataType>(std::llround(data.x[g][j][k] * scale));
+            const std::size_t row = g * kObsPerGroup + j;
+            y_flat[row] = static_cast<DataType>(std::llround(data.y[g][j] * scale));
+            mask_flat[row] = static_cast<DataType>(scale);
+            for (std::size_t k = 0; k < num_fixed; ++k) {
+                x_flat[row * num_fixed + k] =
+                    static_cast<DataType>(std::llround(data.x[g][j][k] * scale));
             }
-            group_x_cols.push_back(engine.secret_share_a(plain_col, 0, precision));
         }
-        secure_dataset.groups.emplace_back(std::move(group_y), std::move(group_x_cols));
     }
+    mixedeffects::BatchedDataset secure_dataset(engine.secret_share_a(x_flat, 0, precision),
+                                                engine.secret_share_a(y_flat, 0, precision),
+                                                engine.secret_share_a(mask_flat, 0, precision),
+                                                kNumGroups, kObsPerGroup, num_fixed);
 
     if (pID == 0) {
         std::cout << "Secret-shared " << kNumGroups << " groups (" << num_fixed
@@ -289,43 +287,40 @@ int main(int argc, char** argv) {
     //    function of the packed parameter vector [beta_0..beta_{p-1}, s] with
     //    sigma = exp(s). Start the fixed effects at 0 and sigma at 1 (s = 0).
     // -----------------------------------------------------------------------
-    const std::function<AV(const std::vector<AV>&)> objective =
-        [&secure_dataset](const std::vector<AV>& params) -> AV {
-            return NegMarginalLogLik(secure_dataset, params);
-        };
+    const BatchedObjective objective = [&secure_dataset](const AV& params,
+                                                         std::size_t num_points) -> AV {
+        return mixedeffects::NegMarginalLogLikBatched(secure_dataset, params, num_points);
+    };
 
-    std::vector<AV> initial_params;
-    initial_params.reserve(num_fixed + 1);
-    for (std::size_t k = 0; k < num_fixed + 1; ++k) {
-        initial_params.push_back(ShareScalar(0.0, engine));
-    }
+    // The whole parameter vector is one AV of length num_fixed + 1.
+    cdough::Vector<DataType> initial_flat(num_fixed + 1, precision);
+    AV initial_params = engine.secret_share_a(initial_flat, 0, precision);
 
     if (pID == 0) {
         std::cout << "Running MinimizeBFGS (cap " << kMaxBfgsIterations << " iterations)..."
                   << std::endl;
     }
 
-    const OptResult fit = MinimizeBFGS(objective, initial_params, kMaxBfgsIterations);
+    const BatchedOptResult fit =
+        MinimizeBFGSBatched(objective, initial_params, kMaxBfgsIterations);
 
     // -----------------------------------------------------------------------
     // 4. Recover the estimates. sigma = exp(s), so sigma_hat is Exp(s_hat);
     //    there is no secure square root, and none is needed. The arithmetic
     //    stays secure and only the reporting boundary opens values.
     // -----------------------------------------------------------------------
-    std::vector<AV> beta_hat_shared;
-    AV sigma2_hat(1, engine);
-    sigma2_hat.setPrecision(precision);
-    UnpackParameters(fit.params, num_fixed, beta_hat_shared, sigma2_hat);
-
-    AV s_hat = fit.params[num_fixed];
+    AV s_hat = fit.params.slice(num_fixed, num_fixed + 1);
     s_hat.setPrecision(precision);
     AV sigma_hat_shared = Exp(s_hat);
     sigma_hat_shared.setPrecision(precision);
 
+    // One open for the whole parameter vector, where the serial version needed
+    // one per coefficient.
+    auto opened_params = fit.params.open();
     std::vector<double> beta_hat;
     beta_hat.reserve(num_fixed);
     for (std::size_t k = 0; k < num_fixed; ++k) {
-        beta_hat.push_back(OpenScalar(beta_hat_shared[k]));
+        beta_hat.push_back(static_cast<double>(opened_params[k]) / scale);
     }
     const double sigma_hat = OpenScalar(sigma_hat_shared);
     const double final_objective = OpenScalar(fit.value);

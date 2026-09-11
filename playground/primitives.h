@@ -48,7 +48,6 @@ constexpr int kMaxNewtonStep = 4;
 constexpr int kNewtonIterations = 5;
 
 // Use these helpers wherever a copy is going to be written to.
-// The std::vector<AV> overload lives in optimizer.h, beside the other container helpers.
 AV Clone(const AV& v) {
     AV out(v.size(), v.engine);
     out = v;

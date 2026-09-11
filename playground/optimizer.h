@@ -8,29 +8,6 @@ namespace cdough::regression {
 // BFGS Optimization & Secure Linear Algebra Helpers
 // =============================================================================
 
-// std::vector<AV>(n, AV(...)) copy-constructs n aliases of a single buffer, so
-// every element would share storage. Build the elements individually instead.
-std::vector<AV> MakeVector(size_t n, size_t elem_size, EngineRef engine) {
-    std::vector<AV> out;
-    out.reserve(n);
-    for (size_t i = 0; i < n; ++i) out.emplace_back(elem_size, engine);
-    return out;
-}
-
-std::vector<std::vector<AV>> MakeMatrix(size_t rows, size_t cols, EngineRef engine) {
-    std::vector<std::vector<AV>> out;
-    out.reserve(rows);
-    for (size_t i = 0; i < rows; ++i) out.push_back(MakeVector(cols, 1, engine));
-    return out;
-}
-
-std::vector<AV> Clone(const std::vector<AV>& vs) {
-    std::vector<AV> out;
-    out.reserve(vs.size());
-    for (const AV& v : vs) out.push_back(Clone(v));
-    return out;
-}
-
 // Generates c * I_n as a SecureMatrix in MPC (row-major).
 SMatrix ScaledIdentity(size_t n, double c, EngineRef engine) {
     cdough::Vector<DataType> eye(n * n, 0);
@@ -85,20 +62,13 @@ SMatrix AsColumnWise(const SMatrix& m) {
     return result;
 }
 
-// Matrix product a * b, both row-major, result row-major.
-//
-// The protocol rescales for us: the 3PC matmul kernel calls handle_precision()
-// and then truncate() on the accumulated dot product, so the result is already
-// in fixed point and must NOT be divided by `scale`. handle_precision() throws
-// unless both operands carry exactly the same precision.
-SMatrix MatMul(const SMatrix& a, const SMatrix& b) {
-    assert(a.cols() == b.rows());
-    assert(!a.isColumnWise() && !b.isColumnWise());
-    assert(a.data().getPrecision() == b.data().getPrecision());
-    SMatrix result = a.matrixRightMultiplyWithColumnMatrixVectorized(AsColumnWise(b));
-    result.setPrecision(a.data().getPrecision());
-    return result;
-}
+// The matmul kernel is called directly throughout, rather than through a
+// wrapper. It takes a row-major left operand and a COLUMN-WISE right operand and
+// rescales internally (handle_precision() then truncate(), so the result must
+// not be divided by `scale`; it throws unless both operands carry the same
+// precision). Calling it directly is what makes the orientation of each operand
+// visible at the call site -- which matters, because sometimes the column-wise
+// form is free (a reinterpretation) and sometimes it needs AsColumnWise.
 
 // Multiplies every entry of `m` by the secret scalar held in the 1-element `s`.
 SMatrix ScaleMatrix(const SMatrix& m, const AV& s) {
@@ -203,274 +173,218 @@ SMatrix NewtonSchulzInverse(const SMatrix& a, int iterations = kMatrixInverseIte
     SMatrix two_identity = ScaledIdentity(n, 2.0, engine);
 
     for (int iteration = 0; iteration < iterations; ++iteration) {
-        SMatrix a_x = MatMul(a, x);
+        SMatrix a_x = a.matrixRightMultiplyWithColumnMatrixVectorized(AsColumnWise(x));
         a_x.setPrecision(precision);
 
         SMatrix residual = two_identity - a_x; // local elementwise
         residual.setPrecision(precision);
 
-        x = MatMul(x, residual);
+        x = x.matrixRightMultiplyWithColumnMatrixVectorized(AsColumnWise(residual));
         x.setPrecision(precision);
     }
 
     return x;
 }
 
-// Matrix-vector product m * v where m is SecureMatrix (n x n) and v is std::vector<AV> (length n).
-std::vector<AV> MatVec(const SMatrix& m, const std::vector<AV>& v) {
-    size_t n = v.size();
-    assert(m.rows() == n && m.cols() == n);
-    EngineRef engine = v[0].engine;
+// =============================================================================
+// Vectorized optimizer
+// =============================================================================
 
-    // m is stored row-major: element (i, j) is at data_[i * n + j]
-    AV m_data = m.data();
-    m_data.setPrecision(0);
+// A batched objective: evaluates `num_points` packed parameter points at once,
+// returning one value per point. `params` is length num_points * dim.
+using BatchedObjective = std::function<AV(const AV& params, size_t num_points)>;
 
-    std::vector<AV> result;
-    result.reserve(n);
-
-    for (size_t i = 0; i < n; ++i) {
-        AV row_sum(1, engine);
-        row_sum.setPrecision(0);
-        for (size_t j = 0; j < n; ++j) {
-            // Slice element at index (i * n + j)
-            AV m_ij = m_data.slice(i * n + j, i * n + j + 1);
-            m_ij.setPrecision(0);
-            AV vj = v[j];
-            vj.setPrecision(0);
-            AV prod = (*(m_ij * vj)) / scale;
-            row_sum += prod;
-        }
-        row_sum.setPrecision(precision);
-        result.push_back(std::move(row_sum));
+// Public +-1 pattern that scatters the per-coordinate step h onto the diagonal
+// of the stacked parameter points: +h_k into point k, -h_k into point dim + k,
+// zero everywhere else.
+//
+// The pattern depends only on `dim`, so share it once and reuse it for every
+// gradient. It has to be secret-shared rather than applied as a public constant
+// because the library has no elementwise multiply against a public vector.
+AV MakeCentralDifferenceSelector(size_t dim, EngineRef engine) {
+    cdough::Vector<DataType> selector(2 * dim * dim, 0);
+    for (size_t k = 0; k < dim; ++k) {
+        selector[k * dim + k] = scale;                  // forward point
+        selector[(dim + k) * dim + k] = -scale;         // backward point
     }
-    return result;
+    return engine.secret_share_a(selector, 0, precision);
 }
 
-// Standard inner product between two secure vectors.
-AV Dot(const std::vector<AV>& a, const std::vector<AV>& b) {
-    assert(a.size() == b.size());
-    size_t n = a.size();
-    EngineRef engine = a[0].engine;
+// Central-difference gradient in ONE objective evaluation.
+//
+// The serial version calls the objective 2*dim times, so its depth grows with
+// the parameter count. Here all 2*dim perturbed points are built at once and
+// handed to the batched objective together, and the 2*dim divisions collapse
+// into a single circuit over `dim` elements. Depth is therefore constant in dim.
+//
+// Step size matches the serial implementation exactly:
+//   h_k = kNumericalGradientStep * (1 + |x_k|).
+AV NumericalGradientBatched(const BatchedObjective& f, const AV& x, const AV& selector) {
+    const size_t dim = x.size();
+    assert(selector.size() == 2 * dim * dim);
 
-    AV sum(1, engine);
-    sum.setPrecision(0);
-    for (size_t i = 0; i < n; ++i) {
-        AV ai = a[i];
-        AV bi = b[i];
-        ai.setPrecision(0);
-        bi.setPrecision(0);
-        AV prod = (*(ai * bi)) / scale;
-        sum += prod;
-    }
-    sum.setPrecision(precision);
-    return sum;
+    // |x| with no division: sign = 2 * gtez(x) - 1 is an unscaled +-1, so
+    // sign * x is already |x| at the original scale.
+    AV x_raw = x;
+    x_raw.setPrecision(0);
+    AV sign = *(x_raw.gtez());
+    AV two_sign = *(sign * DataType(2));
+    two_sign -= DataType(1);
+    AV abs_x = *(two_sign * x_raw);
+
+    AV one_plus_abs = abs_x;
+    one_plus_abs += scale;
+    const DataType h_step_scaled = static_cast<DataType>(kNumericalGradientStep * scale);
+    AV h = (*(one_plus_abs * h_step_scaled)) / scale;  // length dim
+
+    // Stack the 2*dim perturbed points: the base point tiled, plus +-h on the
+    // diagonal. Tiling h puts h_k exactly where the selector needs it, so this
+    // is one multiply and one add rather than a scatter loop.
+    AV x_tiled = x.cyclic_subset_reference(2 * dim);
+    AV h_tiled = h.cyclic_subset_reference(2 * dim);
+    h_tiled.setPrecision(0);
+    AV selector_raw = selector;
+    selector_raw.setPrecision(0);
+    AV delta = (*(h_tiled * selector_raw)) / scale;
+    AV points = x_tiled + delta;
+    points.setPrecision(precision);
+
+    AV values = f(points, 2 * dim);  // length 2*dim: [f_plus..., f_minus...]
+    values.setPrecision(0);
+    AV f_plus = values.slice(0, dim);
+    AV f_minus = values.slice(dim, 2 * dim);
+    AV diff = f_plus - f_minus;
+
+    // gradient = (f_plus - f_minus) / (2h), all dim of them in one circuit.
+    h.setPrecision(0);
+    AV two_h = *(h * DataType(2));
+    auto diff_scaled_b = (*(diff * scale)).a2b();
+    auto two_h_b = two_h.a2b();
+    auto grad_b = (*diff_scaled_b) / (*two_h_b);
+    AV gradient = *(grad_b->b2a());
+    gradient.setPrecision(precision);
+    return gradient;
 }
 
-// Result of the outer quasi-Newton optimization.
-struct OptResult {
-    std::vector<AV> params;
+// Result of the vectorized quasi-Newton optimization. `params` is one AV of
+// length dim rather than dim one-element AVs.
+struct BatchedOptResult {
+    AV params;
     AV value;
     int iterations = 0;
     bool converged = false;
 
-    OptResult(std::vector<AV> p, AV v, int it = 0, bool conv = false)
+    BatchedOptResult(AV p, AV v, int it = 0, bool conv = false)
         : params(std::move(p)), value(std::move(v)), iterations(it), converged(conv) {}
 };
 
-// Central finite-difference gradient of a scalar objective `f` at `x`.
-std::vector<AV> NumericalGradient(const std::function<AV(const std::vector<AV>&)>& f,
-                                  const std::vector<AV>& x) {
-    size_t dim = x.size();
-    std::vector<AV> gradient;
-    gradient.reserve(dim);
+// m (n x n, row-major) * v (length n) -> length n.
+//
+// An n x 1 matrix has identical row-major and column-wise layouts, so the
+// vector needs no transpose to serve as the kernel's column-wise right-hand
+// side.
+AV MatVecBatched(const SMatrix& m, const AV& v) {
+    const size_t n = v.size();
+    assert(m.rows() == n && m.cols() == n);
+    assert(!m.isColumnWise());
+    SMatrix v_col(v, n, 1, true);
+    v_col.setPrecision(precision);
+    SMatrix result = m.matrixRightMultiplyWithColumnMatrixVectorized(v_col);
+    result.setPrecision(precision);
+    return result.data();
+}
 
-    std::vector<AV> perturbed = Clone(x);
-    for (size_t k = 0; k < dim; ++k) {
-        perturbed[k].setPrecision(precision);
-    }
-
-    for (size_t k = 0; k < dim; ++k) {
-        // Step size h = kNumericalGradientStep * (1.0 + |x[k]|)
-        AV xk_copy = x[k];
-        xk_copy.setPrecision(0);
-        AV mask = *(xk_copy.gtez());
-        AV two_mask = *(mask * DataType(2));
-        two_mask -= DataType(1);
-        AV abs_xk =
-            *(two_mask * xk_copy);  // (1 or -1) * xk_copy gives |x[k]| directly without / scale
-
-        AV one_plus_abs = abs_xk;
-        one_plus_abs += scale;
-        DataType h_step_scaled = static_cast<DataType>(kNumericalGradientStep * scale);
-        AV h = (*(one_plus_abs * h_step_scaled)) / scale;  // size 1
-
-        // f_plus = f(perturbed with x[k] + h)
-        h.setPrecision(precision);
-        perturbed[k] = x[k] + h;
-        perturbed[k].setPrecision(precision);
-        AV f_plus = f(perturbed);
-        f_plus.setPrecision(0);
-
-        // f_minus = f(perturbed with x[k] - h)
-        perturbed[k] = x[k] - h;
-        perturbed[k].setPrecision(precision);
-        AV f_minus = f(perturbed);
-        f_minus.setPrecision(0);
-
-        // Reset perturbed[k]
-        perturbed[k] = x[k];
-        perturbed[k].setPrecision(precision);
-
-        // gradient[k] = (f_plus - f_minus) / (2 * h)
-        AV diff = f_plus - f_minus;
-        h.setPrecision(0);
-        AV two_h = *(h * DataType(2));
-
-        auto diff_scaled_b = (*(diff * scale)).a2b();
-        auto two_h_b = two_h.a2b();
-        auto grad_b = (*diff_scaled_b) / (*two_h_b);
-        AV grad_k = *(grad_b->b2a());
-        grad_k.setPrecision(precision);
-
-        gradient.push_back(std::move(grad_k));
-    }
-
-    return gradient;
+// Outer product a * b^T -> (n x n, row-major).
+//
+// `a` as a row-major n x 1 and `b` as a column-wise 1 x n are both just the
+// buffers themselves (a 1 x n column-wise matrix reads element (0, j) from
+// data[j]), so this is one kernel call with no data movement.
+SMatrix OuterProduct(const AV& a, const AV& b) {
+    const size_t n = a.size();
+    assert(b.size() == n);
+    SMatrix a_col(a, n, 1, false);
+    a_col.setPrecision(precision);
+    SMatrix b_row(b, 1, n, true);
+    b_row.setPrecision(precision);
+    SMatrix result = a_col.matrixRightMultiplyWithColumnMatrixVectorized(b_row);
+    result.setPrecision(precision);
+    return result;
 }
 
 // BFGS update of the inverse-Hessian approximation:
-//   H+ = (I - rho s y^T) H (I - rho y s^T) + rho s s^T,   rho = 1 / (y^T s).
-SMatrix BfgsInverseUpdate(const SMatrix& h_inv, const std::vector<AV>& s, const std::vector<AV>& y,
-                          const AV& rho) {
-    size_t n = s.size();
+//   H+ = (I - rho s y^T) H (I - rho y s^T) + rho s s^T
+//
+// The serial version built this from n^3 sequential one-element multiplies. Here
+// it is four kernel calls and some local permutation, so its depth is constant
+// in n.
+//
+// Note the right factor: (I - rho s y^T)^T = I - rho y s^T exactly, and a
+// column-wise matrix over a row-major buffer *is* that buffer's transpose
+// (semantic topic 0001, C-09). So the right factor is the left factor's buffer
+// reinterpreted -- no transpose, no extra call. The h_inv transpose below is a
+// real one, but AsColumnWise is a local index permutation and costs no
+// communication, so there is nothing to gain by assuming h_inv is symmetric
+// (it only is up to truncation, and relying on that would silently substitute
+// H^T for H as the approximation drifts).
+SMatrix BfgsInverseUpdateBatched(const SMatrix& h_inv, const AV& s, const AV& y, const AV& rho) {
+    const size_t n = s.size();
     assert(h_inv.rows() == n && h_inv.cols() == n);
     assert(y.size() == n);
-    EngineRef engine = s[0].engine;
+    EngineRef engine = s.engine;
 
-    // We extract h_inv elements into an n x n 2D array of 1-element AVs
-    // Distinct buffers per element
-    std::vector<std::vector<AV>> h_elements = MakeMatrix(n, n, engine);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            h_elements[i][j] = h_inv.data().slice(i * n + j, i * n + j + 1);
-            h_elements[i][j].setPrecision(0);
-        }
-    }
+    SMatrix eye = Identity(n, engine);
+    SMatrix left = eye - ScaleMatrix(OuterProduct(s, y), rho);
+    left.setPrecision(precision);
 
-    AV rho_copy = rho;
-    rho_copy.setPrecision(0);
+    // temp = left * h_inv   (h_inv needs a genuine transpose to be a rhs)
+    SMatrix temp = left.matrixRightMultiplyWithColumnMatrixVectorized(AsColumnWise(h_inv));
+    temp.setPrecision(precision);
 
-    // Compute left = I - rho * s * y^T as an n x n matrix in std::vector<std::vector<AV>>
-    // In fixed point: (s_i * y_j) / scale, then (* rho) / scale
-    std::vector<std::vector<AV>> left = MakeMatrix(n, n, engine);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            AV si = s[i];
-            AV yj = y[j];
-            si.setPrecision(0);
-            yj.setPrecision(0);
-            AV s_y = (*(si * yj)) / scale;
-            AV rho_s_y = (*(rho_copy * s_y)) / scale;
+    // right = left^T, for free.
+    SMatrix right_col(left.data(), n, n, true);
+    right_col.setPrecision(precision);
 
-            AV elem(1, engine);
-            elem.setPrecision(0);
-            if (i == j) {
-                elem += scale;
-            }
-            elem -= rho_s_y;
-            left[i][j] = elem;
-        }
-    }
-
-    // temp = left * h_inv
-    // temp[i][j] = sum_k (left[i][k] * h_inv[k][j]) / scale
-    std::vector<std::vector<AV>> temp = MakeMatrix(n, n, engine);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            AV sum(1, engine);
-            sum.setPrecision(0);
-            for (size_t k = 0; k < n; ++k) {
-                AV h_kj = h_elements[k][j];
-                AV left_ik = left[i][k];
-                left_ik.setPrecision(0);
-                h_kj.setPrecision(0);
-                AV prod = (*(left_ik * h_kj)) / scale;
-                sum += prod;
-            }
-            temp[i][j] = sum;
-        }
-    }
-
-    // updated = temp * left^T + rho * s * s^T
-    // Flatten result into a single AV of size n * n to construct SecureMatrix.
-    // `concatenate` appends, so this starts empty and grows to exactly n * n over the
-    // loop below; the SecureMatrix constructor asserts data.size() == rows * cols.
-    AV updated_data(0, engine);
-    updated_data.setPrecision(precision);
-
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            AV sum(1, engine);
-            sum.setPrecision(0);
-            for (size_t k = 0; k < n; ++k) {
-                AV temp_ik = temp[i][k];
-                AV left_jk = left[j][k];
-                temp_ik.setPrecision(0);
-                left_jk.setPrecision(0);
-                AV prod = (*(temp_ik * left_jk)) / scale;
-                sum += prod;
-            }
-            AV si = s[i];
-            AV sj = s[j];
-            si.setPrecision(0);
-            sj.setPrecision(0);
-            AV s_s = (*(si * sj)) / scale;
-            AV rho_s_s = (*(rho_copy * s_s)) / scale;
-            sum += rho_s_s;
-            sum.setPrecision(precision);
-
-            updated_data.concatenate(sum);
-        }
-    }
-
-    updated_data.setPrecision(precision);
-    SMatrix updated(updated_data, n, n, false);
+    SMatrix updated = temp.matrixRightMultiplyWithColumnMatrixVectorized(right_col) +
+                      ScaleMatrix(OuterProduct(s, s), rho);
     updated.setPrecision(precision);
     return updated;
 }
 
-// Minimizes `f` starting from `x0` using BFGS with a backtracking (Armijo) line
-// search and numerical gradients.
-OptResult MinimizeBFGS(const std::function<AV(const std::vector<AV>&)>& f,
-                       const std::vector<AV>& x0, int max_iterations = 20) {
-    size_t n = x0.size();
-    EngineRef engine = x0[0].engine;
+// Vectorized BFGS with a backtracking (Armijo) line search and a batched
+// central-difference gradient.
+//
+// Logic is identical to the pre-vectorization implementation (semantic task
+// 0014), including every convergence test and the plaintext values those tests
+// branch on. What changes is the representation: the state is one AV of length
+// dim, so each vector update is a single operation, and each `open()` that the
+// serial version performed dim times now happens once.
+BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
+                                     int max_iterations = 20) {
+    const size_t n = x0.size();
+    EngineRef engine = x0.engine;
 
-    std::vector<AV> x;
-    for (size_t i = 0; i < n; ++i) {
-        AV xi(x0[i].size(), engine);
-        xi = x0[i];
-        xi.setPrecision(precision);
-        x.push_back(xi);
-    }
-    AV fx = f(x);
+    AV x = Clone(x0);
+    x.setPrecision(precision);
+    AV fx = f(x, 1);
     fx.setPrecision(precision);
 
-    std::vector<AV> gradient = NumericalGradient(f, x);
+    // The central-difference scatter pattern depends only on dim, so it is
+    // shared once and reused by every gradient.
+    AV selector = MakeCentralDifferenceSelector(n, engine);
+
+    AV gradient = NumericalGradientBatched(f, x, selector);
     SMatrix h_inv = Identity(n, engine);
 
-    OptResult result(x, fx, 0, false);
+    BatchedOptResult result(x, fx, 0, false);
 
     for (int iteration = 0; iteration < max_iterations; ++iteration) {
         result.iterations = iteration + 1;
 
-        // Check gradient convergence in plaintext after opening
+        // One open for the whole gradient, where the serial version did n.
+        auto opened_g = gradient.open();
         double max_grad = 0.0;
         for (size_t i = 0; i < n; ++i) {
-            auto opened_g = gradient[i].open();
-            double val = std::abs(static_cast<double>(opened_g[0]) / scale);
-            if (val > max_grad) max_grad = val;
+            max_grad = std::max(max_grad, std::abs(static_cast<double>(opened_g[i]) / scale));
         }
 
         if (max_grad < kSmallEpsilon) {
@@ -479,52 +393,46 @@ OptResult MinimizeBFGS(const std::function<AV(const std::vector<AV>&)>& f,
         }
 
         // Search direction d = -H_inv * gradient
-        std::vector<AV> direction = MatVec(h_inv, gradient);
-        for (size_t i = 0; i < n; ++i) {
-            direction[i] = -direction[i];
-            direction[i].setPrecision(precision);
-        }
+        AV direction = -MatVecBatched(h_inv, gradient);
+        direction.setPrecision(precision);
 
-        AV directional_derivative = Dot(gradient, direction);
+        AV directional_derivative = *gradient.dot_product(direction, n);
         directional_derivative.setPrecision(precision);
-
-        // Check if descent direction: directional_derivative < 0
         auto opened_dd = directional_derivative.open();
         double dd_val = static_cast<double>(opened_dd[0]) / scale;
+
         if (dd_val >= 0.0) {
+            // Not a descent direction: reset to steepest descent.
             h_inv = Identity(n, engine);
-            for (size_t i = 0; i < n; ++i) {
-                direction[i] = -gradient[i];
-                direction[i].setPrecision(precision);
-            }
-            directional_derivative = Dot(gradient, direction);
+            direction = -gradient;
+            direction.setPrecision(precision);
+            directional_derivative = *gradient.dot_product(direction, n);
             directional_derivative.setPrecision(precision);
             auto opened_dd2 = directional_derivative.open();
             dd_val = static_cast<double>(opened_dd2[0]) / scale;
         }
 
-        // Backtracking line search satisfying the Armijo sufficient-decrease rule
         const double c1 = 1e-4;
         double alpha = 1.0;
         bool line_search_failed = false;
-        std::vector<AV> x_new = Clone(x);
-        AV fx_new(fx.size(), engine);
-        fx_new = fx;
-        fx_new.setPrecision(precision);
+        AV x_new = Clone(x);
+        AV fx_new = Clone(fx);
 
         auto opened_fx = fx.open();
         double fx_val = static_cast<double>(opened_fx[0]) / scale;
 
         while (true) {
-            for (size_t i = 0; i < n; ++i) {
-                AV alpha_dir(direction[i].size(), engine);
-                alpha_dir = direction[i];
-                alpha_dir.setPrecision(0);
-                alpha_dir = (*(alpha_dir * static_cast<DataType>(alpha * scale))) / scale;
-                x_new[i] = x[i] + alpha_dir;
-                x_new[i].setPrecision(precision);
-            }
-            fx_new = f(x_new);
+            // Clone, NOT `AV alpha_dir = direction;`. Copy-construction aliases
+            // the buffer (semantic topic 0001, C-05), so the copy-assignment
+            // below would write the scaled result back through the alias into
+            // `direction`, compounding alpha on every line-search halving.
+            AV alpha_dir = Clone(direction);
+            alpha_dir.setPrecision(0);
+            alpha_dir = (*(alpha_dir * static_cast<DataType>(alpha * scale))) / scale;
+            x_new = x + alpha_dir;
+            x_new.setPrecision(precision);
+
+            fx_new = f(x_new, 1);
             fx_new.setPrecision(precision);
 
             auto opened_fx_new = fx_new.open();
@@ -535,22 +443,19 @@ OptResult MinimizeBFGS(const std::function<AV(const std::vector<AV>&)>& f,
             }
             alpha *= 0.5;
             if (alpha < 1e-5) {
-                x_new = x;
-                fx_new = fx;
+                x_new = Clone(x);
+                fx_new = Clone(fx);
                 line_search_failed = true;
                 break;
             }
         }
 
-        // Step = x_new - x
-        std::vector<AV> step = MakeVector(n, 1, engine);
+        AV step = x_new - x;
+        step.setPrecision(precision);
+        auto opened_step = step.open();
         double max_step = 0.0;
         for (size_t i = 0; i < n; ++i) {
-            step[i] = x_new[i] - x[i];
-            step[i].setPrecision(precision);
-            auto opened_s = step[i].open();
-            double val = std::abs(static_cast<double>(opened_s[0]) / scale);
-            if (val > max_step) max_step = val;
+            max_step = std::max(max_step, std::abs(static_cast<double>(opened_step[i]) / scale));
         }
 
         // A failed line search is a fixed point: x is unchanged, so the next
@@ -567,31 +472,26 @@ OptResult MinimizeBFGS(const std::function<AV(const std::vector<AV>&)>& f,
             break;
         }
 
-        std::vector<AV> gradient_new = NumericalGradient(f, x_new);
-        std::vector<AV> gradient_delta = MakeVector(n, 1, engine);
-        for (size_t i = 0; i < n; ++i) {
-            gradient_delta[i] = gradient_new[i] - gradient[i];
-            gradient_delta[i].setPrecision(precision);
-        }
+        AV gradient_new = NumericalGradientBatched(f, x_new, selector);
+        AV gradient_delta = gradient_new - gradient;
+        gradient_delta.setPrecision(precision);
 
-        AV curvature = Dot(step, gradient_delta);
+        AV curvature = *step.dot_product(gradient_delta, n);
         curvature.setPrecision(precision);
         auto opened_curv = curvature.open();
         double curv_val = static_cast<double>(opened_curv[0]) / scale;
 
         if (curv_val > kSmallEpsilon) {
-            // rho = 1.0 / curvature
             AV rho = SecureReciprocal(curvature);
-
-            h_inv = BfgsInverseUpdate(h_inv, step, gradient_delta, rho);
+            h_inv = BfgsInverseUpdateBatched(h_inv, step, gradient_delta, rho);
             h_inv.setPrecision(precision);
         }
 
-        x = x_new;
-        gradient = gradient_new;
+        x = Clone(x_new);
+        gradient = Clone(gradient_new);
         auto opened_new_fx = fx_new.open();
         double obj_change = std::abs(fx_val - static_cast<double>(opened_new_fx[0]) / scale);
-        fx = fx_new;
+        fx = Clone(fx_new);
 
         if (engine.getPartyID() == 0) {
             std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
@@ -609,8 +509,8 @@ OptResult MinimizeBFGS(const std::function<AV(const std::vector<AV>&)>& f,
         }
     }
 
-    result.params = x;
-    result.value = fx;
+    result.params = Clone(x);
+    result.value = Clone(fx);
     return result;
 }
 

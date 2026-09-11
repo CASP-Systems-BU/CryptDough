@@ -15,7 +15,6 @@ using namespace COMPILED_MPC_PROTOCOL_NAMESPACE;
 using namespace cdough::debug;
 using namespace cdough::service;
 using namespace cdough::regression;
-using namespace cdough::regression::mixedeffects;
 
 
 int main(int argc, char** argv) {
@@ -330,43 +329,37 @@ int main(int argc, char** argv) {
                   << std::endl;
     }
 
-    // Build secret-shared Dataset
-    Dataset secure_dataset;
-    secure_dataset.num_fixed = test_num_fixed;
-
+    // Build the secret-shared batched dataset: one group-major buffer for the
+    // design matrix, plus y and the padding mask (all ones here, since these
+    // groups are uniform).
+    const size_t total_rows = test_num_groups * test_obs_per_group;
+    cdough::Vector<DataType> x_flat(total_rows * test_num_fixed, precision);
+    cdough::Vector<DataType> y_flat(total_rows, precision);
+    cdough::Vector<DataType> mask_flat(total_rows, precision);
     for (size_t g = 0; g < test_num_groups; ++g) {
-        // Share y
-        cdough::Vector<DataType> plain_y_vec(test_obs_per_group, precision);
         for (size_t j = 0; j < test_obs_per_group; ++j) {
-            plain_y_vec[j] = static_cast<DataType>(plain_Y[g][j] * scale);
-        }
-        AV grp_y = engine.secret_share_a(plain_y_vec, 0, precision);
-
-        // Share columns of X
-        std::vector<AV> grp_x_cols;
-        for (size_t k = 0; k < test_num_fixed; ++k) {
-            cdough::Vector<DataType> plain_col_vec(test_obs_per_group, precision);
-            for (size_t j = 0; j < test_obs_per_group; ++j) {
-                plain_col_vec[j] = static_cast<DataType>(plain_X[g][j][k] * scale);
+            const size_t row = g * test_obs_per_group + j;
+            y_flat[row] = static_cast<DataType>(std::llround(plain_Y[g][j] * scale));
+            mask_flat[row] = static_cast<DataType>(scale);
+            for (size_t k = 0; k < test_num_fixed; ++k) {
+                x_flat[row * test_num_fixed + k] =
+                    static_cast<DataType>(std::llround(plain_X[g][j][k] * scale));
             }
-            grp_x_cols.push_back(engine.secret_share_a(plain_col_vec, 0, precision));
         }
-        secure_dataset.groups.emplace_back(std::move(grp_y), std::move(grp_x_cols));
     }
+    mixedeffects::BatchedDataset secure_dataset(engine.secret_share_a(x_flat, 0, precision),
+                                                engine.secret_share_a(y_flat, 0, precision),
+                                                engine.secret_share_a(mask_flat, 0, precision),
+                                                test_num_groups, test_obs_per_group,
+                                                test_num_fixed);
 
-    // Secret share parameter vector [beta_0, beta_1, s]
-    std::vector<AV> secure_params;
-    cdough::Vector<DataType> p0(1, precision); p0[0] = static_cast<DataType>(plain_beta[0] * scale);
-    cdough::Vector<DataType> p1(1, precision); p1[0] = static_cast<DataType>(plain_beta[1] * scale);
-    cdough::Vector<DataType> ps(1, precision); ps[0] = static_cast<DataType>(plain_s * scale);
-
-    secure_params.push_back(engine.secret_share_a(p0, 0, precision));
-    secure_params.push_back(engine.secret_share_a(p1, 0, precision));
-    secure_params.push_back(engine.secret_share_a(ps, 0, precision));
-
-    std::vector<AV> secure_beta = { secure_params[0], secure_params[1] };
-    cdough::Vector<DataType> p_sig(1, precision); p_sig[0] = static_cast<DataType>(plain_sigma2 * scale);
-    AV secure_sigma2 = engine.secret_share_a(p_sig, 0, precision);
+    // Packed parameter vector [beta_0, beta_1, s] as one AV.
+    const size_t test_dim = test_num_fixed + 1;
+    cdough::Vector<DataType> params_flat(test_dim, precision);
+    params_flat[0] = static_cast<DataType>(std::llround(plain_beta[0] * scale));
+    params_flat[1] = static_cast<DataType>(std::llround(plain_beta[1] * scale));
+    params_flat[2] = static_cast<DataType>(std::llround(plain_s * scale));
+    AV secure_params = engine.secret_share_a(params_flat, 0, precision);
 
     // Plaintext computation helper functions
     auto plain_exp = [](double x) -> double {
@@ -448,89 +441,76 @@ int main(int argc, char** argv) {
         return grad;
     };
 
-    // 1. Test ConditionalMode on group 0 and group 1
-    AV u_mode_0 = ConditionalMode(secure_dataset.groups[0], secure_beta, secure_sigma2);
-    auto opened_u0 = u_mode_0.open();
-    double expected_u0 = plain_conditional_mode(0, plain_beta, plain_sigma2);
-    if (pID == 0) {
-        double actual_u0 = static_cast<double>(opened_u0[0]) / scale;
-        std::cout << "ConditionalMode (Group 0):\n"
-                  << "  Plaintext: " << expected_u0 << "\n"
-                  << "  MPC:       " << actual_u0 << "\n"
-                  << "  Abs Error: " << std::abs(expected_u0 - actual_u0) << std::endl;
-    }
+    // Shared unpacking for the model tests below.
+    auto unpacked = mixedeffects::UnpackParametersBatched(secure_params, 1, test_num_fixed);
+    AV inv_sigma2_test = SecureReciprocal(unpacked.sigma2);
+    inv_sigma2_test.setPrecision(0);
+    AV x_beta_test = mixedeffects::LinearPredictors(secure_dataset, unpacked.beta_data, 1);
+    x_beta_test.setPrecision(0);
 
-    AV u_mode_1 = ConditionalMode(secure_dataset.groups[1], secure_beta, secure_sigma2);
-    auto opened_u1 = u_mode_1.open();
+    // 1. Test ConditionalMode on group 0 and group 1
+    AV modes = mixedeffects::ConditionalModeBatched(secure_dataset, x_beta_test, inv_sigma2_test, 1);
+    auto opened_modes = modes.open();
+    double expected_u0 = plain_conditional_mode(0, plain_beta, plain_sigma2);
     double expected_u1 = plain_conditional_mode(1, plain_beta, plain_sigma2);
     if (pID == 0) {
-        double actual_u1 = static_cast<double>(opened_u1[0]) / scale;
-        std::cout << "ConditionalMode (Group 1):\n"
-                  << "  Plaintext: " << expected_u1 << "\n"
-                  << "  MPC:       " << actual_u1 << "\n"
-                  << "  Abs Error: " << std::abs(expected_u1 - actual_u1) << std::endl;
+        double a0 = static_cast<double>(opened_modes[0]) / scale;
+        double a1 = static_cast<double>(opened_modes[1]) / scale;
+        std::cout << "ConditionalMode (Group 0):\n  Plaintext: " << expected_u0
+                  << "\n  MPC:       " << a0 << "\n  Abs Error: " << std::abs(expected_u0 - a0)
+                  << std::endl;
+        std::cout << "ConditionalMode (Group 1):\n  Plaintext: " << expected_u1
+                  << "\n  MPC:       " << a1 << "\n  Abs Error: " << std::abs(expected_u1 - a1)
+                  << std::endl;
     }
 
     // 2. Test GroupLaplaceLogLik on group 0 and group 1
-    AV group0_lik = GroupLaplaceLogLik(secure_dataset.groups[0], secure_beta, secure_sigma2);
-    auto opened_g0_lik = group0_lik.open();
-    double expected_g0 = plain_group_laplace(0, plain_beta, plain_sigma2);
+    AV group_liks = mixedeffects::GroupLaplaceLogLikBatched(secure_dataset, unpacked.beta_data,
+                                                           unpacked.sigma2, 1);
+    auto opened_liks = group_liks.open();
+    double expected_l0 = plain_group_laplace(0, plain_beta, plain_sigma2);
+    double expected_l1 = plain_group_laplace(1, plain_beta, plain_sigma2);
     if (pID == 0) {
-        double actual_g0 = static_cast<double>(opened_g0_lik[0]) / scale;
-        std::cout << "GroupLaplaceLogLik (Group 0):\n"
-                  << "  Plaintext: " << expected_g0 << "\n"
-                  << "  MPC:       " << actual_g0 << "\n"
-                  << "  Abs Error: " << std::abs(expected_g0 - actual_g0) << std::endl;
-    }
-
-    AV group1_lik = GroupLaplaceLogLik(secure_dataset.groups[1], secure_beta, secure_sigma2);
-    auto opened_g1_lik = group1_lik.open();
-    double expected_g1 = plain_group_laplace(1, plain_beta, plain_sigma2);
-    if (pID == 0) {
-        double actual_g1 = static_cast<double>(opened_g1_lik[0]) / scale;
-        std::cout << "GroupLaplaceLogLik (Group 1):\n"
-                  << "  Plaintext: " << expected_g1 << "\n"
-                  << "  MPC:       " << actual_g1 << "\n"
-                  << "  Abs Error: " << std::abs(expected_g1 - actual_g1) << std::endl;
+        double a0 = static_cast<double>(opened_liks[0]) / scale;
+        double a1 = static_cast<double>(opened_liks[1]) / scale;
+        std::cout << "GroupLaplaceLogLik (Group 0):\n  Plaintext: " << expected_l0
+                  << "\n  MPC:       " << a0 << "\n  Abs Error: " << std::abs(expected_l0 - a0)
+                  << std::endl;
+        std::cout << "GroupLaplaceLogLik (Group 1):\n  Plaintext: " << expected_l1
+                  << "\n  MPC:       " << a1 << "\n  Abs Error: " << std::abs(expected_l1 - a1)
+                  << std::endl;
     }
 
     // 3. Test NegMarginalLogLik
-    AV neg_log_lik = NegMarginalLogLik(secure_dataset, secure_params);
+    AV neg_log_lik = mixedeffects::NegMarginalLogLikBatched(secure_dataset, secure_params, 1);
     auto opened_neg_log_lik = neg_log_lik.open();
     std::vector<double> plain_params = {plain_beta[0], plain_beta[1], plain_s};
     double expected_nll = plain_neg_marginal_log_lik(plain_params);
     if (pID == 0) {
         double actual_nll = static_cast<double>(opened_neg_log_lik[0]) / scale;
-        std::cout << "NegMarginalLogLik (Total):\n"
-                  << "  Plaintext: " << expected_nll << "\n"
-                  << "  MPC:       " << actual_nll << "\n"
-                  << "  Abs Error: " << std::abs(expected_nll - actual_nll) << std::endl;
+        std::cout << "NegMarginalLogLik (Total):\n  Plaintext: " << expected_nll
+                  << "\n  MPC:       " << actual_nll
+                  << "\n  Abs Error: " << std::abs(expected_nll - actual_nll) << std::endl;
     }
 
     // 4. Test NumericalGradient
-    auto objective_func = [&secure_dataset](const std::vector<AV>& p) -> AV {
-        return NegMarginalLogLik(secure_dataset, p);
+    BatchedObjective objective_func = [&secure_dataset](const AV& pts, size_t n) -> AV {
+        return mixedeffects::NegMarginalLogLikBatched(secure_dataset, pts, n);
     };
-
-    std::vector<AV> secure_grad = NumericalGradient(objective_func, secure_params);
+    AV selector_test = MakeCentralDifferenceSelector(test_dim, engine);
+    AV secure_grad = NumericalGradientBatched(objective_func, secure_params, selector_test);
+    auto opened_grad = secure_grad.open();
     std::vector<double> expected_grad = plain_numerical_gradient(plain_params);
     if (pID == 0) {
-        std::cout << "NumericalGradient:" << std::endl;
-        std::cout << "  Plaintext: [";
+        std::cout << "NumericalGradient:\n  Plaintext: [";
         for (size_t k = 0; k < expected_grad.size(); ++k) {
             std::cout << expected_grad[k] << (k + 1 < expected_grad.size() ? ", " : "");
         }
-        std::cout << "]" << std::endl;
-        std::cout << "  MPC:       [";
-    }
-    for (size_t k = 0; k < secure_grad.size(); ++k) {
-        auto opened_grad_k = secure_grad[k].open();
-        if (pID == 0) {
-            double val = static_cast<double>(opened_grad_k[0]) / scale;
-            std::cout << val << (k + 1 < secure_grad.size() ? ", " : "");
+        std::cout << "]\n  MPC:       [";
+        for (size_t k = 0; k < test_dim; ++k) {
+            std::cout << static_cast<double>(opened_grad[k]) / scale
+                      << (k + 1 < test_dim ? ", " : "");
         }
-    }
-    if (pID == 0) {
         std::cout << "]" << std::endl;
     }
 
@@ -562,14 +542,14 @@ int main(int argc, char** argv) {
     std::vector<double> v2_plain = {0.5, 4.0, -1.0};
     double expected_dot = 1.5 * 0.5 + (-2.0) * 4.0 + 3.0 * (-1.0); // 0.75 - 8.0 - 3.0 = -10.25
 
-    std::vector<AV> v1_sec, v2_sec;
+    cdough::Vector<DataType> v1_flat(dim, precision), v2_flat(dim, precision);
     for (size_t i = 0; i < dim; ++i) {
-        cdough::Vector<DataType> p1(1, precision); p1[0] = static_cast<DataType>(v1_plain[i] * scale);
-        cdough::Vector<DataType> p2(1, precision); p2[0] = static_cast<DataType>(v2_plain[i] * scale);
-        v1_sec.push_back(engine.secret_share_a(p1, 0, precision));
-        v2_sec.push_back(engine.secret_share_a(p2, 0, precision));
+        v1_flat[i] = static_cast<DataType>(std::llround(v1_plain[i] * scale));
+        v2_flat[i] = static_cast<DataType>(std::llround(v2_plain[i] * scale));
     }
-    AV sec_dot = Dot(v1_sec, v2_sec);
+    AV v1_sec = engine.secret_share_a(v1_flat, 0, precision);
+    AV v2_sec = engine.secret_share_a(v2_flat, 0, precision);
+    AV sec_dot = *v1_sec.dot_product(v2_sec, dim);
     auto opened_dot = sec_dot.open();
     if (pID == 0) {
         double actual_dot = static_cast<double>(opened_dot[0]) / scale;
@@ -580,11 +560,11 @@ int main(int argc, char** argv) {
     }
 
     // 3. Test MatVec with Identity: I * v1 == v1
-    std::vector<AV> sec_matvec = MatVec(sec_I, v1_sec);
+    AV sec_matvec = MatVecBatched(sec_I, v1_sec);
+    auto opened_matvec = sec_matvec.open();
     std::vector<double> opened_matvec_vals;
     for (size_t i = 0; i < dim; ++i) {
-        auto op_mv = sec_matvec[i].open();
-        opened_matvec_vals.push_back(static_cast<double>(op_mv[0]) / scale);
+        opened_matvec_vals.push_back(static_cast<double>(opened_matvec[i]) / scale);
     }
     if (pID == 0) {
         std::cout << "MatVec (I * v1):" << std::endl;
@@ -603,17 +583,17 @@ int main(int argc, char** argv) {
     double ys = 0.1 * 0.2 + (-0.2) * (-0.1) + 0.05 * 0.1; // 0.045
     double rho_plain = 1.0 / ys;
 
-    std::vector<AV> s_sec, y_sec;
+    cdough::Vector<DataType> s_flat(dim, precision), y_flat_v(dim, precision);
     for (size_t i = 0; i < dim; ++i) {
-        cdough::Vector<DataType> ps(1, precision); ps[0] = static_cast<DataType>(s_plain[i] * scale);
-        cdough::Vector<DataType> py(1, precision); py[0] = static_cast<DataType>(y_plain[i] * scale);
-        s_sec.push_back(engine.secret_share_a(ps, 0, precision));
-        y_sec.push_back(engine.secret_share_a(py, 0, precision));
+        s_flat[i] = static_cast<DataType>(std::llround(s_plain[i] * scale));
+        y_flat_v[i] = static_cast<DataType>(std::llround(y_plain[i] * scale));
     }
+    AV s_sec = engine.secret_share_a(s_flat, 0, precision);
+    AV y_sec = engine.secret_share_a(y_flat_v, 0, precision);
     cdough::Vector<DataType> prho(1, precision); prho[0] = static_cast<DataType>(rho_plain * scale);
     AV rho_sec = engine.secret_share_a(prho, 0, precision);
 
-    SMatrix sec_h_updated = BfgsInverseUpdate(sec_I, s_sec, y_sec, rho_sec);
+    SMatrix sec_h_updated = BfgsInverseUpdateBatched(sec_I, s_sec, y_sec, rho_sec);
     auto opened_h_up = sec_h_updated.open();
 
     // Plaintext computation of BfgsInverseUpdate from Identity
@@ -782,8 +762,10 @@ int main(int argc, char** argv) {
     SMatrix secure_right = share_matrix(plain_right);
 
     Mat opened_transpose = open_matrix(Transpose(secure_wide));
-    Mat opened_rect_product = open_matrix(MatMul(secure_wide, secure_tall));
-    Mat opened_square_product = open_matrix(MatMul(secure_left, secure_right));
+    Mat opened_rect_product = open_matrix(
+        secure_wide.matrixRightMultiplyWithColumnMatrixVectorized(AsColumnWise(secure_tall)));
+    Mat opened_square_product = open_matrix(
+        secure_left.matrixRightMultiplyWithColumnMatrixVectorized(AsColumnWise(secure_right)));
 
     if (pID == 0) {
         Mat expected_transpose = plain_transpose(plain_wide);
@@ -915,20 +897,17 @@ int main(int argc, char** argv) {
         if (pID == 0) {
             std::cout << "\nRunning MinimizeBFGS (Secure Quasi-Newton Optimizer)..." << std::endl;
         }
-        // Initial parameter guess: [0.0, 0.0, 0.0]
-        std::vector<AV> init_params_sec;
-        for (size_t i = 0; i < dim; ++i) {
-            cdough::Vector<DataType> p_init(1, precision); p_init[0] = 0;
-            init_params_sec.push_back(engine.secret_share_a(p_init, 0, precision));
-        }
+        // Initial parameter guess: [0.0, 0.0, 0.0], as one packed vector.
+        cdough::Vector<DataType> p_init(dim, precision);
+        AV init_params_sec = engine.secret_share_a(p_init, 0, precision);
 
-        OptResult opt_res = MinimizeBFGS(objective_func, init_params_sec, 50);
+        BatchedOptResult opt_res = MinimizeBFGSBatched(objective_func, init_params_sec, 50);
 
         auto opened_final_val = opt_res.value.open();
+        auto opened_params_vec = opt_res.params.open();
         std::vector<double> opened_final_params;
         for (size_t i = 0; i < dim; ++i) {
-            auto op_p = opt_res.params[i].open();
-            opened_final_params.push_back(static_cast<double>(op_p[0]) / scale);
+            opened_final_params.push_back(static_cast<double>(opened_params_vec[i]) / scale);
         }
 
         if (pID == 0) {
