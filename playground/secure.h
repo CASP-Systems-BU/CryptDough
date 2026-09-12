@@ -218,6 +218,67 @@ SecureColumns MergeTwoOwners(EngineRef engine, const PlainFlagged& half_a, int p
     return c;
 }
 
+// =============================================================================
+// Single-owner ingestion
+//
+// The other data model the deployment supports: ONE organisation holds the whole
+// of cdrcatsse_match_pcc and the other parties hold nothing. It is the shape a
+// single-site run takes, and the shape `--owner` selects.
+//
+// It is not the two-owner path with an empty second half. Two things fall away:
+//
+//   - There is no merge. bitonic_merge exists to interleave two independently
+//     sorted halves; one owner sorts its whole table in the clear, so the shared
+//     table arrives already ordered on (subject_id, encounter_dt) and the log N
+//     compare-swap stages have nothing left to do.
+//   - The table is padded to NextPowerOfTwo(rows) rather than 2 *
+//     NextPowerOfTwo(rows), because there is no second half to match. That halves
+//     the row count every downstream sort and scan runs over.
+//
+// The local sort discloses nothing: the owner is sorting rows it already holds
+// in plaintext. Everything after this point is identical to the two-owner path,
+// which is why RunSecurePipeline and RunSecurePipelineSingleOwner share
+// SequenceSharedTable below rather than each carrying their own copy of it.
+// =============================================================================
+
+SecureColumns ShareOneOwner(EngineRef engine, const PlainFlagged& half, int party,
+                            size_t rows) {
+    const size_t n = NextPowerOfTwo(std::max<size_t>(rows, 2));
+
+    HalfPlain p = BuildHalf(half, LocalOrder(half), n);
+
+    SecureColumns c(engine, n);
+    for (size_t k = 0; k < kGenderLevels.size(); ++k) c.gender_is.emplace_back(n, engine);
+    for (size_t k = 0; k < kHispanicLevels.size(); ++k) c.hispanic_is.emplace_back(n, engine);
+
+    // Every party calls these; only `party` holds real values, so the others pass
+    // the zero-filled placeholder BuildHalf gave them and receive shares.
+    auto share_b = [&](BV& dst, cdough::Vector<DataType>& v) {
+        dst = engine.template secret_share_b<DataType>(v, party);
+    };
+    auto share_a = [&](AV& dst, cdough::Vector<DataType>& v) {
+        dst = engine.template secret_share_a<DataType>(v, party, 0);
+        dst.setPrecision(0);
+    };
+
+    share_b(c.subject_key, p.subject);
+    share_b(c.dt_key, p.dt);
+    share_b(c.ds_key, p.ds);
+    share_a(c.valid, p.valid);
+    share_a(c.encounter_dt, p.dt);
+    share_a(c.newage, p.newage);
+    share_a(c.sisa, p.sisa);
+    share_a(c.sa, p.sa);
+    share_a(c.umass, p.umass);
+    for (size_t k = 0; k < kGenderLevels.size(); ++k) share_a(c.gender_is[k], p.gender_is[k]);
+    for (size_t k = 0; k < kHispanicLevels.size(); ++k)
+        share_a(c.hispanic_is[k], p.hispanic_is[k]);
+
+    // No bitonic_merge: LocalOrder already left the table ascending on
+    // (subject_id, encounter_dt), which is what the merge exists to produce.
+    return c;
+}
+
 // Re-order the merged table by (subject_id, data_source, encounter_dt) so that
 // each (patient, system) run is contiguous and internally in date order. The
 // already-computed global sequencing columns ride along as payload.
@@ -369,12 +430,16 @@ Sequencing SequenceVisits(std::vector<BV>& keys, const ScanPlan& plan, const AV&
 //
 // Only the NUMBER of conflicting MRNs is opened. That is the count the upstream
 // table publishes, and it discloses nothing about which patients are involved.
+//
+// `reveal_to` names the party that learns that count; -1 gives it to everybody,
+// which is the two-owner default. Collective either way.
 // =============================================================================
 
 long SecureConflictCount(EngineRef engine, const std::vector<DataType>& mrn_a,
                          const std::vector<DataType>& sid_a, int party_a,
                          const std::vector<DataType>& mrn_b,
-                         const std::vector<DataType>& sid_b, int party_b) {
+                         const std::vector<DataType>& sid_b, int party_b,
+                         int reveal_to = -1, int party_id = 0) {
     const size_t m = NextPowerOfTwo(std::max<size_t>(std::max(mrn_a.size(), mrn_b.size()), 2));
     const size_t n = 2 * m;
 
@@ -453,7 +518,8 @@ long SecureConflictCount(EngineRef engine, const std::vector<DataType>& mrn_a,
 
     AV total = hit.chunkedSum(hit.size());
     total.setPrecision(0);
-    return static_cast<long>(std::llround(OpenScalar(total, false)));
+    return static_cast<long>(
+        std::llround(OpenScalarToParty(total, reveal_to, party_id, false)));
 }
 
 // =============================================================================
@@ -609,16 +675,13 @@ struct SecurePipeline {
     SecureCohort nonumass;
 };
 
-// `rows_a` / `rows_b` are PUBLIC row counts from the run manifest, not
-// half_a.rows() / half_b.rows(). In a cross-organisational run a party holds
-// only its own half, so the other one is empty locally -- deriving the padded
-// size from the local vectors would give each party a different N and the
-// shares would not line up.
-SecurePipeline RunSecurePipeline(EngineRef engine, const PlainFlagged& half_a, int party_a,
-                                 const PlainFlagged& half_b, int party_b, size_t rows_a,
-                                 size_t rows_b) {
-    SecureColumns c = MergeTwoOwners(engine, half_a, party_a, half_b, party_b, rows_a, rows_b);
-
+// Everything after ingestion. Both data models -- two owners merged, or one
+// owner's whole table -- reach this with the same object: a shared table already
+// ascending on (subject_id, encounter_dt). Nothing below can tell which produced
+// it, which is the point of the split.
+//
+// `n_real` is the number of REAL rows, for the cohorts' reported row counts.
+SecurePipeline SequenceSharedTable(EngineRef engine, SecureColumns& c, size_t n_real) {
     // --- flagged_dx pass 2: sequencing on the date order ---------------------
     std::vector<BV> subject_keys{c.subject_key};
     ScanPlan plan_dt = BuildScanPlan(c.subject_key);
@@ -655,10 +718,31 @@ SecurePipeline RunSecurePipeline(EngineRef engine, const PlainFlagged& half_a, i
         BuildCohort(engine, c, per_system, umass_valid, sys_keys, plan_sys, SystemScope::UMass),
         BuildCohort(engine, c, per_system, nonumass_valid, sys_keys, plan_sys,
                     SystemScope::NonUMass)};
-    out.any.n = rows_a + rows_b;
-    out.umass.n = rows_a + rows_b;
-    out.nonumass.n = rows_a + rows_b;
+    out.any.n = n_real;
+    out.umass.n = n_real;
+    out.nonumass.n = n_real;
     return out;
+}
+
+// `rows_a` / `rows_b` are PUBLIC row counts from the run manifest, not
+// half_a.rows() / half_b.rows(). In a cross-organisational run a party holds
+// only its own half, so the other one is empty locally -- deriving the padded
+// size from the local vectors would give each party a different N and the
+// shares would not line up.
+SecurePipeline RunSecurePipeline(EngineRef engine, const PlainFlagged& half_a, int party_a,
+                                 const PlainFlagged& half_b, int party_b, size_t rows_a,
+                                 size_t rows_b) {
+    SecureColumns c = MergeTwoOwners(engine, half_a, party_a, half_b, party_b, rows_a, rows_b);
+    return SequenceSharedTable(engine, c, rows_a + rows_b);
+}
+
+// The single-owner data model. `rows` is the manifest row count after the pass-1
+// filter, public for the same reason rows_a / rows_b are: every party pads from
+// it, and the parties that do not own the file cannot read its length.
+SecurePipeline RunSecurePipelineSingleOwner(EngineRef engine, const PlainFlagged& half,
+                                            int party, size_t rows) {
+    SecureColumns c = ShareOneOwner(engine, half, party, rows);
+    return SequenceSharedTable(engine, c, rows);
 }
 
 }  // namespace cdough::regression

@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <numeric>
 #include <vector>
 
 #include "cdough.h"
+#include "core/random/prg/prg_algorithm.h"
 
 // Fixed-point kernels for the MPC analysis pipeline: the types and constants
 // everything else is built on, plus the transcendental and division routines.
@@ -710,6 +712,128 @@ double OpenScalar(const AV& v, bool scaled = true) {
     auto opened = v.open();
     const double raw = static_cast<double>(opened[0]);
     return scaled ? raw / scale : raw;
+}
+
+// =============================================================================
+// Opening to ONE party
+//
+// SharedVector::open() (shared_vector.h:143) reveals to EVERY party. That is the
+// right default for a result the parties jointly agreed to learn, and the wrong
+// one when the result belongs to a single party -- the lone data owner of
+// `--owner`, who contributed the whole input and is the only party entitled to
+// anything derived from it.
+//
+// The recipient masks first:
+//
+//   1. the recipient draws r uniformly over the whole ring and secret-shares it;
+//   2. every party opens x + r;
+//   3. only the recipient subtracts r back off.
+//
+// x + r is uniform on Z_2^64 and independent of x, so step 2 discloses nothing
+// to anyone else -- information-theoretically, not computationally. The cost is
+// one extra secret-share and one extra open, and it uses nothing beyond
+// secret_share and open, so it behaves identically under every protocol the
+// framework compiles.
+//
+// These calls are COLLECTIVE. Every party must reach them, whatever it intends
+// to do with the result: the open underneath is a synchronised exchange and a
+// party that skips it hangs the rest.
+//
+// `reveal_to < 0` means "reveal to everybody", so a call site can carry one
+// parameter instead of branching.
+// =============================================================================
+
+// A uniformly random ring element per slot, from /dev/urandom via the
+// framework's own PRG rather than a seeded std:: generator: the mask is the only
+// thing standing between the other parties and the recipient's output, so it has
+// to be drawn from a source that is not reproducible from a captured state.
+cdough::Vector<DataType> RandomRingVector(size_t n) {
+    cdough::Vector<DataType> out(n, 0);
+    if (n == 0) return out;
+    cdough::random::DevUrandomPRGAlgorithm prg;
+    std::vector<uint8_t> bytes(n * sizeof(DataType));
+    prg.fillBytes(std::span<uint8_t>(bytes.data(), bytes.size()));
+    for (size_t i = 0; i < n; ++i) {
+        DataType word = 0;
+        std::memcpy(&word, bytes.data() + i * sizeof(DataType), sizeof(DataType));
+        out[i] = word;
+    }
+    return out;
+}
+
+// Reveal an arithmetic vector to `reveal_to` alone, as raw ring elements. Every
+// other party gets an empty vector back.
+std::vector<DataType> OpenRawToParty(const AV& v, int reveal_to, int party_id) {
+    const size_t n = v.size();
+    auto decode = [n](const auto& opened) {
+        std::vector<DataType> out(n);
+        for (size_t i = 0; i < n; ++i) out[i] = static_cast<DataType>(opened[i]);
+        return out;
+    };
+    if (reveal_to < 0) return decode(v.open());
+
+    const bool mine = (party_id == reveal_to);
+    cdough::Vector<DataType> mask = mine ? RandomRingVector(n) : cdough::Vector<DataType>(n, 0);
+    EngineRef engine = v.engine;
+    AV shared_mask = engine.template secret_share_a<DataType>(mask, reveal_to, 0);
+    shared_mask.setPrecision(0);
+
+    AV masked = Clone(v);
+    masked.setPrecision(0);
+    masked += shared_mask;
+
+    const auto opened = masked.open();  // uniform, and independent of v
+    if (!mine) return {};
+
+    std::vector<DataType> out(n);
+    for (size_t i = 0; i < n; ++i)
+        out[i] = static_cast<DataType>(opened[i]) - mask[i];  // -fwrapv: wraps, exactly
+    return out;
+}
+
+// The boolean-sharing counterpart. Same construction with XOR in place of
+// addition, which is the group operation B-shares live in.
+std::vector<DataType> OpenRawToParty(const BV& v, int reveal_to, int party_id) {
+    const size_t n = v.size();
+    auto decode = [n](const auto& opened) {
+        std::vector<DataType> out(n);
+        for (size_t i = 0; i < n; ++i) out[i] = static_cast<DataType>(opened[i]);
+        return out;
+    };
+    if (reveal_to < 0) return decode(v.open());
+
+    const bool mine = (party_id == reveal_to);
+    cdough::Vector<DataType> mask = mine ? RandomRingVector(n) : cdough::Vector<DataType>(n, 0);
+    EngineRef engine = v.engine;
+    BV shared_mask = engine.template secret_share_b<DataType>(mask, reveal_to);
+
+    BV masked(n, engine);
+    masked = v;
+    masked ^= shared_mask;
+
+    const auto opened = masked.open();
+    if (!mine) return {};
+
+    std::vector<DataType> out(n);
+    for (size_t i = 0; i < n; ++i) out[i] = static_cast<DataType>(opened[i]) ^ mask[i];
+    return out;
+}
+
+// OpenToDoubles, revealed to one party. Empty on every other party.
+std::vector<double> OpenToPartyDoubles(const AV& v, int reveal_to, int party_id) {
+    const std::vector<DataType> raw = OpenRawToParty(v, reveal_to, party_id);
+    std::vector<double> out(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) out[i] = static_cast<double>(raw[i]) / scale;
+    return out;
+}
+
+// OpenScalar, revealed to one party. Returns 0 on every other party, which is a
+// placeholder and not a result -- callers must gate on `party_id == reveal_to`.
+double OpenScalarToParty(const AV& v, int reveal_to, int party_id, bool scaled = true) {
+    const std::vector<DataType> raw = OpenRawToParty(v, reveal_to, party_id);
+    if (raw.empty()) return 0.0;
+    const double value = static_cast<double>(raw[0]);
+    return scaled ? value / scale : value;
 }
 
 }  // namespace cdough::regression

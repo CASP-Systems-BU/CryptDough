@@ -14,3 +14,5 @@ Short list of all tasks so far.
 - 0010 — Secure matrix inversion via Newton–Schulz iterations — Status: Done — [tasks/0010_secure-matrix-inversion-newton-schulz.md](0010_secure-matrix-inversion-newton-schulz.md)
 - 0011 — Full pipeline from cdrcatsse_match_pcc across two owners: oblivious merge + in-MPC rank/sequencing — Status: Done — [tasks/0011_two-owner-merge-and-oblivious-rank.md](0011_two-owner-merge-and-oblivious-rank.md)
 - 0012 — SQLite cross-check for the relational stage (`flagged_dx` pass 2 + per-system re-sequencing); restore the stale Python oracle — Status: Done — [tasks/0012_sqlite-relational-verification.md](0012_sqlite-relational-verification.md)
+- 0013 — Run one lineage node, for one data owner: `-N` node selection, single-owner ingest, output opened to that party alone — Status: Done — [tasks/0013_single-owner-node-runner.md](0013_single-owner-node-runner.md)
+- 0014 — Convergence over the production data ranges: magnitude is free, the `visit_num` tail is not — Status: Done — [tasks/0014_production-range-convergence-test.md](0014_production-range-convergence-test.md)

@@ -27,14 +27,22 @@ struct SisaCounts {
     long null_fu_rows = 0;
 };
 
-std::vector<SisaCounts> ReportSisaCounts(SecureCohort& c, int party_id) {
+// `reveal_to` names the party the counts belong to; -1 publishes them to every
+// party, which is the two-owner default. The party that receives them is also
+// the one that prints them, so a run with `--owner 0` leaves parties 1 and 2
+// with nothing on stdout and nothing in their process memory.
+//
+// Collective: every party must call this, because the opens inside are.
+std::vector<SisaCounts> ReportSisaCounts(SecureCohort& c, int party_id, int reveal_to = -1,
+                                         bool print = true) {
     std::vector<SisaCounts> out;
 
     // Rows the follow-up windows cannot see at all.
     AV not_present = -c.fu_present;
     not_present += DataType(1);
     AV dropped = *(not_present * c.valid);
-    const long null_rows = static_cast<long>(std::llround(OpenScalar(MaskCount(dropped), false)));
+    const long null_rows = static_cast<long>(
+        std::llround(OpenScalarToParty(MaskCount(dropped), reveal_to, party_id, false)));
 
     for (DataType w : kFuWindows) {
         // in_window = fu_month is non-null AND equals w.
@@ -63,9 +71,12 @@ std::vector<SisaCounts> ReportSisaCounts(SecureCohort& c, int party_id) {
 
         SisaCounts r;
         r.window = static_cast<long>(w);
-        r.total_pts = static_cast<long>(std::llround(OpenScalar(total_pts, false)));
-        r.pts_with_sisa = static_cast<long>(std::llround(OpenScalar(pts_with_sisa, false)));
-        r.total_sa = static_cast<long>(std::llround(OpenScalar(total_sa, false)));
+        r.total_pts = static_cast<long>(
+            std::llround(OpenScalarToParty(total_pts, reveal_to, party_id, false)));
+        r.pts_with_sisa = static_cast<long>(
+            std::llround(OpenScalarToParty(pts_with_sisa, reveal_to, party_id, false)));
+        r.total_sa = static_cast<long>(
+            std::llround(OpenScalarToParty(total_sa, reveal_to, party_id, false)));
         r.sisa_pct = r.total_pts > 0 ? 100.0 * static_cast<double>(r.pts_with_sisa) /
                                            static_cast<double>(r.total_pts)
                                      : 0.0;
@@ -73,7 +84,8 @@ std::vector<SisaCounts> ReportSisaCounts(SecureCohort& c, int party_id) {
         out.push_back(r);
     }
 
-    if (party_id != 0) return out;
+    const int recipient = reveal_to < 0 ? 0 : reveal_to;
+    if (party_id != recipient || !print) return out;
 
     const std::string suffix = c.scope == SystemScope::Any
                                    ? ""

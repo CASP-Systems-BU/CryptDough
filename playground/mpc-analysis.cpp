@@ -1,7 +1,8 @@
 // MPC port of the SISA acute-care analysis pipeline.
 //   https://cs-people.bu.edu/liagos/pilot/mpc_analysis_lineage.html
 //
-// Two owners' halves of cdrcatsse_match_pcc in; seventeen terminal outputs out --
+// Two owners' halves of cdrcatsse_match_pcc in -- or ONE owner's whole table,
+// with --owner -- and seventeen terminal outputs out --
 // three one-row aggregate tables and fourteen fitted regression models (six
 // specifications across three populations, minus the four interaction fits that
 // can only run on the pooled table). The three analysis tables (any_system,
@@ -55,10 +56,30 @@
 //   ./mpc-analysis -pa 0 -pb 1                # which party owns which half
 //   ./mpc-analysis -cc 50 -ic 5 -cl 1         # even split, 5% ID conflicts, and
 //                                             # run the conflict_list check
+//
+// Running ONE node, for ONE data owner (see tasks/0013):
+//
+//   ./mpc-analysis -N 5a:umass -ow 0 \
+//       -D /data -F input.csv -rs 1310 -o /out/5a_umass.csv
+//
+//     -N  which lineage node to run; -N all (default) runs the whole pipeline.
+//         Relational query steps, aggregate nodes and individual model fits are
+//         all addressable -- see `-N ?` for the list.
+//     -ow the SINGLE data owner. That party holds the one input CSV, secret-
+//         shares it to the others, and is the only party the node's output is
+//         opened to. Omit it for the two-owner data model, where outputs are
+//         published to everybody.
+//     -F  the owner's CSV, inside -D. Only party -ow opens it.
+//     -rs its row count AFTER the pass-1 visit_type filter, from the manifest --
+//         the single-owner counterpart of -ra/-rb, and public for the same
+//         reason: every party pads from it and the non-owners cannot read the
+//         file's length.
+//     -o  where the owner writes the node's result, as CSV.
 
 #include "cdough.h"
 
 #include "./harness.h"
+#include "./output.h"
 #include "./reporting.h"
 #include "./secure.h"
 
@@ -118,6 +139,14 @@ const SecureCohort& PickCohort(const SecureCohort& any, const SecureCohort& umas
     return any;
 }
 
+// ReportSisaCounts caches its scan plan, so it needs a mutable cohort.
+SecureCohort& PickCohortMut(SecureCohort& any, SecureCohort& umass, SecureCohort& nonumass,
+                            SystemScope s) {
+    if (s == SystemScope::UMass) return umass;
+    if (s == SystemScope::NonUMass) return nonumass;
+    return any;
+}
+
 const PlainCohort& PickPlain(const PlainCohort& any, const PlainCohort& umass,
                              const PlainCohort& nonumass, SystemScope s) {
     if (s == SystemScope::UMass) return umass;
@@ -138,11 +167,11 @@ int main(int argc, char** argv) {
     //   models   - the fourteen regression fits
     //   all      - everything (default)
     const std::string stage = engine.getArg<std::string>("stage", "S", "all");
-    const bool run_kernels = (stage == "kernels" || stage == "all");
-    const bool run_describe = (stage == "describe" || stage == "models" || stage == "all");
-    const bool run_models = (stage == "models" || stage == "all");
-    const bool run_bench = (stage == "bench");
-    const bool print_describe = (stage == "describe" || stage == "all");
+    bool run_kernels = (stage == "kernels" || stage == "all");
+    bool run_describe = (stage == "describe" || stage == "models" || stage == "all");
+    bool run_models = (stage == "models" || stage == "all");
+    bool run_bench = (stage == "bench");
+    bool print_describe = (stage == "describe" || stage == "all");
 
     // Number of patients in the synthetic cohort. Ignored in CSV mode.
     const int num_subjects = engine.getArg<int>("subjects", "r", 200);
@@ -185,6 +214,78 @@ int main(int argc, char** argv) {
     // cached per-level group bits, for A/B measurement.
     g_use_cached_scans = engine.getArg<int>("cached-scans", "C", 1) != 0;
 
+    // ---------------------------------------------- one node, one data owner
+    //
+    // Which lineage node to run. `all` keeps the whole-pipeline behaviour; any
+    // other value computes that node and nothing else.
+    const std::string node_arg = engine.getArg<std::string>("node", "N", "all");
+    // The SINGLE data owner, when there is one: the party that holds the one
+    // input CSV, secret-shares it to the others, and receives the output. -1
+    // selects the two-owner data model, where -pa / -pb each hold a half and
+    // every output is published to all parties.
+    const int owner = engine.getArg<int>("owner", "ow", -1);
+    const std::string file_one = engine.getArg<std::string>("file", "F", "base_owner.csv");
+    // Row count after the pass-1 visit_type filter -- the single-owner
+    // counterpart of -ra / -rb, public for the same reason.
+    const int rows_one = engine.getArg<int>("rows", "rs", 0);
+    // Where the owner writes the node's result.
+    const std::string out_file = engine.getArg<std::string>("out-file", "o", "");
+
+    const bool single_owner = (owner >= 0);
+    // -1 is the framework's own open(): every party learns the value. With a
+    // single owner the output belongs to that party alone, and every open below
+    // is masked so that it does.
+    const int reveal_to = single_owner ? owner : -1;
+
+    if (node_arg == "?" || node_arg == "help" || node_arg == "list") {
+        if (pID == 0) std::cout << "-N accepts:\n" << kNodeHelp << std::endl;
+        return 0;
+    }
+    NodeRequest node;
+    {
+        std::string err;
+        if (!ParseNode(node_arg, node, err)) {
+            if (pID == 0)
+                std::cerr << "FATAL: -N " << node_arg << ": " << err << "\n\n-N accepts:\n"
+                          << kNodeHelp << std::endl;
+            return 1;
+        }
+    }
+    const bool one_node = (node.kind != NodeKind::All);
+
+    if (single_owner && owner >= engine.getNumParties()) {
+        if (pID == 0)
+            std::cerr << "FATAL: --owner " << owner << " is not a party in this run ("
+                      << engine.getNumParties() << " parties)." << std::endl;
+        return 1;
+    }
+    if (single_owner && check_sql) {
+        if (pID == 0)
+            std::cerr << "FATAL: -Q opens all three analysis tables to EVERY party so they "
+                         "can be diffed against SQLite, which is the opposite of what "
+                         "--owner asks for. Run the cross-check without --owner."
+                      << std::endl;
+        return 1;
+    }
+    if (!out_file.empty() && !one_node) {
+        if (pID == 0)
+            std::cerr << "FATAL: -o writes ONE node's result, so it needs -N to say which."
+                      << std::endl;
+        return 1;
+    }
+
+    // Naming a node is its own stage: it needs ingestion whatever -S says, and
+    // it runs nothing else. The accuracy harnesses are minutes of work that say
+    // nothing about the node, so they run only when -S kernels asks for them by
+    // name rather than falling out of the default -S all.
+    if (one_node) {
+        run_kernels = (stage == "kernels");
+        run_describe = true;
+        run_models = false;
+        run_bench = false;
+        print_describe = false;
+    }
+
     if (run_kernels) {
         TestNewKernels(engine, pID);
         TestSegmented(engine, pID);
@@ -212,11 +313,39 @@ int main(int argc, char** argv) {
     OwnerSplit split;
     // Only the synthetic path can build the plaintext oracle, because the oracle
     // needs the UNION -- which is exactly what no party holds in a real run.
+    // (With a single owner that party DOES hold the union, but the other parties
+    // do not, so building it here would make them diverge; the oracle stays off.)
     const bool have_oracle = data_dir.empty();
+
+    // With one data owner everything lives in half A and half B stays empty, so
+    // the ingestion, the MRN repair and pass 1 below are shared with the
+    // two-owner path unchanged. Only the shape of the secure table differs, and
+    // that difference is confined to RunSecurePipelineSingleOwner.
+    const int in_party_a = single_owner ? owner : party_a;
+    const int in_party_b = single_owner ? owner : party_b;
+
+    // With a single party in the protocol this process stands in for every
+    // owner, so it must open every file; otherwise each party opens only its
+    // own and the rest stay empty until the shares arrive.
+    const bool simulate_all = (engine.getNumParties() <= 1);
 
     if (data_dir.empty()) {
         PlainBaseTable base = GenerateBaseTable(static_cast<size_t>(num_subjects), truth);
-        split = SplitAcrossOwners(base, concentration, id_conflict_rate);
+        if (single_owner)
+            split.a = base;  // one owner holds the whole of cdrcatsse_match_pcc
+        else
+            split = SplitAcrossOwners(base, concentration, id_conflict_rate);
+    } else if (single_owner) {
+        if (rows_one <= 0) {
+            if (pID == 0)
+                std::cerr << "FATAL: --owner with --data-dir needs --rows (the manifest "
+                             "row count, after the pass-1 visit_type filter). The table "
+                             "is padded to one public length, and the parties that do "
+                             "not own the file cannot read its length."
+                          << std::endl;
+            return 1;
+        }
+        split.a = LoadOwnedBaseTable(data_dir, file_one, owner, pID, simulate_all);
     } else {
         if (rows_a <= 0 || rows_b <= 0) {
             if (pID == 0)
@@ -228,10 +357,6 @@ int main(int argc, char** argv) {
                           << std::endl;
             return 1;
         }
-        // With a single party in the protocol this process stands in for every
-        // owner, so it must open both halves; otherwise each party opens only
-        // its own and the other stays empty until the shares arrive.
-        const bool simulate_all = (engine.getNumParties() <= 1);
         split.a = LoadOwnedBaseTable(data_dir, file_a, party_a, pID, simulate_all);
         split.b = LoadOwnedBaseTable(data_dir, file_b, party_b, pID, simulate_all);
     }
@@ -248,9 +373,8 @@ int main(int argc, char** argv) {
     if (!data_dir.empty()) {
         // A row-count disagreement does not fail cleanly later: the parties would
         // pad to different lengths and the shares would not line up.
-        const bool simulate_all = (engine.getNumParties() <= 1);
-        auto check = [&](int owner, size_t got, int declared, const char* which) {
-            if ((simulate_all || pID == owner) && got != static_cast<size_t>(declared)) {
+        auto check = [&](int holder, size_t got, int declared, const char* which) {
+            if ((simulate_all || pID == holder) && got != static_cast<size_t>(declared)) {
                 std::cerr << "FATAL: owner " << which << "'s half has " << got
                           << " rows after the pass-1 filter but the manifest declares "
                           << declared << ". Every party pads from the manifest, so these "
@@ -259,13 +383,19 @@ int main(int argc, char** argv) {
                 std::exit(1);
             }
         };
-        check(party_a, flagged_a.rows(), rows_a, "A");
-        check(party_b, flagged_b.rows(), rows_b, "B");
-        n_a = static_cast<size_t>(rows_a);
-        n_b = static_cast<size_t>(rows_b);
+        if (single_owner) {
+            check(owner, flagged_a.rows(), rows_one, "");
+            n_a = static_cast<size_t>(rows_one);
+            n_b = 0;
+        } else {
+            check(party_a, flagged_a.rows(), rows_a, "A");
+            check(party_b, flagged_b.rows(), rows_b, "B");
+            n_a = static_cast<size_t>(rows_a);
+            n_b = static_cast<size_t>(rows_b);
+        }
     }
 
-    if (pID == 0 && !out_dir.empty() && have_oracle) {
+    if (pID == 0 && !out_dir.empty() && have_oracle) {  // simulation-only dump
         // Dump the two halves as the owners would hold them, so -O then -D is a
         // round trip.
         WriteBaseTableCsv(split.a, out_dir + "/base_owner_a.csv");
@@ -278,7 +408,16 @@ int main(int argc, char** argv) {
     }
 
     // --- conflict_list, under MPC -------------------------------------------
-    if (check_conflicts) {
+    //
+    // -N conflict_list asks for this node alone, and it does not need the merge
+    // or either sequencing pass, so the run stops here rather than paying for
+    // them. With a single owner the node is degenerate -- one organisation can
+    // see its own MRN collisions in the clear -- and it is answered anyway, on
+    // the owner's rows, so the two data models take the same code path.
+    long conflict_count = -1;
+    const bool want_conflicts = check_conflicts || node.kind == NodeKind::ConflictList;
+    const int conflict_recipient = reveal_to < 0 ? 0 : reveal_to;
+    if (want_conflicts) {
         std::vector<DataType> ma, sa_, mb, sb_;
         for (size_t i = 0; i < split.a.rows(); ++i) {
             ma.push_back(MrnToInt(split.a.pat_mrn[i]));
@@ -288,15 +427,16 @@ int main(int argc, char** argv) {
             mb.push_back(MrnToInt(split.b.pat_mrn[i]));
             sb_.push_back(split.b.subject_id[i]);
         }
-        const long secure_n =
-            SecureConflictCount(engine, ma, sa_, party_a, mb, sb_, party_b);
-        if (pID == 0 && !have_oracle) {
+        const long secure_n = SecureConflictCount(engine, ma, sa_, in_party_a, mb, sb_,
+                                                 in_party_b, reveal_to, pID);
+        conflict_count = secure_n;
+        if (pID == conflict_recipient && !have_oracle) {
             std::cout << "\n=== conflict_list ===\n"
                       << "  MRNs mapping to more than one subject_id: " << secure_n
                       << "  (no plaintext cross-check: it would need both owners' rows)"
                       << std::endl;
         }
-        if (pID == 0 && have_oracle) {
+        if (pID == conflict_recipient && have_oracle) {
             // The oracle has to be the UNION OF WHAT THE OWNERS HOLD, after the
             // repair -- not the pre-split base table. A study-ID disagreement
             // between the two owners does not exist until the split creates it,
@@ -320,6 +460,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (node.kind == NodeKind::ConflictList) {
+        if (pID == conflict_recipient && !out_file.empty()) {
+            if (!WriteConflictCsv(out_file, conflict_count)) return 1;
+            std::cout << "\nwrote conflict_list to " << out_file << std::endl;
+        }
+        return 0;
+    }
+
     // The plaintext mirror of the cross-party half, over the union. NOTHING in a
     // real deployment can compute this: it needs both halves, which is exactly
     // what no party holds. It exists only in the synthetic path, where every
@@ -332,8 +480,16 @@ int main(int argc, char** argv) {
     }
 
     // --- merge, sequence, re-sequence per system -----------------------------
+    //
+    // One owner needs no merge: it sorted its whole table locally, so the shared
+    // table is already ordered and the log N compare-swap stages have nothing to
+    // do. It also pads to NextPowerOfTwo(n) rather than twice that, because
+    // there is no second half to match. Everything after ingestion is identical,
+    // which is why both calls land in the same SequenceSharedTable.
     SecurePipeline pipeline =
-        RunSecurePipeline(engine, flagged_a, party_a, flagged_b, party_b, n_a, n_b);
+        single_owner
+            ? RunSecurePipelineSingleOwner(engine, flagged_a, owner, n_a)
+            : RunSecurePipeline(engine, flagged_a, party_a, flagged_b, party_b, n_a, n_b);
     SecureCohort& any = pipeline.any;
     SecureCohort& umass = pipeline.umass;
     SecureCohort& nonumass = pipeline.nonumass;
@@ -383,12 +539,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (pID == 0) {
+    const int banner_party = reveal_to < 0 ? 0 : reveal_to;
+    if (pID == banner_party) {
+        std::ostringstream owners;
+        if (single_owner)
+            owners << "sole owner: party " << owner << ", " << n_a << " rows (file "
+                   << (data_dir.empty() ? "synthetic" : file_one)
+                   << "); output opened to that party only";
+        else
+            owners << "owner A rows " << n_a << " (party " << party_a << "), "
+                   << "owner B rows " << n_b << " (party " << party_b << ")";
         std::cout << "\n################ MPC analysis pipeline ################\n"
                   << "source: " << (data_dir.empty() ? "synthetic base table" : data_dir)
                   << "\n"
-                  << "owner A rows " << n_a << " (party " << party_a << "), "
-                  << "owner B rows " << n_b << " (party " << party_b << ")\n"
+                  << owners.str() << "\n"
                   << std::left << std::setw(20) << "table" << std::setw(12) << "rows"
                   << std::setw(12) << "padded" << std::setw(12) << "patients" << std::endl;
         for (const SecureCohort* c : {&any, &umass, &nonumass})
@@ -402,6 +566,56 @@ int main(int argc, char** argv) {
                       << "  slope_diff(UMass-nonUMass)=" << truth.slope_diff << std::endl;
     }
 
+    // ----------------------------------------------------- one node, and stop
+    //
+    // Everything above is shared with the full run: ingestion and the relational
+    // stage are what every node reads. What differs is that exactly one terminal
+    // output is computed, and that with --owner its opens are masked so only the
+    // owner sees it -- the other parties reach every open, get nothing back, and
+    // write nothing.
+    if (one_node) {
+        const bool mine = (pID == (reveal_to < 0 ? 0 : reveal_to));
+        switch (node.kind) {
+            case NodeKind::Relational: {
+                const SecureCohort& c = PickCohort(any, umass, nonumass, node.scope);
+                const PlainCohort table = OpenCohortToParty(c, reveal_to, pID);
+                if (mine) {
+                    std::cout << "\n=== " << ScopeName(node.scope) << "  ["
+                              << ScopeLabel(node.scope) << "] ===\n"
+                              << "  " << table.rows() << " encounters, " << c.num_subjects
+                              << " patients" << std::endl;
+                    if (!out_file.empty() && !WriteCohortCsv(out_file, table)) return 1;
+                }
+                break;
+            }
+            case NodeKind::Counts: {
+                SecureCohort& c = PickCohortMut(any, umass, nonumass, node.scope);
+                const std::vector<SisaCounts> rows = ReportSisaCounts(c, pID, reveal_to);
+                if (mine && !out_file.empty() && !WriteCountsCsv(out_file, node.scope, rows))
+                    return 1;
+                break;
+            }
+            case NodeKind::Model: {
+                const SecureCohort& c = PickCohort(any, umass, nonumass, node.spec.scope);
+                ModelData md = BuildDesign(c, node.spec, reveal_to, pID);
+                const FitResult fit =
+                    node.spec.random_intercept
+                        ? FitGlmmLaplace(md, node.spec, pID, reveal_to)
+                        : FitLogisticIrls(md, node.spec, reveal_to, pID);
+                if (mine) {
+                    PrintFit(fit, node.spec);
+                    if (!out_file.empty() && !WriteFitCsv(out_file, fit, node.spec)) return 1;
+                }
+                break;
+            }
+            default:
+                break;  // ConflictList returned above; All is not one_node
+        }
+        if (mine && !out_file.empty())
+            std::cout << "\nwrote " << node.name << " to " << out_file << std::endl;
+        return 0;
+    }
+
     if (run_bench) {
         BenchmarkObjective(engine, pID, any);
         return 0;
@@ -409,28 +623,28 @@ int main(int argc, char** argv) {
 
     // ------------------------------------------------------------- the counts
     if (print_describe) {
-        ReportSisaCounts(any, pID);
-        ReportSisaCounts(umass, pID);
-        ReportSisaCounts(nonumass, pID);
+        ReportSisaCounts(any, pID, reveal_to);
+        ReportSisaCounts(umass, pID, reveal_to);
+        ReportSisaCounts(nonumass, pID, reveal_to);
     }
 
     if (!run_models) return 0;
 
     // ------------------------------------------------------------- the models
     const std::vector<ModelSpec> specs = AllModelSpecs();
-    if (pID == 0)
+    if (pID == banner_party)
         std::cout << "\n################ " << specs.size()
                   << " regression models ################" << std::endl;
 
     std::vector<FitResult> fits;
     for (const ModelSpec& spec : specs) {
         const SecureCohort& c = PickCohort(any, umass, nonumass, spec.scope);
-        ModelData md = BuildDesign(c, spec);
+        ModelData md = BuildDesign(c, spec, reveal_to, pID);
 
-        FitResult r = spec.random_intercept ? FitGlmmLaplace(md, spec, pID)
-                                            : FitLogisticIrls(md, spec);
+        FitResult r = spec.random_intercept ? FitGlmmLaplace(md, spec, pID, reveal_to)
+                                            : FitLogisticIrls(md, spec, reveal_to, pID);
         fits.push_back(r);
-        if (pID == 0) PrintFit(r, spec);
+        if (pID == banner_party) PrintFit(r, spec);
 
         // Score against the plaintext oracle. For the fixed-effects models this
         // is the same estimator in double precision, so the two should agree to
@@ -438,7 +652,7 @@ int main(int argc, char** argv) {
         // estimand -- it ignores the random intercept -- so it is reported as
         // context, with the generating parameters as the real reference.
         // The oracle needs both halves, so it only exists in the synthetic path.
-        if (pID == 0 && have_oracle) {
+        if (pID == banner_party && have_oracle) {
             const PlainCohort& pc = PickPlain(any_plain, umass_plain, nonumass_plain, spec.scope);
             std::vector<double> x_rm, y, mask;
             size_t pp = 0;
@@ -468,7 +682,7 @@ int main(int argc, char** argv) {
     }
 
     // --------------------------------------------------------------- summary
-    if (pID == 0) {
+    if (pID == banner_party) {
         std::cout << "\n################ summary ################\n"
                   << std::left << std::setw(8) << "model" << std::setw(18) << "population"
                   << std::setw(32) << "time term" << std::setw(14) << "estimate"

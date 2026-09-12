@@ -59,7 +59,12 @@ struct ModelData {
           last_of_subject(np, engine) {}
 };
 
-ModelData BuildDesign(const SecureCohort& c, const ModelSpec& spec) {
+// `reveal_to` names the party entitled to this model's output; -1 publishes to
+// everybody, which is the default and the two-owner behaviour. The only values
+// this function opens are the two row counts it reports, so they follow the same
+// rule as the coefficients.
+ModelData BuildDesign(const SecureCohort& c, const ModelSpec& spec, int reveal_to = -1,
+                      int party_id = 0) {
     EngineRef engine = c.valid.engine;
 
     // Column list, in the order SAS lists them.
@@ -154,10 +159,11 @@ ModelData BuildDesign(const SecureCohort& c, const ModelSpec& spec) {
     md.y = *(y * DataType(scale));
     md.y.setPrecision(0);
 
-    md.rows_used = static_cast<long>(std::llround(OpenScalar(MaskCount(md.row_mask), false)));
+    md.rows_used = static_cast<long>(
+        std::llround(OpenScalarToParty(MaskCount(md.row_mask), reveal_to, party_id, false)));
     AV dropped = c.valid - md.row_mask;
-    md.rows_dropped_null_fu =
-        static_cast<long>(std::llround(OpenScalar(MaskCount(dropped), false)));
+    md.rows_dropped_null_fu = static_cast<long>(
+        std::llround(OpenScalarToParty(MaskCount(dropped), reveal_to, party_id, false)));
     return md;
 }
 
@@ -232,7 +238,8 @@ constexpr int kIrlsIterations = 8;
 // IRLS rather than BFGS because the Hessian is analytic: convergence is
 // quadratic, and the converged X^T W X IS the inverse asymptotic covariance, so
 // the standard errors come out exact instead of approximated.
-FitResult FitLogisticIrls(const ModelData& md, const ModelSpec& spec) {
+FitResult FitLogisticIrls(const ModelData& md, const ModelSpec& spec, int reveal_to = -1,
+                          int party_id = 0) {
     EngineRef engine = md.y.engine;
     const size_t n = md.n_pad, p = md.p;
 
@@ -281,8 +288,13 @@ FitResult FitLogisticIrls(const ModelData& md, const ModelSpec& spec) {
     r.rows_dropped_null_fu = md.rows_dropped_null_fu;
     r.converged = true;
 
-    const std::vector<double> beta_open = OpenToDoubles(beta);
-    const std::vector<double> cov_open = OpenToDoubles(cov);
+    // The ONLY opens in this estimator are these two, so with `reveal_to` set the
+    // fit discloses nothing to any other party -- not an intermediate, not a
+    // branch. That is a property of IRLS, whose iteration count is fixed and
+    // whose step needs no line search; the mixed models below cannot say it.
+    const std::vector<double> beta_open = OpenToPartyDoubles(beta, reveal_to, party_id);
+    const std::vector<double> cov_open = OpenToPartyDoubles(cov, reveal_to, party_id);
+    if (beta_open.empty()) return r;  // not this party's output
     for (size_t k = 0; k < p; ++k) {
         r.estimate.push_back(beta_open[k]);
         r.se.push_back(std::sqrt(std::max(0.0, cov_open[k * p + k])));
@@ -660,10 +672,14 @@ const double kHessianConditionWarn = 1e6;
 // consistent with the choice already made for p-values: the curvature of the
 // log-likelihood at the optimum is precisely what a published standard error
 // discloses, so evaluating it under MPC would protect nothing.
+// The gradient opens below steer nothing: the axes, the step and the trip count
+// are all public and fixed, so unlike the line search inside MinimizeBFGS these
+// values can go to one party without any other party needing to see them.
 std::vector<double> ObservedInformationSE(const ValueGradFn& objective,
                                           const std::vector<AV>& optimum,
                                           size_t num_reported,
-                                          double* condition_out = nullptr) {
+                                          double* condition_out = nullptr,
+                                          int reveal_to = -1, int party_id = 0) {
     const size_t dim = optimum.size();
     const double h = kHessianStep;
 
@@ -681,7 +697,7 @@ std::vector<double> ObservedInformationSE(const ValueGradFn& objective,
         objective(point, &grad);
         std::vector<double> out;
         out.reserve(dim);
-        for (AV& g : grad) out.push_back(OpenScalar(g));
+        for (AV& g : grad) out.push_back(OpenScalarToParty(g, reveal_to, party_id));
         return out;
     };
 
@@ -763,7 +779,15 @@ std::vector<double> ObservedInformationSE(const ValueGradFn& objective,
     return se;
 }
 
-FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_id) {
+// `reveal_to` restricts this fit's OUTPUT -- coefficients, standard errors and
+// the variance component -- to one party. It does NOT make the whole fit
+// single-party: MinimizeBFGS opens objective values and directional derivatives
+// to steer its Armijo line search, and every party has to follow the same branch
+// for the trip counts to stay public, so those scalars remain visible to all.
+// That leak predates this parameter (tasks/0009 records it as a known follow-up);
+// steps 6a/6b, fitted by IRLS, have no such intermediate.
+FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_id,
+                         int reveal_to = -1) {
     EngineRef engine = md.y.engine;
     const size_t p = md.p;
     const size_t dim = p + 1;  // beta plus s, where sigma = exp(s)
@@ -793,11 +817,12 @@ FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_i
     r.rows_used = md.rows_used;
     r.rows_dropped_null_fu = md.rows_dropped_null_fu;
 
-    for (size_t k = 0; k < p; ++k) r.estimate.push_back(OpenScalar(opt.params[k]));
+    for (size_t k = 0; k < p; ++k)
+        r.estimate.push_back(OpenScalarToParty(opt.params[k], reveal_to, party_id));
     double condition = 0.0;
-    r.se = ObservedInformationSE(objective, opt.params, p, &condition);
+    r.se = ObservedInformationSE(objective, opt.params, p, &condition, reveal_to, party_id);
     r.hessian_condition = condition;
-    const double s_hat = OpenScalar(opt.params[p]);
+    const double s_hat = OpenScalarToParty(opt.params[p], reveal_to, party_id);
     r.sigma2 = std::exp(2.0 * s_hat);
 
     r.notes.push_back(
@@ -819,7 +844,6 @@ FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_i
                     "indicative only";
         r.notes.push_back(note.str());
     }
-    (void)party_id;
     return r;
 }
 
