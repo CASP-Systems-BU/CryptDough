@@ -25,6 +25,11 @@ sosp-replication/data/
 doc/html/
 doc/latex/
 
+# Saved images (docker save) and their scan reports
+docker/*.tar
+docker/*.tar.gz
+docker/cryptdough-sample-*.txt
+
 # Local editor / OS noise
 .DS_Store
 .vscode/

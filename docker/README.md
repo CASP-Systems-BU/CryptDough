@@ -117,9 +117,12 @@ target machine.
 git cmake pkg-config build-essential manpages-dev gfortran wget
 libsqlite3-0 libsqlite3-dev  libsodium23 libsodium-dev
 libopenmpi3 libopenmpi-dev openmpi-bin openmpi-common
-libopenblas-dev libblas-dev  python3 python3-pip
+libopenblas-dev libblas-dev  python3
 libtool autoconf automake
 ```
+
+`_setup_required.sh` also installs `python3-pip`. The image does not: see the Python
+section below.
 
 OpenMPI is **not optional even for nocopy**: `CMakeLists.txt:121` calls
 `find_package(MPI REQUIRED)` outside any communicator guard.
@@ -143,7 +146,6 @@ failure on a lean base image.
 | `sudo` | `sudo` | `wan-sim.py` runs `sudo tc qdisc` |
 | `ca-certificates` | TLS roots | cloning at build time |
 | `perl` | `perl` | NTL's `./configure` is a Perl script |
-| `python3-venv` | venv | Ubuntu 24.04 enforces PEP 668 |
 
 ### TLS (optional, `-DTLS=ON`)
 
@@ -154,7 +156,18 @@ setting, since it changes the wire protocol. See [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ### Python — `requirements.txt`, installed to `/opt/venv`
 
-`numpy`, `matplotlib`, `pandas`, `sphinx_rtd_theme`, `breathe`, `myst_parser`
+`numpy`, `matplotlib`, `pandas`, `sphinx_rtd_theme`, `breathe`, `myst_parser`, `scipy`
+
+The venv is built in a separate `pyenv` stage (Ubuntu 24.04 enforces PEP 668) and only
+`/opt/venv` is copied into the final image. pip is uninstalled from the venv after the
+requirements are in, and `python3-pip`/`python3-venv` are not installed at all. Nothing in the image installs Python packages at run time. If you
+need to add one to a running container:
+
+```bash
+sudo apt-get update && sudo apt-get install -y python3-venv
+sudo /opt/venv/bin/python -m ensurepip
+sudo /opt/venv/bin/python -m pip install <package>
+```
 
 ### Source-built libraries, installed to `/opt/cdough-deps`
 

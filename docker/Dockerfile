@@ -34,14 +34,22 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #  (b) tools the run scripts shell out to that a minimal ubuntu image lacks.
 #      Group (b) is the most common cause of a first-run failure, because these
 #      happen to be preinstalled on a typical cloud VM.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# python3-pip and python3-venv are deliberately absent: they drag in Ubuntu's pip,
+# setuptools and wheel, which carry known CVEs and are only needed to populate the
+# venv. The venv is built in its own stage below and copied in without them.
+#
+# `apt-get upgrade` picks up security updates published after the ubuntu:24.04 base
+# image was cut, so the result does not depend on how stale the local base image is.
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
         `# (a) from scripts/setup/_setup_required.sh` \
         git cmake pkg-config build-essential manpages-dev gfortran wget \
         libsqlite3-0 libsqlite3-dev \
         libsodium23 libsodium-dev \
         libopenmpi3 libopenmpi-dev openmpi-bin openmpi-common \
         libopenblas-dev libblas-dev \
-        python3 python3-pip python3-venv \
+        python3 \
         libtool autoconf automake \
         `# (b) required by startmpc / run_experiment.py / wan-sim.py` \
         openssh-client openssh-server \
@@ -54,12 +62,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         netcat-openbsd curl less nano \
     && rm -rf /var/lib/apt/lists/*
 
-# Ubuntu 24.04 enforces PEP 668, so the plotting stack goes in a venv.
-COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
 ENV PATH=/opt/venv/bin:$PATH
 
 # mpirun refuses to run as root, and scripts/testing/run_multithreaded_test.sh
@@ -74,7 +76,28 @@ RUN groupadd -g ${CDOUGH_GID} ${CDOUGH_USER} \
     && chmod 0440 /etc/sudoers.d/90-${CDOUGH_USER}
 
 ##############################################################################
-# Stage 2: deps — the five source-built libraries.
+# Stage 2: pyenv — the Python plotting/docs stack.
+#
+# Ubuntu 24.04 enforces PEP 668, so it goes in a venv. pip is uninstalled once the
+# requirements are in: it vendors its own msgpack and setuptools, both with known
+# CVEs, and nothing in the image installs Python packages at run time. Only /opt/venv
+# is copied into the runtime stage, leaving python3-venv (and the pip/setuptools
+# wheels it depends on) behind.
+##############################################################################
+FROM base AS pyenv
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
+    && /opt/venv/bin/python -m pip uninstall -y pip \
+    && rm /tmp/requirements.txt
+
+##############################################################################
+# Stage 3: deps — the five source-built libraries.
 #
 # Each library gets its own RUN so that bumping one pin does not invalidate the
 # others. libOTe is the long pole (20-40 min) and fetches boost/relic/sodium
@@ -160,7 +183,7 @@ RUN echo "==== Building Blaze ${BLAZE_TAG}..." \
     && echo "==== Blaze installed"
 
 ##############################################################################
-# Stage 3: runtime — deps + source + launcher wiring.
+# Stage 4: runtime — deps + venv + source + launcher wiring.
 ##############################################################################
 FROM base AS runtime
 
@@ -168,6 +191,7 @@ ARG DEPS_PREFIX=/opt/cdough-deps
 ARG CDOUGH_USER=cdough
 ARG CDOUGH_SRC=/opt/cryptdough
 
+COPY --from=pyenv /opt/venv /opt/venv
 COPY --from=deps ${DEPS_PREFIX} ${DEPS_PREFIX}
 
 # The keystone: CMakeLists.txt's HINTS point into <source>/build, but every one of
