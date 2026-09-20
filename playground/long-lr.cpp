@@ -64,6 +64,8 @@
 #include <string>
 #include <vector>
 
+#define LOGISTIC_REGRESSION_LAYER_PRINT 1
+
 #include "cdough.h"
 
 #include "./regression.h"

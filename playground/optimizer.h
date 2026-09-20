@@ -196,6 +196,16 @@ SMatrix NewtonSchulzInverse(const SMatrix& a, int iterations = kMatrixInverseIte
 // returning one value per point. `params` is length num_points * dim.
 using BatchedObjective = std::function<AV(const AV& params, size_t num_points)>;
 
+// An analytic gradient of that objective at a single parameter point: takes a
+// length-dim point and returns a length-dim gradient.
+//
+// Optional. MinimizeBFGSBatched falls back to NumericalGradientBatched when none
+// is supplied, which is what every caller before task 0019 did. Supplying one is
+// worthwhile when the model has a closed-form gradient: the numerical path costs
+// a 2*dim-wide objective evaluation per iteration, so its cost grows with the
+// parameter count, while an analytic gradient's does not.
+using BatchedGradient = std::function<AV(const AV& params)>;
+
 // Public +-1 pattern that scatters the per-coordinate step h onto the diagonal
 // of the stacked parameter points: +h_k into point k, -h_k into point dim + k,
 // zero everywhere else.
@@ -328,13 +338,19 @@ SMatrix OuterProduct(const AV& a, const AV& b) {
 // communication, so there is nothing to gain by assuming h_inv is symmetric
 // (it only is up to truncation, and relying on that would silently substitute
 // H^T for H as the approximation drifts).
-SMatrix BfgsInverseUpdateBatched(const SMatrix& h_inv, const AV& s, const AV& y, const AV& rho) {
+//
+// `eye` is supplied by the caller rather than built here. This function is called
+// once per BFGS iteration, and Identity() secret-shares n*n elements, so building
+// it internally re-shared the same public constant on every iteration -- a cost
+// that grows quadratically in the parameter count for no benefit. The caller
+// already holds an identity of the right size.
+SMatrix BfgsInverseUpdateBatched(const SMatrix& h_inv, const AV& s, const AV& y, const AV& rho,
+                                 const SMatrix& eye) {
     const size_t n = s.size();
     assert(h_inv.rows() == n && h_inv.cols() == n);
     assert(y.size() == n);
-    EngineRef engine = s.engine;
+    assert(eye.rows() == n && eye.cols() == n);
 
-    SMatrix eye = Identity(n, engine);
     SMatrix left = eye - ScaleMatrix(OuterProduct(s, y), rho);
     left.setPrecision(precision);
 
@@ -458,7 +474,8 @@ LineSearchConstants MakeLineSearchConstants(EngineRef engine) {
 //      shares the single opened flag. `result.iterations` is therefore one
 //      higher than before on that path. The returned parameters are unaffected.
 BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
-                                     int max_iterations = 20) {
+                                     int max_iterations = 20,
+                                     const BatchedGradient& analytic_gradient = nullptr) {
     const size_t n = x0.size();
     EngineRef engine = x0.engine;
 
@@ -475,7 +492,14 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
     AV one(1, engine);
     one += scale;
 
-    AV gradient = NumericalGradientBatched(f, x, selector);
+    // One place decides how the gradient is obtained, so the two call sites below
+    // cannot drift apart. The numerical path is the default and is unchanged.
+    const auto gradient_at = [&](const AV& point) {
+        return analytic_gradient ? analytic_gradient(point)
+                                 : NumericalGradientBatched(f, point, selector);
+    };
+
+    AV gradient = gradient_at(x);
     SMatrix h_inv = Identity(n, engine);
 
     // 1 while the previous iteration's line search succeeded. Starts at 1: there
@@ -654,7 +678,7 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
         // Curvature-gated inverse-Hessian update. Both arms again: the update is
         // always computed, then kept or discarded by multiplex.
         // -------------------------------------------------------------------
-        AV gradient_new = NumericalGradientBatched(f, x_new, selector);
+        AV gradient_new = gradient_at(x_new);
         AV gradient_delta = gradient_new - gradient;
         gradient_delta.setPrecision(precision);
 
@@ -676,7 +700,7 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
         AV safe_curvature = Multiplex(curv_ok, one, curvature);
         AV rho = SecureReciprocal(safe_curvature);
 
-        SMatrix h_updated = BfgsInverseUpdateBatched(h_inv, step, gradient_delta, rho);
+        SMatrix h_updated = BfgsInverseUpdateBatched(h_inv, step, gradient_delta, rho, eye);
         h_inv = SMatrix(Multiplex(curv_ok, h_inv.data(), h_updated.data()), n, n, false);
         h_inv.setPrecision(precision);
 

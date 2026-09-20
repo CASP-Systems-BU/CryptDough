@@ -2,6 +2,7 @@
 #include <cmath>
 #include <functional>
 #include <numeric>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -593,7 +594,9 @@ int main(int argc, char** argv) {
     cdough::Vector<DataType> prho(1, precision); prho[0] = static_cast<DataType>(rho_plain * scale);
     AV rho_sec = engine.secret_share_a(prho, 0, precision);
 
-    SMatrix sec_h_updated = BfgsInverseUpdateBatched(sec_I, s_sec, y_sec, rho_sec);
+    // `sec_I` serves as both the starting inverse-Hessian and the identity the
+    // update needs; the caller now supplies the latter (task 0019).
+    SMatrix sec_h_updated = BfgsInverseUpdateBatched(sec_I, s_sec, y_sec, rho_sec, sec_I);
     auto opened_h_up = sec_h_updated.open();
 
     // Plaintext computation of BfgsInverseUpdate from Identity
@@ -934,6 +937,210 @@ int main(int argc, char** argv) {
                                                     : "   (WORSE than truth)")
                       << std::endl;
             std::cout << "\nAll functions executed and validated successfully against plaintext!" << std::endl;
+        }
+    }
+
+    // =========================================================================
+    // Validation for SecureSqrt, NormalCdf, TwoSidedPValue (task 0019)
+    // =========================================================================
+    //
+    // SecureSqrt is Exp(0.5 * Log(x)), so it composes two operators that each
+    // carry ~1e-4 error. Whether the composition stays inside the accuracy bar is
+    // the measurement that decides between this form and a Newton iteration; the
+    // task document treats it as a gate, not a formality.
+    {
+        const std::vector<double> sqrt_inputs = {0.0001, 0.0025, 0.01, 0.04, 0.25,
+                                                 1.0,    2.0,    4.0,  9.0,  25.0};
+        cdough::Vector<DataType> plain_sqrt_x(sqrt_inputs.size(), precision);
+        for (size_t i = 0; i < sqrt_inputs.size(); ++i) {
+            plain_sqrt_x[i] = static_cast<DataType>(std::llround(sqrt_inputs[i] * scale));
+        }
+        AV secure_sqrt_x = engine.secret_share_a(plain_sqrt_x, 0, precision);
+        AV secure_sqrt = SecureSqrt(secure_sqrt_x);
+        auto opened_sqrt = secure_sqrt.open();
+
+        if (pID == 0) {
+            std::cout << "\n--- SecureSqrt Test Results ---" << std::endl;
+            std::cout << std::left << std::setw(12) << "Input (x)" << std::setw(16) << "Plaintext"
+                      << std::setw(16) << "MPC" << std::setw(14) << "Abs Error" << std::setw(14)
+                      << "Rel Error" << std::endl;
+            double max_abs = 0.0;
+            double max_rel = 0.0;
+            for (size_t i = 0; i < sqrt_inputs.size(); ++i) {
+                const double expected = std::sqrt(sqrt_inputs[i]);
+                const double actual = static_cast<double>(opened_sqrt[i]) / scale;
+                const double abs_error = std::abs(expected - actual);
+                const double rel_error = abs_error / expected;
+                max_abs = std::max(max_abs, abs_error);
+                max_rel = std::max(max_rel, rel_error);
+                std::cout << std::left << std::fixed << std::setprecision(6) << std::setw(12)
+                          << sqrt_inputs[i] << std::setw(16) << expected << std::setw(16)
+                          << actual << std::scientific << std::setprecision(3) << std::setw(14)
+                          << abs_error << std::setw(14) << rel_error << std::endl;
+            }
+            std::cout << "  max abs error = " << std::scientific << std::setprecision(3) << max_abs
+                      << "   max rel error = " << max_rel << std::endl;
+        }
+    }
+
+    // NormalCdf against std::erfc. Absolute error is the wrong yardstick once Phi
+    // is near 1, so the upper tail is reported as a relative error on the small
+    // probability instead.
+    {
+        const std::vector<double> cdf_inputs = {-3.5, -2.5, -1.96, -1.0, -0.5, 0.0,
+                                                0.5,  1.0,  1.96,  2.5,  3.5};
+        cdough::Vector<DataType> plain_cdf_x(cdf_inputs.size(), precision);
+        for (size_t i = 0; i < cdf_inputs.size(); ++i) {
+            plain_cdf_x[i] = static_cast<DataType>(std::llround(cdf_inputs[i] * scale));
+        }
+        AV secure_cdf_x = engine.secret_share_a(plain_cdf_x, 0, precision);
+        AV secure_cdf = NormalCdf(secure_cdf_x);
+        auto opened_cdf = secure_cdf.open();
+
+        if (pID == 0) {
+            std::cout << "\n--- NormalCdf Test Results ---" << std::endl;
+            std::cout << std::left << std::setw(10) << "Input (x)" << std::setw(16) << "Plaintext"
+                      << std::setw(16) << "MPC" << std::setw(14) << "Abs Error" << std::endl;
+            double max_abs = 0.0;
+            for (size_t i = 0; i < cdf_inputs.size(); ++i) {
+                const double expected = 0.5 * std::erfc(-cdf_inputs[i] * kSqrt1_2);
+                const double actual = static_cast<double>(opened_cdf[i]) / scale;
+                const double abs_error = std::abs(expected - actual);
+                max_abs = std::max(max_abs, abs_error);
+                std::cout << std::left << std::fixed << std::setprecision(4) << std::setw(10)
+                          << cdf_inputs[i] << std::setprecision(8) << std::setw(16) << expected
+                          << std::setw(16) << actual << std::scientific << std::setprecision(3)
+                          << std::setw(14) << abs_error << std::endl;
+            }
+            std::cout << "  max abs error = " << std::scientific << std::setprecision(3) << max_abs
+                      << "   (fixed-point resolution at precision " << precision << " is "
+                      << 1.0 / scale << ")" << std::endl;
+        }
+    }
+
+    // Two-sided p-values at the z values an analysis actually reads off.
+    {
+        const std::vector<double> z_inputs = {0.0, 0.5, -1.0, 1.645, -1.96, 2.576, -3.0};
+        cdough::Vector<DataType> plain_z(z_inputs.size(), precision);
+        for (size_t i = 0; i < z_inputs.size(); ++i) {
+            plain_z[i] = static_cast<DataType>(std::llround(z_inputs[i] * scale));
+        }
+        AV secure_z = engine.secret_share_a(plain_z, 0, precision);
+        AV secure_p = TwoSidedPValue(secure_z);
+        auto opened_p = secure_p.open();
+
+        if (pID == 0) {
+            std::cout << "\n--- TwoSidedPValue Test Results ---" << std::endl;
+            std::cout << std::left << std::setw(10) << "z" << std::setw(16) << "Plaintext p"
+                      << std::setw(16) << "MPC p" << std::setw(14) << "Abs Error" << std::endl;
+            double max_abs = 0.0;
+            for (size_t i = 0; i < z_inputs.size(); ++i) {
+                const double expected = std::erfc(std::abs(z_inputs[i]) * kSqrt1_2);
+                const double actual = static_cast<double>(opened_p[i]) / scale;
+                const double abs_error = std::abs(expected - actual);
+                max_abs = std::max(max_abs, abs_error);
+                std::cout << std::left << std::fixed << std::setprecision(4) << std::setw(10)
+                          << z_inputs[i] << std::setprecision(8) << std::setw(16) << expected
+                          << std::setw(16) << actual << std::scientific << std::setprecision(3)
+                          << std::setw(14) << abs_error << std::endl;
+            }
+            std::cout << "  max abs error = " << std::scientific << std::setprecision(3) << max_abs
+                      << std::endl;
+        }
+    }
+
+    // =========================================================================
+    // Differential test: logistic::LogisticGradient vs NumericalGradientBatched
+    // =========================================================================
+    //
+    // Two independent paths to the same quantity on identical secret values. This
+    // is the pattern the rest of this file is built around, and it is the check
+    // that matters most for the analytic gradient: a closed-form gradient that
+    // disagrees with the objective it claims to differentiate would still let BFGS
+    // converge, just to the wrong place.
+    {
+        constexpr size_t kObs = 40;
+        constexpr size_t kFixed = 3;
+
+        std::mt19937 rng(20260917u);
+        std::normal_distribution<double> normal(0.0, 1.0);
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+
+        std::vector<double> flat_x(kObs * kFixed, 0.0);
+        std::vector<double> y(kObs, 0.0);
+        std::vector<double> mask(kObs, 1.0);
+        const std::vector<double> beta_point = {0.4, -0.7, 0.25};
+
+        for (size_t i = 0; i < kObs; ++i) {
+            flat_x[i * kFixed] = 1.0;
+            double eta = beta_point[0];
+            for (size_t j = 1; j < kFixed; ++j) {
+                const double value = normal(rng);
+                flat_x[i * kFixed + j] = value;
+                eta += value * beta_point[j];
+            }
+            const double probability = 1.0 / (1.0 + std::exp(-eta));
+            y[i] = uniform(rng) < probability ? 1.0 : 0.0;
+        }
+
+        const auto share = [&](const std::vector<double>& values) {
+            cdough::Vector<DataType> plain(values.size(), precision);
+            for (size_t i = 0; i < values.size(); ++i) {
+                plain[i] = static_cast<DataType>(std::llround(values[i] * scale));
+            }
+            return engine.secret_share_a(plain, 0, precision);
+        };
+
+        logistic::Dataset gradient_data(share(flat_x), share(y), share(mask), kObs, kFixed);
+        AV beta_shared = share(beta_point);
+
+        const BatchedObjective objective = [&](const AV& params, size_t num_points) {
+            return logistic::NegLogLikBatched(gradient_data, params, num_points);
+        };
+
+        AV selector = MakeCentralDifferenceSelector(kFixed, engine);
+        AV numerical = NumericalGradientBatched(objective, beta_shared, selector);
+        AV analytic = logistic::LogisticGradient(gradient_data, beta_shared);
+
+        auto opened_numerical = numerical.open();
+        auto opened_analytic = analytic.open();
+
+        // Plaintext reference for both.
+        std::vector<double> plain_gradient(kFixed, 0.0);
+        for (size_t i = 0; i < kObs; ++i) {
+            double eta = 0.0;
+            for (size_t j = 0; j < kFixed; ++j) {
+                eta += flat_x[i * kFixed + j] * beta_point[j];
+            }
+            const double probability = 1.0 / (1.0 + std::exp(-eta));
+            for (size_t j = 0; j < kFixed; ++j) {
+                plain_gradient[j] += flat_x[i * kFixed + j] * (probability - y[i]);
+            }
+        }
+
+        if (pID == 0) {
+            std::cout << "\n--- LogisticGradient vs NumericalGradientBatched ---" << std::endl;
+            std::cout << std::left << std::setw(8) << "j" << std::setw(16) << "Plaintext"
+                      << std::setw(16) << "Analytic" << std::setw(16) << "Numerical"
+                      << std::setw(14) << "|A - P|" << std::setw(14) << "|N - P|" << std::endl;
+            double max_analytic_error = 0.0;
+            double max_numerical_error = 0.0;
+            for (size_t j = 0; j < kFixed; ++j) {
+                const double analytic_value = static_cast<double>(opened_analytic[j]) / scale;
+                const double numerical_value = static_cast<double>(opened_numerical[j]) / scale;
+                const double analytic_error = std::abs(analytic_value - plain_gradient[j]);
+                const double numerical_error = std::abs(numerical_value - plain_gradient[j]);
+                max_analytic_error = std::max(max_analytic_error, analytic_error);
+                max_numerical_error = std::max(max_numerical_error, numerical_error);
+                std::cout << std::left << std::setw(8) << j << std::fixed << std::setprecision(6)
+                          << std::setw(16) << plain_gradient[j] << std::setw(16) << analytic_value
+                          << std::setw(16) << numerical_value << std::scientific
+                          << std::setprecision(3) << std::setw(14) << analytic_error
+                          << std::setw(14) << numerical_error << std::endl;
+            }
+            std::cout << std::scientific << std::setprecision(3)
+                      << "  max |analytic - plaintext|  = " << max_analytic_error << "\n"
+                      << "  max |numerical - plaintext| = " << max_numerical_error << std::endl;
         }
     }
 

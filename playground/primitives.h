@@ -33,6 +33,19 @@ const float kSeriesTolerance = 0.0001;
 const float kNumericalGradientStep = 0.05;
 const float kMaxExpArg = 10.0;
 
+// 1 / sqrt(2*pi), the standard normal density's normalizing constant.
+const double kSqrt2Pi_inv = 0.39894228040143268;
+
+// Abramowitz & Stegun 26.2.17: the rational approximation to the standard normal
+// CDF used by NormalCdf. `kAsP` is the argument transform t = 1/(1 + p|x|) and
+// kAsB1..kAsB5 are the polynomial coefficients in t.
+const double kAsP = 0.2316419;
+const double kAsB1 = 0.319381530;
+const double kAsB2 = -0.356563782;
+const double kAsB3 = 1.781477937;
+const double kAsB4 = -1.821255978;
+const double kAsB5 = 1.330274429;
+
 const DataType kLn2_scaled = std::llround(kLn2 * scale);
 const DataType kLn2_inv_scaled = std::llround(kLn2_inv * scale);
 const DataType kSqrt2_scaled = std::llround(kSqrt2 * scale);
@@ -42,6 +55,13 @@ const DataType kSeriesTolerance_scaled = (kSeriesTolerance * scale);
 const DataType kHalf_scaled = (0.5 * scale);
 const DataType kMaxNewtonStep_scaled = (4.0 * scale);
 const DataType kMaxExpArg_scaled = (kMaxExpArg * scale);
+const DataType kSqrt2Pi_inv_scaled = std::llround(kSqrt2Pi_inv * scale);
+const DataType kAsP_scaled = std::llround(kAsP * scale);
+const DataType kAsB1_scaled = std::llround(kAsB1 * scale);
+const DataType kAsB2_scaled = std::llround(kAsB2 * scale);
+const DataType kAsB3_scaled = std::llround(kAsB3 * scale);
+const DataType kAsB4_scaled = std::llround(kAsB4 * scale);
+const DataType kAsB5_scaled = std::llround(kAsB5 * scale);
 
 constexpr int kMaxSeriesTerms = 3;
 constexpr int kMaxNewtonStep = 4;
@@ -347,6 +367,34 @@ AV Log1p(const AV& x) {
     return Log(one_plus_x);
 }
 
+// Secure square root, as Exp(0.5 * Log(x)).
+//
+// Requires x > 0, which is the domain this operator is built for: it exists to
+// take the square root of a variance (a diagonal entry of a covariance matrix),
+// and a non-positive variance is a defect upstream rather than a case to handle.
+// Log's own range reduction bounds the usable interval to roughly [3e-5, 4e4];
+// outside it Log saturates and the result is wrong rather than merely imprecise.
+//
+// WHY THIS FORM. The alternatives considered (task 0019) were a division-free
+// Newton iteration on the inverse square root and a Babylonian iteration. Both
+// need a new fixed iteration bound calibrated by measurement, and Babylonian
+// additionally pays one boolean division circuit per iteration. Composing the two
+// operators already validated here costs nothing new to build, at the price of
+// composing their errors -- which is a measurement, not a guess, and the
+// measurement is in secure-logistic-regression.cpp. If that table ever shows the
+// composed error missing the accuracy bar, the Newton form is the fallback.
+//
+// Obliviousness: inherited from Exp and Log. No branch on shared data, no open().
+AV SecureSqrt(const AV& x) {
+    AV log_x = Log(Clone(x));
+    log_x.setPrecision(0);
+
+    AV half_log = (*(log_x * kHalf_scaled)) / scale;
+    half_log.setPrecision(precision);
+
+    return Exp(half_log);
+}
+
 // Numerically stable logistic function: Sigmoid(eta)
 // For positive eta: z = exp(-eta), return 1 / (1 + z)
 // For negative eta: z = exp(eta), return z / (1 + z)
@@ -418,6 +466,111 @@ AV LogOnePlusExp(const AV& eta) {
     AV result = pos_term + log1p_z;
 
     return result;
+}
+
+// Standard normal CDF Phi(x), by the Abramowitz & Stegun 26.2.17 rational
+// approximation:
+//
+//     Phi(|x|) = 1 - phi(|x|) * (b1 t + b2 t^2 + b3 t^3 + b4 t^4 + b5 t^5),
+//     t = 1 / (1 + p|x|),   phi(u) = exp(-u^2 / 2) / sqrt(2*pi)
+//
+// and the reflection Phi(-x) = 1 - Phi(x) for the negative half.
+//
+// WHY THIS FORM. Its double-precision error is about 7.5e-8, which is two orders
+// of magnitude below what `precision` 16 can represent (1.5e-5), so the fixed-point
+// format is the binding constraint and a more accurate series would buy nothing.
+// It is also a fixed-length expression -- one reciprocal, one Exp, a degree-5
+// Horner chain -- so unlike an iterative form it needs no calibrated iteration
+// bound, and its cost and communication pattern are constants.
+//
+// Obliviousness: the sign split is the `gtez`-and-multiplex idiom used by Sigmoid
+// and LogOnePlusExp, so both halves are evaluated and the result selected. No
+// branch on shared data and no open(). This is what lets a Wald p-value be
+// reported without declassifying the test statistic (task 0019).
+//
+// Accuracy near the tails: absolute error is the wrong yardstick once Phi is near
+// 1. At `precision` 16 the representable resolution is 1.5e-5, so a p-value below
+// roughly 1e-4 should be read as "small" rather than at face value.
+AV NormalCdf(const AV& x) {
+    AV x_raw = Clone(x);
+    x_raw.setPrecision(0);
+
+    // |x| with no division: sign = 2 * gtez(x) - 1 is an unscaled +-1, so
+    // sign * x is already |x| at the original scale.
+    AV mask = *(x_raw.gtez());  // raw 0/1, 1 iff x >= 0
+    mask.setPrecision(0);
+    AV two_mask = *(mask * DataType(2));
+    two_mask -= DataType(1);
+    two_mask.setPrecision(0);
+    AV abs_x = *(two_mask * x_raw);
+    abs_x.setPrecision(0);
+
+    // t = 1 / (1 + p|x|). The only division in the operator.
+    AV denominator = (*(abs_x * kAsP_scaled)) / scale;
+    denominator += scale;
+    denominator.setPrecision(precision);
+    AV t = SecureReciprocal(denominator);
+    t.setPrecision(0);
+
+    // Horner in t: acc = b1 + t*(b2 + t*(b3 + t*(b4 + t*b5))), then poly = t * acc.
+    AV acc(x.size(), x.engine);
+    acc += kAsB5_scaled;
+    acc.setPrecision(0);
+    const DataType coefficients[] = {kAsB4_scaled, kAsB3_scaled, kAsB2_scaled, kAsB1_scaled};
+    for (const DataType coefficient : coefficients) {
+        acc = (*(acc * t)) / scale;
+        acc += coefficient;
+    }
+    AV poly = (*(acc * t)) / scale;
+    poly.setPrecision(0);
+
+    // phi(|x|) = exp(-x^2 / 2) / sqrt(2*pi)
+    AV x_squared = (*(abs_x * abs_x)) / scale;
+    AV half_x_squared = (*(x_squared * kHalf_scaled)) / scale;
+    AV neg_half_x_squared = -half_x_squared;
+    neg_half_x_squared.setPrecision(precision);
+    AV density = Exp(neg_half_x_squared);
+    density.setPrecision(0);
+    density = (*(density * kSqrt2Pi_inv_scaled)) / scale;
+
+    // upper = Phi(|x|); lower = 1 - Phi(|x|) = Phi(-|x|).
+    AV tail = (*(density * poly)) / scale;
+    AV upper = -tail;
+    upper += scale;
+    upper.setPrecision(precision);
+
+    AV lower = -upper;
+    lower += scale;
+    lower.setPrecision(precision);
+
+    return Multiplex(mask, lower, upper);
+}
+
+// Two-sided Wald p-value 2 * (1 - Phi(|z|)) for a vector of z statistics.
+//
+// Computed from |z| directly rather than as 2 * (1 - NormalCdf(|z|)), so the
+// result never passes through the cancellation at Phi near 1.
+AV TwoSidedPValue(const AV& z) {
+    AV z_raw = Clone(z);
+    z_raw.setPrecision(0);
+
+    AV sign = *(z_raw.gtez());
+    sign.setPrecision(0);
+    AV two_sign = *(sign * DataType(2));
+    two_sign -= DataType(1);
+    two_sign.setPrecision(0);
+    AV abs_z = *(two_sign * z_raw);
+    abs_z.setPrecision(precision);
+
+    // Phi(-|z|) is the upper tail; doubling it gives the two-sided p-value.
+    AV neg_abs_z = -abs_z;
+    neg_abs_z.setPrecision(precision);
+    AV upper_tail = NormalCdf(neg_abs_z);
+    upper_tail.setPrecision(0);
+
+    AV p_value = *(upper_tail * DataType(2));
+    p_value.setPrecision(precision);
+    return p_value;
 }
 
 }  // namespace cdough::regression
