@@ -68,7 +68,7 @@
 
 #include "cdough.h"
 
-#include "./regression.h"
+#include "./library/regression.h"
 
 using namespace COMPILED_MPC_PROTOCOL_NAMESPACE;
 using namespace cdough::debug;

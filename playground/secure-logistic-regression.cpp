@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "cdough.h"
-#include "./regression.h"
+#include "./library/regression.h"
 
 // ../scripts/run_experiment.py -p 3 -r 16 secure-logistic-regression
 
