@@ -305,6 +305,122 @@ AV NegMarginalLogLikBatched(const BatchedDataset& data, const AV& params, size_t
     return neg_total;
 }
 
+
+// =============================================================================
+// Mixed-model inference (semantic task 0022)
+// =============================================================================
+
+// Fixed-effect covariance from the observed information of the Laplace marginal
+// likelihood, by Schur complement.
+//
+// `information` is the (p+1) x (p+1) Hessian of the NEGATIVE marginal log
+// likelihood at the optimum, ordered [beta_0 .. beta_{p-1}, s] where
+// sigma^2 = exp(2s). `num_obs` is the padded observation count used to normalise.
+//
+// WHY A SCHUR COMPLEMENT AND NOT A FULL INVERSE. Two reasons, and the second is
+// the one that matters here.
+//
+//   1. Only the beta block is reported, so inverting (p+1) x (p+1) does more work
+//      than the answer needs.
+//   2. CONDITIONING. Coefficients and the variance parameter live on different
+//      scales, so the full matrix is markedly worse conditioned than its beta
+//      block. NewtonSchulzInverse degrades sharply with condition number -- its
+//      own calibration table in optimizer.h is still descending at 20 iterations
+//      for kappa ~ 199 -- so handing it the better-conditioned matrix is not an
+//      optimisation, it is what makes the result usable.
+//
+// The identity: for
+//     H = [ H_bb   h_bs ]
+//         [ h_bs'  h_ss ]
+// the beta block of H^-1 is (H_bb - h_bs h_bs' / h_ss)^-1. Note this is NOT
+// H_bb^-1 -- it accounts for the covariance between the coefficients and the
+// variance parameter, and using H_bb^-1 instead understates the standard errors.
+// That distinction is the classic error in mixed-model inference and is why the
+// plaintext oracle in the test inverts the full matrix independently.
+//
+// The only division is one reciprocal of the SCALAR h_ss, which is far cheaper
+// and better behaved than a matrix inverse of the same information.
+//
+// PRECONDITION: h_ss > 0, which holds at a genuine minimum of the negative log
+// likelihood. It is not checked -- a non-positive curvature there means the
+// optimiser did not reach a minimum, which is a defect upstream rather than a
+// case to handle. Compare SecureSqrt's treatment of a non-positive variance.
+//
+// Obliviousness: straight-line. No branch on shared data, no open().
+SMatrix CovarianceFromInformation(const SMatrix& information, size_t num_fixed,
+                                  size_t num_obs) {
+    const size_t dim = information.rows();
+    assert(dim == num_fixed + 1);
+    assert(information.cols() == dim);
+
+    // Normalise by n before inverting: NewtonSchulzInverse needs an O(1)-scaled
+    // operand, and at n observations the raw information is O(n). Undone below.
+    const DataType inverse_n_scaled = std::llround(scale / static_cast<double>(num_obs));
+    AV information_raw = Clone(information.data());
+    information_raw.setPrecision(0);
+    AV normalized = (*(information_raw * inverse_n_scaled)) / scale;
+    normalized.setPrecision(precision);
+
+    // Split into blocks. All three are index mappings, so they cost nothing.
+    std::vector<size_t> bb_map(num_fixed * num_fixed);
+    for (size_t i = 0; i < num_fixed; ++i) {
+        for (size_t j = 0; j < num_fixed; ++j) {
+            bb_map[i * num_fixed + j] = i * dim + j;
+        }
+    }
+    std::vector<size_t> bs_map(num_fixed);
+    for (size_t i = 0; i < num_fixed; ++i) {
+        bs_map[i] = i * dim + num_fixed;
+    }
+    const std::vector<size_t> ss_map = {num_fixed * dim + num_fixed};
+
+    AV h_bb = Clone(normalized.mapping_reference(bb_map));
+    AV h_bs = Clone(normalized.mapping_reference(bs_map));
+    AV h_ss = Clone(normalized.mapping_reference(ss_map));
+    h_bb.setPrecision(precision);
+    h_bs.setPrecision(precision);
+    h_ss.setPrecision(precision);
+
+    // Schur complement: H_bb - h_bs h_bs' / h_ss.
+    AV inverse_h_ss = SecureReciprocal(h_ss);
+    SMatrix outer = OuterProduct(h_bs, h_bs);
+    SMatrix correction = ScaleMatrix(outer, inverse_h_ss);
+    SMatrix schur = SMatrix(h_bb, num_fixed, num_fixed, false) - correction;
+    schur.setPrecision(precision);
+
+    SMatrix inverse = NewtonSchulzInverse(schur);
+
+    // Undo the normalisation: (A/n)^-1 = n A^-1, so A^-1 = (A/n)^-1 / n.
+    AV inverse_raw = Clone(inverse.data());
+    inverse_raw.setPrecision(0);
+    AV covariance_data = (*(inverse_raw * inverse_n_scaled)) / scale;
+
+    SMatrix covariance(covariance_data, num_fixed, num_fixed, false);
+    covariance.setPrecision(precision);
+    return covariance;
+}
+
+// Observed information for the Laplace marginal likelihood, numerically.
+//
+// STAGE S1 of semantic task 0022: the numerical route, built first as a sanity
+// check on the whole chain (oracle -> Hessian -> Schur -> inverse -> standard
+// errors) before any new mathematics is introduced. Its accuracy is bounded by
+// the objective's own error amplified by 1/h^2, so `step_scaled` is a calibrated
+// constant, not a reused gradient step.
+SMatrix ObservedInformation(const BatchedDataset& data, const AV& params,
+                            DataType step_scaled) {
+    const BatchedObjective objective = [&data](const AV& points, size_t num_points) {
+        return NegMarginalLogLikBatched(data, points, num_points);
+    };
+    return NumericalHessianBatched(objective, params, step_scaled);
+}
+
+// Fixed-effect covariance at `params`, the composition of the two above.
+SMatrix Covariance(const BatchedDataset& data, const AV& params, DataType step_scaled) {
+    SMatrix information = ObservedInformation(data, params, step_scaled);
+    return CovarianceFromInformation(information, data.num_fixed, data.total_rows());
+}
+
 }  // namespace mixedeffects
 
 // =============================================================================

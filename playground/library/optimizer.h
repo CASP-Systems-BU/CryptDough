@@ -278,6 +278,122 @@ AV NumericalGradientBatched(const BatchedObjective& f, const AV& x, const AV& se
     return gradient;
 }
 
+
+// Numerical Hessian of a batched objective, by four-point central second
+// differences, as a row-major dim x dim SecureMatrix.
+//
+//     H_jk = [ f(x+he_j+he_k) - f(x+he_j-he_k)
+//            - f(x-he_j+he_k) + f(x-he_j-he_k) ] / (4 h^2)
+//
+// THREE MPC-SPECIFIC CHOICES, all recorded in semantic task 0022:
+//
+// 1. BATCHED. Every perturbed point is stacked into a SINGLE objective call, so
+//    depth is one evaluation regardless of `dim`, exactly as
+//    NumericalGradientBatched does for the gradient. Evaluating the stencil
+//    point by point would cost 2*dim*(dim+1) sequential evaluations.
+//
+// 2. PUBLIC STEP. `step_scaled` is a public constant, unlike the gradient's
+//    data-dependent `kNumericalGradientStep * (1 + |x|)`. At the optimum
+//    adaptivity buys nothing, and a public step turns the final division into a
+//    division by a public constant -- one fewer boolean division circuit, and no
+//    secret ever reaches the divisor.
+//
+// 3. SYMMETRIC BY CONSTRUCTION. Only the upper triangle is evaluated and the
+//    result mirrored. This halves the work AND guarantees exact symmetry: a
+//    Hessian that is symmetric only up to truncation would make the covariance
+//    asymmetric, and the Schur complement below assumes symmetry.
+//
+// ACCURACY. Second differences divide by h^2, so the objective's own error is
+// amplified by 1/h^2. At `precision` 16 that is the binding constraint and the
+// reason `step_scaled` must be calibrated by measurement rather than reused from
+// the gradient -- see semantic task 0022.
+//
+// Obliviousness: straight-line. No branch on shared data, no open(). The
+// communication pattern depends only on the public `dim` and `step_scaled`.
+SMatrix NumericalHessianBatched(const BatchedObjective& f, const AV& x,
+                                DataType step_scaled) {
+    const size_t dim = x.size();
+    EngineRef engine = x.engine;
+
+    // Upper-triangular stencil, four points per entry.
+    std::vector<std::pair<size_t, size_t>> pairs;
+    pairs.reserve(dim * (dim + 1) / 2);
+    for (size_t j = 0; j < dim; ++j) {
+        for (size_t k = j; k < dim; ++k) {
+            pairs.emplace_back(j, k);
+        }
+    }
+    const size_t num_entries = pairs.size();
+    const size_t num_points = 4 * num_entries;
+
+    // The +-h pattern is public and depends only on `dim`, so it is built in the
+    // clear and shared once -- the same reason MakeCentralDifferenceSelector
+    // shares its pattern rather than applying it as a public vector.
+    cdough::Vector<DataType> offsets(num_points * dim, 0);
+    for (size_t e = 0; e < num_entries; ++e) {
+        const size_t j = pairs[e].first;
+        const size_t k = pairs[e].second;
+        const int signs[4][2] = {{+1, +1}, {+1, -1}, {-1, +1}, {-1, -1}};
+        for (int variant = 0; variant < 4; ++variant) {
+            const size_t point = 4 * e + variant;
+            // j and k coincide on the diagonal, so accumulate rather than assign.
+            offsets[point * dim + j] += signs[variant][0] * step_scaled;
+            offsets[point * dim + k] += signs[variant][1] * step_scaled;
+        }
+    }
+    AV offset_shared = engine.secret_share_a(offsets, 0, precision);
+    offset_shared.setPrecision(0);
+
+    AV x_tiled = x.cyclic_subset_reference(num_points);
+    AV x_raw = Clone(x_tiled);
+    x_raw.setPrecision(0);
+    AV points = x_raw + offset_shared;
+    points.setPrecision(precision);
+
+    AV values = f(points, num_points);  // ONE call
+    values.setPrecision(0);
+
+    // Combine the four variants of each entry: (++) - (+-) - (-+) + (--).
+    std::vector<size_t> pp_map(num_entries), pm_map(num_entries), mp_map(num_entries),
+        mm_map(num_entries);
+    for (size_t e = 0; e < num_entries; ++e) {
+        pp_map[e] = 4 * e + 0;
+        pm_map[e] = 4 * e + 1;
+        mp_map[e] = 4 * e + 2;
+        mm_map[e] = 4 * e + 3;
+    }
+    AV pp = Clone(values.mapping_reference(pp_map));
+    AV pm = Clone(values.mapping_reference(pm_map));
+    AV mp = Clone(values.mapping_reference(mp_map));
+    AV mm = Clone(values.mapping_reference(mm_map));
+    pp.setPrecision(0); pm.setPrecision(0); mp.setPrecision(0); mm.setPrecision(0);
+
+    AV combined = pp - pm;
+    combined -= mp;
+    combined += mm;
+    combined.setPrecision(0);
+
+    // Divide by 4h^2. Both factors are public, so this is a public constant
+    // division -- no boolean circuit. Done in two steps to keep the intermediate
+    // from overflowing when `step_scaled` is small.
+    const DataType denominator = (4 * step_scaled * step_scaled) / scale;
+    AV upper = *(*(combined * scale) / denominator);
+    upper.setPrecision(precision);
+
+    // Scatter the upper triangle into a full symmetric matrix. Pure index
+    // permutation: no communication.
+    std::vector<size_t> full_map(dim * dim);
+    for (size_t e = 0; e < num_entries; ++e) {
+        const size_t j = pairs[e].first;
+        const size_t k = pairs[e].second;
+        full_map[j * dim + k] = e;
+        full_map[k * dim + j] = e;
+    }
+    SMatrix hessian(Clone(upper.mapping_reference(full_map)), dim, dim, false);
+    hessian.setPrecision(precision);
+    return hessian;
+}
+
 // Result of the vectorized quasi-Newton optimization. `params` is one AV of
 // length dim rather than dim one-element AVs.
 struct BatchedOptResult {
