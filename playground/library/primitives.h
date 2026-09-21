@@ -67,6 +67,62 @@ constexpr int kMaxSeriesTerms = 3;
 constexpr int kMaxNewtonStep = 4;
 constexpr int kNewtonIterations = 5;
 
+// =============================================================================
+// MEASURED OPERATING RANGES
+// =============================================================================
+// Every range below was MEASURED, not derived. Semantic experiment 0002
+// (2026-09-21) profiled each operator against a plaintext reference over 2^14
+// random samples plus edge grids, on the 3PC build (PROTOCOL=3,
+// DEFAULT_BITWIDTH=32, TRIPLES=DUMMY, DIVISION_CORRECTION=ON). Earlier figures in
+// this file were derived from the range-reduction algebra; where the two differ,
+// the measurement is recorded here and the older comment corrected in place.
+//
+// "Confident range" means: worst error <= 1.0e-3 under the measure
+// |actual - expected| / max(1, |expected|) -- absolute where the output is small,
+// relative where it is large.
+//
+//   Operator            confident range              bounded by
+//   ------------------  ---------------------------  ----------------------------
+//   Exp                 x <= +10                     kMaxExpArg clamp
+//   Log                 [1.53e-5, 1e5]               input representability below;
+//                                                    1.8e-3 error at 3.16e5 above
+//   Log1p               [-0.99, 1e4]                 as Log, shifted
+//   SecureReciprocal    [1e-4, 1e4]                  measured
+//   SecureSqrt          [1.53e-5, 1e5]               inherits Log
+//   Sigmoid             all finite eta               output underflow only
+//   LogOnePlusExp       all finite eta               output underflow only
+//   NormalCdf           all finite x                 output underflow only
+//   TwoSidedPValue      all finite z                 output underflow only
+//   Sum                 N * magnitude < 1.4e14       overflow; FAILS BY SIGN FLIP
+//   ClampAbs            |x| + bound < ~1.4e14        internal sum overflows first
+//   Multiplex           |x| <= 1e14                  exact below
+//   AnyAbsAtLeast       |x| <= 1e14                  exact below
+//
+// THE RULE THAT EXPLAINS ALL OF IT. Absolute error is a near-constant 1-7 ULPs
+// for every operator except Exp; relative error is therefore governed by how many
+// ULPs the OUTPUT has, not by the operator:
+//
+//     relative error ~ (1 to 2) / output_ULPs
+//
+// So a caller needing 1% relative accuracy needs an output of at least ~100 ULPs
+// (~1.5e-3), and one needing 0.1% needs ~1000 ULPs (~1.5e-2). Exp is the sole
+// exception, carrying genuine series-truncation error of ~4e-4 relative for x > 0
+// independent of output magnitude, peaking near x = 4.5.
+//
+// WHAT THIS COSTS CALLERS IN PRACTICE -- the limits below which a RELATIVE
+// accuracy of 1% is no longer available:
+//
+//   TwoSidedPValue    p < ~4.6e-4      (|z| > 3.5)
+//   NormalCdf tail    tail < ~2.3e-4   (|x| > 3.5)
+//   Sigmoid           p < ~3.4e-4      (eta < -8)
+//   SecureReciprocal  1/x < ~1e-3      (x > 1000)
+//
+// Scoped to precision 16 and DataType int64_t under the configuration above. Not
+// claimed for other precisions, protocols, bit widths, or TRIPLES=REAL. Re-measure
+// with playground/tests/profile_playground_primitives.cpp after any change to an
+// operator or to the number format.
+// =============================================================================
+
 // Use these helpers wherever a copy is going to be written to.
 AV Clone(const AV& v) {
     AV out(v.size(), v.engine);
@@ -94,6 +150,11 @@ AV SecureReciprocal(const AV& x) {
 }
 
 // Secure clamping to [-bound_scaled, bound_scaled].
+//
+// Exact below its limit, which is NOT the format's limit: the operator forms
+// `-x - (bound + 1)` internally, so both operands count. Measured exact to
+// |x| = 1e13 and broken at 1e14 (experiment 0002); the usable condition is
+// roughly |x| + bound < 1.4e14, not |x| < 1.4e14.
 AV ClampAbs(const AV& x, DataType bound_scaled) {
     AV x_(x.size(), x.engine);
     x_ = x;
@@ -181,6 +242,13 @@ AV AnyAbsAtLeast(const AV& x, DataType bound_scaled) {
 }
 
 // Sum of all elements in an arithmetic shared vector (returns size 1 AV).
+//
+// THE ONLY PRIMITIVE WHOSE SAFE RANGE DEPENDS ON THE VECTOR LENGTH. Below
+// N * magnitude = 2^63 / 2^16 = 2^47 ~ 1.4e14 this is integer addition and is
+// EXACT -- measured bit-exact at every point tested (experiment 0002 E7). Above
+// it the accumulation wraps, and it does so silently: the result comes back as a
+// plausible-looking number of the WRONG SIGN, with no clamp and no flag. At
+// N = 16384 the per-element ceiling is 8.6e9.
 AV Sum(const AV& x) {
     return x.chunkedSum(x.size());
 }
@@ -251,6 +319,12 @@ AV Exp(const AV& x) {
 }
 
 // Requires positive numbers.
+//
+// MEASURED confident range (experiment 0002): [1.53e-5, 1e5], with absolute error
+// at or below 1.3e-4 throughout -- about ten orders of magnitude, and wider at
+// both ends than the range reduction below would suggest. The lower bound is the
+// input's own representability (one ULP), not an accuracy limit. Above the range,
+// error climbs quickly: 1.8e-3 at 3.16e5.
 AV Log(AV x) {
     AV x_(x.size(), x.engine);
     x_ = x;
@@ -372,8 +446,11 @@ AV Log1p(const AV& x) {
 // Requires x > 0, which is the domain this operator is built for: it exists to
 // take the square root of a variance (a diagonal entry of a covariance matrix),
 // and a non-positive variance is a defect upstream rather than a case to handle.
-// Log's own range reduction bounds the usable interval to roughly [3e-5, 4e4];
-// outside it Log saturates and the result is wrong rather than merely imprecise.
+// MEASURED (experiment 0002): the confident range is [1.53e-5, 1e5], wider at
+// both ends than the [3e-5, 4e4] this comment previously derived from Log's range
+// reduction. Worst relative error inside it is 8.4e-4; at 3.16e5 it reaches
+// 1.1e-2. Below 1.53e-5 the INPUT is under one ULP and rounds to zero, at which
+// point Log is undefined -- so the lower bound is representability, not accuracy.
 //
 // WHY THIS FORM. The alternatives considered (task 0019) were a division-free
 // Newton iteration on the inverse square root and a Babylonian iteration. Both
@@ -489,8 +566,14 @@ AV LogOnePlusExp(const AV& eta) {
 // reported without declassifying the test statistic (task 0019).
 //
 // Accuracy near the tails: absolute error is the wrong yardstick once Phi is near
-// 1. At `precision` 16 the representable resolution is 1.5e-5, so a p-value below
-// roughly 1e-4 should be read as "small" rather than at face value.
+// 1. Absolute error stays at or below 2e-4 everywhere, but the tail probability
+// shrinks, so RELATIVE error grows without bound.
+//
+// MEASURED (experiment 0002), and tighter than this comment previously claimed:
+// at |x| = 3.5 the tail is 2.3e-4 and already carries 1.6e-2 relative error; at
+// |x| = 4.0 the tail is 3.2e-5 and carries 5.2e-1 -- more than 50%. The honest
+// cutoff for a tail probability worth quoting is nearer 1e-3 than the 1e-4 this
+// comment used to give.
 AV NormalCdf(const AV& x) {
     AV x_raw = Clone(x);
     x_raw.setPrecision(0);

@@ -100,6 +100,23 @@ if(LOGISTIC_REGRESSION_LAYER_PRINT)
     add_compile_definitions(LOGISTIC_REGRESSION_LAYER_PRINT)
 endif()
 
+# Option: per-element diagnostic output in the playground library tests.
+#
+# The tests under playground/tests/ always print, for every tolerance-bearing
+# check, the tolerance applied and the worst error observed against it. This
+# option additionally dumps input/expected/actual/error for the first few
+# elements of every checked vector, which is what you want when triaging a
+# failure and not what you want in a normal run. Defaults to OFF.
+#
+# Unrelated to LOGISTIC_REGRESSION_LAYER_PRINT above: this one declassifies
+# nothing that the tests do not already open by their nature.
+option(PLAYGROUND_TEST_PRINT
+       "Dump per-element input/expected/actual/error in the playground library tests"
+       OFF)
+if(PLAYGROUND_TEST_PRINT)
+    add_compile_definitions(PLAYGROUND_TEST_PRINT)
+endif()
+
 # Option: choose the default sorting protocol (see include/core/operators/sorting.h).
 # Passed through as CONFIG_DEFAULT_SORT_PROTO; defaults to QUICKSORT.
 set(SORT_PROTO "QUICKSORT" CACHE STRING "Default sorting protocol")
@@ -263,6 +280,11 @@ endfunction()
 ######################################################
 file(GLOB EXE_EXAMPLES examples/*.cpp)
 file(GLOB EXE_PLAYGROUND playground/*.cpp)
+# playground/*.cpp above does not descend, so the library tests need their own glob.
+# Their sources carry a test_playground_ prefix because configure_target() derives the
+# CMake target name from the bare filename, which would otherwise collide with the
+# same-named targets built from tests/.
+file(GLOB EXE_PLAYGROUND_TESTS playground/tests/*.cpp)
 file(GLOB EXE_BENCH bench/*.cpp)
 file(GLOB EXE_MICRO bench/micro/*.cpp)
 file(GLOB EXE_ML bench/models/*.cpp)
@@ -275,7 +297,7 @@ file(GLOB SECRETFLOW_QUERIES bench/queries/secretflow/*.cpp)
 file(GLOB OTHER_QUERIES bench/queries/other/*.cpp)
 
 foreach (_target
-            ${EXE_EXAMPLES} ${EXE_MICRO} ${EXE_ML} ${EXE_TVA} ${EXE_MULTI_WORKLOAD} ${EXE_TESTS} ${EXE_BENCH} ${EXE_PLAYGROUND})
+            ${EXE_EXAMPLES} ${EXE_MICRO} ${EXE_ML} ${EXE_TVA} ${EXE_MULTI_WORKLOAD} ${EXE_TESTS} ${EXE_BENCH} ${EXE_PLAYGROUND} ${EXE_PLAYGROUND_TESTS})
     configure_target(${_target})
 endforeach ()
 
@@ -284,6 +306,7 @@ foreach (_target ${TPCH_QUERIES} ${SECRETFLOW_QUERIES} ${OTHER_QUERIES})
 endforeach()
 
 aggregate_target(tests-only EXE_TESTS)
+aggregate_target(playground-tests EXE_PLAYGROUND_TESTS)
 aggregate_target(tpch-queries TPCH_QUERIES)
 aggregate_target(secretflow-queries SECRETFLOW_QUERIES)
 aggregate_target(other-queries OTHER_QUERIES)
