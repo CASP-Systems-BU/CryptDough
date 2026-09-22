@@ -132,7 +132,30 @@ AV FrobeniusNormSquared(const SMatrix& m) {
 // A kappa ~ 199 case was also measured and is still descending at k = 20; it is
 // outside the operating range by design, and is kept in the suite to mark where
 // a fixed bound stops being able to help.
-constexpr int kMatrixInverseIterations = 14;
+//
+// RAISED 14 -> 30 (task 0017). The figures above were calibrated for the
+// library's own operating range; the MPC analysis pipeline inverts observed
+// information matrices whose 1-norm condition estimate is ~1.2e4, four orders
+// beyond the kappa ~ 199 case this constant was tuned against. Measured residual
+// max|A X - I| for a dense n = 7 operand:
+//
+//   kappa    k=14    k=20    k=25    k=30    k=40    k=60
+//   1e2      1.6e-1  5.8e-4  6.0e-4  6.0e-4  5.6e-4  5.8e-4
+//   1e3      6.9e-1  2.3e-1  5.1e-3  5.1e-3  5.1e-3  5.1e-3
+//   1e4      8.6e-1  6.8e-1  4.2e-1  4.2e-2  4.2e-2  4.2e-2
+//   2e4      9.0e-1  7.0e-1  5.5e-1  9.7e-2  1.0e-1  1.0e-1
+//
+// 30 is the knee: every row is flat beyond it, and at 14 the ill-conditioned
+// rows are still returning garbage (residual ~1, i.e. no information at all).
+//
+// THE PLATEAU IS NOT AN ITERATION LIMIT. Its height is 0.31-0.47 * kappa * ULP
+// across five orders of magnitude of kappa -- it is the fixed-point resolution
+// at `precision`. An inverse whose entries span kappa cannot be represented to
+// better than ~kappa * ULP relative error by ANY algorithm at this precision.
+// So callers inverting a matrix conditioned at 1e4 get ~4% residual and no
+// iteration count will improve it; see tasks/0017 for the measurement and for
+// the decision to accept that in the pipeline's standard errors.
+constexpr int kMatrixInverseIterations = 30;
 
 // Sweeps NewtonSchulzInverse over iteration counts and prints the accuracy at
 // each, to choose kMatrixInverseIterations. Off by default: it multiplies the
@@ -168,6 +191,23 @@ SMatrix NewtonSchulzInverse(const SMatrix& a, int iterations = kMatrixInverseIte
     EngineRef engine = a.data().engine;
 
     // The only division in the operator: one boolean division circuit per call.
+    //
+    // NOTE (task 0017). The "O(1)-scaled" precondition above is LOAD-BEARING and
+    // callers were violating it. Measured relative error of the inverse DIAGONAL
+    // against an exact double-precision inverse, n = 7:
+    //
+    //   magnitude   kappa=1e2   kappa=1e3   kappa=1e4
+    //   1e+00        6.2e-4      2.7e-3      1.9e-2
+    //   1e-01        7.2e-3      4.4e-2      2.7e-1
+    //   1e-02        1.3e+07     6.5e+06     1.5e+07
+    //   1e-03        1.0e+00     1.0e+00     1.0e+00
+    //
+    // An operand whose entries sit at 1e-2 fails by seven orders of magnitude
+    // whatever its conditioning, because at `precision` its SMALL entries
+    // (magnitude/kappa) are down to single-digit ULPs. Normalising inside this
+    // function was tried and does NOT help: the resolution is already gone by the
+    // time the shares arrive, and scaling a secret cannot recreate bits. The
+    // operand has to be CONSTRUCTED at a sensible scale by the caller.
     AV inverse_norm = SecureReciprocal(FrobeniusNormSquared(a));
     SMatrix x = ScaleMatrix(Transpose(a), inverse_norm);
     x.setPrecision(precision);
@@ -186,6 +226,257 @@ SMatrix NewtonSchulzInverse(const SMatrix& a, int iterations = kMatrixInverseIte
     }
 
     return x;
+}
+
+
+// =============================================================================
+// Secure Cholesky factorisation and inverse
+// =============================================================================
+//
+// Moved here from playground/linalg.h (task 0018) to sit beside the operator it
+// replaces. It reveals nothing: there is no open() anywhere in this family or
+// its transitive closure, and no branch on secret data -- every loop bound is
+// the public `p`. That is a STRONGER obliviousness argument than the iterative
+// inverse it replaces, which needed a compile-time trip count precisely because
+// a convergence test would have leaked the operand's conditioning.
+//
+// ACCURACY. Measured relative error of diag(A^-1) -- what a standard error
+// reads -- against an exact double-precision inverse, n = 7:
+//
+//   kappa    1e2       1e3       1e4       2e4
+//   error    7.8e-4    5.7e-3    7.9e-2    1.5e-1
+//
+// It is NOT condition-insensitive: "backward stable with growth factor 1" is a
+// statement about BACKWARD error, and the inverse diagonal is a forward
+// quantity whose error scales with kappa whatever the method. It is simply far
+// better than the iterative alternative, which returned 55-ULP noise at the
+// same conditioning.
+
+// Cholesky factorisation A = L L^T of a symmetric positive definite A.
+//
+// No pivoting, for two independent reasons. Numerically it is unnecessary: for
+// SPD matrices Cholesky is unconditionally backward stable, with a growth factor
+// bounded by 1, so pivoting buys nothing. Cryptographically it is impossible:
+// pivoting means comparing secret magnitudes and permuting rows on the result,
+// which is data-dependent control flow. SPD is guaranteed here by the ridge term
+// the callers add to the diagonal.
+struct Cholesky {
+    AV l;         // p*p, lower triangular, row-major
+    AV inv_diag;  // p, reciprocals of L's diagonal (so the solves need no division)
+};
+
+Cholesky CholeskyFactor(const AV& a, size_t p) {
+    EngineRef engine = a.engine;
+    AV l(p * p, engine);
+    l.setPrecision(0);
+    AV inv_diag(p, engine);
+    inv_diag.setPrecision(0);
+
+    AV a_ = a;
+    a_.setPrecision(0);
+
+    for (size_t j = 0; j < p; ++j) {
+        // d = A[j][j] - sum_{k<j} L[j][k]^2
+        AV d = Clone(Cell(a_, j * p + j));
+        d.setPrecision(0);
+        for (size_t k = 0; k < j; ++k) {
+            AV ljk = Cell(l, j * p + k);
+            d -= *(*(ljk * ljk) / scale);
+        }
+
+        // r = 1/sqrt(d) and L[j][j] = d * r = sqrt(d), neither needing a division.
+        //
+        // Task 0017 phase 6 briefly replaced this with
+        // SecureReciprocal(SecureSqrt(d)) -- two boolean division circuits per
+        // pivot, ~100x the rounds, and the measured Cholesky inverse error went
+        // 2.7e-4 -> 7.9e-4. Reverted: this is the inner loop of every standard
+        // error the pipeline reports. d is a Cholesky pivot, strictly positive
+        // on a positive-definite Gram, which is what SqrtBoth's clamped band
+        // assumes.
+        AV r = Rsqrt(d);
+        r.setPrecision(0);
+        AV diag = *(*(d * r) / scale);
+        AV diag_cell = Cell(l, j * p + j);
+        diag_cell = diag;
+        AV inv_cell = Cell(inv_diag, j);
+        inv_cell = r;
+
+        // L[i][j] = (A[i][j] - sum_{k<j} L[i][k] L[j][k]) / L[j][j]
+        for (size_t i = j + 1; i < p; ++i) {
+            AV v = Clone(Cell(a_, i * p + j));
+            v.setPrecision(0);
+            for (size_t k = 0; k < j; ++k) {
+                AV lik = Cell(l, i * p + k);
+                AV ljk = Cell(l, j * p + k);
+                v -= *(*(lik * ljk) / scale);
+            }
+            AV cell = Cell(l, i * p + j);
+            cell = *(*(v * r) / scale);
+        }
+    }
+    l.setPrecision(0);
+    inv_diag.setPrecision(0);
+    return Cholesky{l, inv_diag};
+}
+
+// Solve A X = B for `rhs` right-hand sides at once, from one factorisation.
+// B and the result are p x rhs, ROW-MAJOR: row i, column c at i * rhs + c.
+//
+// The substitution loops are sequential in p either way, so batching does not
+// change the round COUNT -- it makes each multiply `rhs` wide instead of one
+// element. The p solves a full inverse needs therefore cost what a single solve
+// used to: ~p^2 + p rounds rather than ~p^3 + p^2. At p = 8 that is about 72
+// against 576.
+AV CholeskySolveManyWith(const Cholesky& f, const AV& b, size_t p, size_t rhs) {
+    EngineRef engine = b.engine;
+    AV b_ = b;
+    b_.setPrecision(0);
+
+    AV y(p * rhs, engine);
+    y.setPrecision(0);
+    for (size_t i = 0; i < p; ++i) {
+        AV t = Clone(b_.slice(i * rhs, (i + 1) * rhs));
+        t.setPrecision(0);
+        for (size_t k = 0; k < i; ++k) {
+            // Cloned before broadcasting: repeated_subset_reference is a view,
+            // and mapping_reference asserts !has_mapping(), so a slice cannot be
+            // broadcast directly.
+            AV lik_s = Clone(Cell(f.l, i * p + k));
+            lik_s.setPrecision(0);
+            AV lik = lik_s.repeated_subset_reference(rhs);
+            lik.setPrecision(0);
+            AV yk = y.slice(k * rhs, (k + 1) * rhs);
+            yk.setPrecision(0);
+            t -= *(*(lik * yk) / scale);
+        }
+        AV inv_s = Clone(Cell(f.inv_diag, i));
+        inv_s.setPrecision(0);
+        AV inv_row = inv_s.repeated_subset_reference(rhs);
+        inv_row.setPrecision(0);
+        AV cell = y.slice(i * rhs, (i + 1) * rhs);
+        cell = *(*(t * inv_row) / scale);
+    }
+
+    AV x(p * rhs, engine);
+    x.setPrecision(0);
+    for (size_t i = p; i-- > 0;) {
+        AV t = Clone(y.slice(i * rhs, (i + 1) * rhs));
+        t.setPrecision(0);
+        for (size_t k = i + 1; k < p; ++k) {
+            AV lki_s = Clone(Cell(f.l, k * p + i));
+            lki_s.setPrecision(0);
+            AV lki = lki_s.repeated_subset_reference(rhs);
+            lki.setPrecision(0);
+            AV xk = x.slice(k * rhs, (k + 1) * rhs);
+            xk.setPrecision(0);
+            t -= *(*(lki * xk) / scale);
+        }
+        AV inv_s = Clone(Cell(f.inv_diag, i));
+        inv_s.setPrecision(0);
+        AV inv_row = inv_s.repeated_subset_reference(rhs);
+        inv_row.setPrecision(0);
+        AV cell = x.slice(i * rhs, (i + 1) * rhs);
+        cell = *(*(t * inv_row) / scale);
+    }
+    x.setPrecision(0);
+    return x;
+}
+
+// Single right-hand side, the case the IRLS Newton step wants.
+AV CholeskySolveWith(const Cholesky& f, const AV& b, size_t p) {
+    return CholeskySolveManyWith(f, b, p, 1);
+}
+
+AV CholeskySolve(const AV& a, const AV& b, size_t p) {
+    return CholeskySolveWith(CholeskyFactor(a, p), b, p);
+}
+
+// Full inverse of an SPD matrix, row-major: one factorisation, then all p unit
+// vectors solved together. Solving A X = I with B the identity returns A^-1
+// directly, in the same row-major layout.
+//
+// NOT symmetrised: each column is an independent solve, so entries (i,j) and
+// (j,i) can differ by a few ULPs. Harmless for the diagonal read a standard
+// error needs; worth knowing for anything else.
+AV SymmetricInverse(const AV& a, size_t p) {
+    Cholesky f = CholeskyFactor(a, p);
+    std::vector<double> eye(p * p, 0.0);
+    for (size_t k = 0; k < p; ++k) eye[k * p + k] = 1.0;
+    AV inv = CholeskySolveManyWith(f, PublicVector(a.engine, eye), p, p);
+    inv.setPrecision(0);
+    return inv;
+}
+
+
+
+// Oblivious 1-norm: max over columns of the column's absolute sum.
+//
+// Replaces opening the whole matrix to reduce it in plaintext. Everything here
+// is on shares: Abs is the (2*gtez - 1) * x idiom, the column gather is a public
+// mapping_reference view, chunkedSum is local, and the max is a tournament of
+// pairwise Multiplex over gtez -- ceil(log2(n)) comparison rounds, 3 at n = 7.
+AV OneNorm(const SMatrix& m) {
+    const size_t n = m.rows();
+    assert(m.cols() == n);
+
+    AV entries = Clone(m.data());
+    entries.setPrecision(0);
+    AV magnitudes = Abs(entries);
+    magnitudes.setPrecision(0);
+
+    // Gather column-major so each column's n entries are contiguous, then one
+    // local chunked sum gives the n column totals.
+    std::vector<cdough::VectorSizeType> colmajor(n * n);
+    for (size_t j = 0; j < n; ++j)
+        for (size_t i = 0; i < n; ++i)
+            colmajor[j * n + i] = static_cast<cdough::VectorSizeType>(i * n + j);
+    AV gathered = magnitudes.mapping_reference(colmajor);
+    gathered.setPrecision(0);
+    AV col_sums = Clone(gathered.chunkedSum(n));
+    col_sums.setPrecision(0);
+
+    // Sequential fold rather than a tournament. A tournament would be
+    // ceil(log2 n) rounds instead of n-1, but it has to rebind the accumulator
+    // to a shorter vector each round, and `AV a = b` is a SHALLOW copy while
+    // `a = b` is a deep element-wise copy that asserts equal sizes -- so there is
+    // no clean way to shrink it. At n <= 8 the difference is 7 comparison rounds
+    // against 3, which is not worth the trap.
+    AV best = Clone(col_sums.slice(0, 1));
+    best.setPrecision(0);
+    for (size_t j = 1; j < n; ++j) {
+        AV cand = Clone(col_sums.slice(j, j + 1));
+        cand.setPrecision(0);
+        AV diff = cand - best;
+        diff.setPrecision(0);
+        AV sel = *(diff.gtez());              // 1 where cand >= best
+        AV picked = Multiplex(sel, best, cand);
+        picked.setPrecision(0);
+        best = picked;                        // same size, so the deep copy is fine
+    }
+    best.setPrecision(precision);
+    return best;  // 1 element
+}
+
+// SMatrix-facing wrapper over the Cholesky inverse, matching the signature the
+// covariance paths used to call on the iterative one.
+//
+// Callers must hand this the operand at its NATURAL magnitude. The iterative
+// inverse it replaces documented an "O(1)-scaled" precondition and its callers
+// normalised by n to satisfy it; Cholesky has no such requirement -- it has no
+// Frobenius-seeded initial guess -- and normalising actively hurts, because an
+// operand whose entries sit near 1e-2 loses its small entries to the fixed-point
+// floor. Measured relative error of diag(A^-1) at kappa = 1e4: 7.9e-2 at
+// magnitude 1, 8.0e-1 at magnitude 1e-2.
+SMatrix SecureInverse(const SMatrix& a) {
+    const size_t n = a.rows();
+    assert(a.cols() == n);
+    assert(!a.isColumnWise());
+    AV raw = Clone(a.data());
+    raw.setPrecision(0);
+    AV inv = SymmetricInverse(raw, n);
+    SMatrix out(inv, n, n, false);
+    out.setPrecision(precision);
+    return out;
 }
 
 // =============================================================================
@@ -500,10 +791,20 @@ const double kArmijoC1 = 1e-4;
 // the alphas it could ever try were 2^-l with 2^-l >= 1e-5, i.e. l <= 16 --
 // seventeen candidates, the smallest being 2^-16 = 1.526e-5.
 //
-// Seventeen is also the ceiling the number format allows: 2^-16 is exactly 1 at
-// `precision` 16, and 2^-17 truncates to zero, which would make the last rung a
-// zero step rather than a small one.
+// Seventeen USED to be the ceiling the number format allows: at `precision` 16,
+// 2^-16 is exactly 1 ULP and 2^-17 truncates to zero, which would make the last
+// rung a zero step rather than a small one.
+//
+// That coincidence ended when precision moved to 28 (task 0017): the smallest
+// rung is now 2^-16 = 4096 ULPs and the format would allow rungs down to 2^-28.
+// Seventeen is KEPT anyway -- it is the floor the backtracking loop it replaced
+// used, and a smaller trial step buys nothing while widening every line-search
+// call. The relationship is asserted rather than left implicit, so that lowering
+// `precision` below 16 fails loudly instead of silently producing zero steps.
 constexpr int kLineSearchSteps = 17;
+static_assert(kLineSearchSteps <= precision + 1,
+              "the alpha ladder bottoms out at 2^-(kLineSearchSteps-1); below one ULP "
+              "the last rungs truncate to a zero step");
 
 // Public constants for the oblivious line search. They depend only on
 // kLineSearchSteps and kArmijoC1, so they are shared once per optimization and
@@ -891,445 +1192,10 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
 
 namespace cdough::regression {
 
-// Central finite-difference gradient of a scalar objective `f` at `x`.
-std::vector<AV> NumericalGradient(
-    const std::function<AV(const std::vector<AV>&)>& f,
-    const std::vector<AV>& x) {
-    size_t dim = x.size();
-    std::vector<AV> gradient;
-    gradient.reserve(dim);
-
-    std::vector<AV> perturbed = Clone(x);
-    for (size_t k = 0; k < dim; ++k) {
-        perturbed[k].setPrecision(precision);
-    }
-
-    for (size_t k = 0; k < dim; ++k) {
-        // Step size h = kNumericalGradientStep * (1.0 + |x[k]|)
-        AV xk_copy = x[k];
-        xk_copy.setPrecision(0);
-        AV mask = *(xk_copy.gtez());
-        AV two_mask = *(mask * DataType(2));
-        two_mask -= DataType(1);
-        AV abs_xk = *(two_mask * xk_copy); // (1 or -1) * xk_copy gives |x[k]| directly without / scale
-
-        AV one_plus_abs = abs_xk;
-        one_plus_abs += scale;
-        DataType h_step_scaled = static_cast<DataType>(kNumericalGradientStep * scale);
-        AV h = (*(one_plus_abs * h_step_scaled)) / scale; // size 1
-
-        // f_plus = f(perturbed with x[k] + h)
-        h.setPrecision(precision);
-        perturbed[k] = x[k] + h;
-        perturbed[k].setPrecision(precision);
-        AV f_plus = f(perturbed);
-        f_plus.setPrecision(0);
-
-        // f_minus = f(perturbed with x[k] - h)
-        perturbed[k] = x[k] - h;
-        perturbed[k].setPrecision(precision);
-        AV f_minus = f(perturbed);
-        f_minus.setPrecision(0);
-
-        // Reset perturbed[k]
-        perturbed[k] = x[k];
-        perturbed[k].setPrecision(precision);
-
-        // gradient[k] = (f_plus - f_minus) / (2 * h)
-        AV diff = f_plus - f_minus;
-        h.setPrecision(0);
-        AV two_h = *(h * DataType(2));
-
-        auto diff_scaled_b = (*(diff * scale)).a2b();
-        auto two_h_b = two_h.a2b();
-        auto grad_b = (*diff_scaled_b) / (*two_h_b);
-        AV grad_k = *(grad_b->b2a());
-        grad_k.setPrecision(precision);
-
-        gradient.push_back(std::move(grad_k));
-    }
-
-    return gradient;
-}
 
 // =============================================================================
 // BFGS Optimization & Secure Linear Algebra Helpers
 // =============================================================================
 
-// Matrix-vector product m * v where m is SecureMatrix (n x n) and v is std::vector<AV> (length n).
-std::vector<AV> MatVec(const SMatrix& m, const std::vector<AV>& v) {
-    size_t n = v.size();
-    assert(m.rows() == n && m.cols() == n);
-    EngineRef engine = v[0].engine;
-
-    // m is stored row-major: element (i, j) is at data_[i * n + j]
-    AV m_data = m.data();
-    m_data.setPrecision(0);
-
-    std::vector<AV> result;
-    result.reserve(n);
-
-    for (size_t i = 0; i < n; ++i) {
-        AV row_sum(1, engine);
-        row_sum.setPrecision(0);
-        for (size_t j = 0; j < n; ++j) {
-            // Slice element at index (i * n + j)
-            AV m_ij = m_data.slice(i * n + j, i * n + j + 1);
-            m_ij.setPrecision(0);
-            AV vj = v[j];
-            vj.setPrecision(0);
-            AV prod = (*(m_ij * vj)) / scale;
-            row_sum += prod;
-        }
-        row_sum.setPrecision(precision);
-        result.push_back(std::move(row_sum));
-    }
-    return result;
-}
-
-// Standard inner product between two secure vectors.
-AV Dot(const std::vector<AV>& a, const std::vector<AV>& b) {
-    assert(a.size() == b.size());
-    size_t n = a.size();
-    EngineRef engine = a[0].engine;
-
-    AV sum(1, engine);
-    sum.setPrecision(0);
-    for (size_t i = 0; i < n; ++i) {
-        AV ai = a[i];
-        AV bi = b[i];
-        ai.setPrecision(0);
-        bi.setPrecision(0);
-        AV prod = (*(ai * bi)) / scale;
-        sum += prod;
-    }
-    sum.setPrecision(precision);
-    return sum;
-}
-
-// BFGS update of the inverse-Hessian approximation:
-//   H+ = (I - rho s y^T) H (I - rho y s^T) + rho s s^T,   rho = 1 / (y^T s).
-SMatrix BfgsInverseUpdate(const SMatrix& h_inv, const std::vector<AV>& s,
-                         const std::vector<AV>& y, const AV& rho) {
-    size_t n = s.size();
-    assert(h_inv.rows() == n && h_inv.cols() == n);
-    assert(y.size() == n);
-    EngineRef engine = s[0].engine;
-
-    // We extract h_inv elements into an n x n 2D array of 1-element AVs
-    // Distinct buffers per element
-    std::vector<std::vector<AV>> h_elements = MakeMatrix(n, n, engine);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            h_elements[i][j] = h_inv.data().slice(i * n + j, i * n + j + 1);
-            h_elements[i][j].setPrecision(0);
-        }
-    }
-
-    AV rho_copy = rho;
-    rho_copy.setPrecision(0);
-
-    // Compute left = I - rho * s * y^T as an n x n matrix in std::vector<std::vector<AV>>
-    // In fixed point: (s_i * y_j) / scale, then (* rho) / scale
-    std::vector<std::vector<AV>> left = MakeMatrix(n, n, engine);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            AV si = s[i];
-            AV yj = y[j];
-            si.setPrecision(0);
-            yj.setPrecision(0);
-            AV s_y = (*(si * yj)) / scale;
-            AV rho_s_y = (*(rho_copy * s_y)) / scale;
-
-            AV elem(1, engine);
-            elem.setPrecision(0);
-            if (i == j) {
-                elem += scale;
-            }
-            elem -= rho_s_y;
-            left[i][j] = elem;
-        }
-    }
-
-    // temp = left * h_inv
-    // temp[i][j] = sum_k (left[i][k] * h_inv[k][j]) / scale
-    std::vector<std::vector<AV>> temp = MakeMatrix(n, n, engine);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            AV sum(1, engine);
-            sum.setPrecision(0);
-            for (size_t k = 0; k < n; ++k) {
-                AV h_kj = h_elements[k][j];
-                AV left_ik = left[i][k];
-                left_ik.setPrecision(0);
-                h_kj.setPrecision(0);
-                AV prod = (*(left_ik * h_kj)) / scale;
-                sum += prod;
-            }
-            temp[i][j] = sum;
-        }
-    }
-
-    // updated = temp * left^T + rho * s * s^T
-    // Flatten result into a single AV of size n * n to construct SecureMatrix
-    cdough::Vector<DataType> dummy_init(n * n, 0);
-    AV updated_data = engine.secret_share_a(dummy_init, 0, 0);
-    updated_data.setPrecision(0);
-
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            AV sum(1, engine);
-            sum.setPrecision(0);
-            for (size_t k = 0; k < n; ++k) {
-                AV temp_ik = temp[i][k];
-                AV left_jk = left[j][k];
-                temp_ik.setPrecision(0);
-                left_jk.setPrecision(0);
-                AV prod = (*(temp_ik * left_jk)) / scale;
-                sum += prod;
-            }
-            AV si = s[i];
-            AV sj = s[j];
-            si.setPrecision(0);
-            sj.setPrecision(0);
-            AV s_s = (*(si * sj)) / scale;
-            AV rho_s_s = (*(rho_copy * s_s)) / scale;
-            sum += rho_s_s;
-
-            // Place into updated_data at index i * n + j
-            AV sum_rep = sum.repeated_subset_reference(n * n);
-            sum_rep.setPrecision(0);
-            cdough::Vector<DataType> mask_vec(n * n, 0);
-            mask_vec[i * n + j] = scale; // Use scale (1.0 in fixed-point)
-            AV mask_elem = engine.secret_share_a(mask_vec, 0, 0);
-            mask_elem.setPrecision(0);
-            AV placed = (*(sum_rep * mask_elem)) / scale;
-            placed.setPrecision(0);
-            updated_data += placed;
-        }
-    }
-
-    updated_data.setPrecision(precision);
-    SMatrix updated(updated_data, n, n, false);
-    updated.setPrecision(precision);
-    return updated;
-}
-
-// Result of the outer quasi-Newton optimization.
-struct OptResult {
-    std::vector<AV> params;
-    AV value;
-    int iterations = 0;
-    bool converged = false;
-    // False when no curvature update ever passed the y^T s > 0 test, in which
-    // case h_inv is still the identity and its diagonal is NOT a variance.
-    bool hessian_updated = false;
-
-    OptResult(std::vector<AV> p, AV v, int it = 0, bool conv = false)
-        : params(std::move(p)), value(std::move(v)), iterations(it), converged(conv) {}
-};
-
-// Minimizes `f` starting from `x0` using BFGS with a backtracking (Armijo) line
-// search and numerical gradients.
-// `h_inv_out`, when given, receives the converged inverse-Hessian approximation.
-// For a negative log-likelihood objective that is the asymptotic covariance
-// matrix of the estimates, so the standard errors come out of the optimisation
-// for free. It is a quasi-Newton approximation rather than the exact observed
-// information -- unlike the IRLS models, whose covariance is exact -- and the
-// report says so.
-// An objective that can return its own gradient. Passing nullptr asks for the
-// value alone, which is all the line search needs; passing a vector asks for
-// both, so a caller with an analytic gradient pays for the shared work once.
-using ValueGradFn = std::function<AV(const std::vector<AV>&, std::vector<AV>*)>;
-
-OptResult MinimizeBFGS(const ValueGradFn& f, const std::vector<AV>& x0,
-                       int max_iterations = 20) {
-    size_t n = x0.size();
-    EngineRef engine = x0[0].engine;
-
-    std::vector<AV> x = Clone(x0);
-    for (size_t i = 0; i < n; ++i) {
-        x[i].setPrecision(precision);
-    }
-    std::vector<AV> gradient;
-    AV fx = f(x, &gradient);
-    fx.setPrecision(precision);
-
-    SMatrix h_inv = Identity(n, engine);
-
-    OptResult result(x, fx, 0, false);
-
-    for (int iteration = 0; iteration < max_iterations; ++iteration) {
-        result.iterations = iteration + 1;
-
-        // Check gradient convergence in plaintext after opening
-        double max_grad = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            auto opened_g = gradient[i].open();
-            double val = std::abs(static_cast<double>(opened_g[0]) / scale);
-            if (val > max_grad) max_grad = val;
-        }
-
-        if (max_grad < kSmallEpsilon) {
-            result.converged = true;
-            break;
-        }
-
-        // Search direction d = -H_inv * gradient
-        std::vector<AV> direction = MatVec(h_inv, gradient);
-        for (size_t i = 0; i < n; ++i) {
-            direction[i] = -direction[i];
-            direction[i].setPrecision(precision);
-        }
-
-        AV directional_derivative = Dot(gradient, direction);
-        directional_derivative.setPrecision(precision);
-
-        // Check if descent direction: directional_derivative < 0
-        auto opened_dd = directional_derivative.open();
-        double dd_val = static_cast<double>(opened_dd[0]) / scale;
-        if (dd_val >= 0.0) {
-            h_inv = Identity(n, engine);
-            for (size_t i = 0; i < n; ++i) {
-                direction[i] = -gradient[i];
-                direction[i].setPrecision(precision);
-            }
-            directional_derivative = Dot(gradient, direction);
-            directional_derivative.setPrecision(precision);
-            auto opened_dd2 = directional_derivative.open();
-            dd_val = static_cast<double>(opened_dd2[0]) / scale;
-        }
-
-        // Backtracking line search satisfying the Armijo sufficient-decrease rule
-        const double c1 = 1e-4;
-        double alpha = 1.0;
-        bool line_search_failed = false;
-        std::vector<AV> x_new = Clone(x);
-        AV fx_new = Clone(fx);
-
-        auto opened_fx = fx.open();
-        double fx_val = static_cast<double>(opened_fx[0]) / scale;
-
-        while (true) {
-            for (size_t i = 0; i < n; ++i) {
-                AV alpha_dir = Clone(direction[i]);
-                alpha_dir.setPrecision(0);
-                alpha_dir = (*(alpha_dir * static_cast<DataType>(alpha * scale))) / scale;
-                x_new[i] = x[i] + alpha_dir;
-                x_new[i].setPrecision(precision);
-            }
-            fx_new = f(x_new, nullptr);
-            fx_new.setPrecision(precision);
-
-            auto opened_fx_new = fx_new.open();
-            double fx_new_val = static_cast<double>(opened_fx_new[0]) / scale;
-
-            if (std::isfinite(fx_new_val) &&
-                fx_new_val <= fx_val + c1 * alpha * dd_val) {
-                break;
-            }
-            alpha *= 0.5;
-            if (alpha < 1e-5) {
-                x_new = x;
-                fx_new = fx;
-                line_search_failed = true;
-                break;
-            }
-        }
-
-        // Step = x_new - x
-        std::vector<AV> step = MakeVector(n, 1, engine);
-        double max_step = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            step[i] = x_new[i] - x[i];
-            step[i].setPrecision(precision);
-            auto opened_s = step[i].open();
-            double val = std::abs(static_cast<double>(opened_s[0]) / scale);
-            if (val > max_step) max_step = val;
-        }
-
-        // A failed line search is a fixed point: x is unchanged, so the next
-        // iteration recomputes the same direction and fails identically
-        if (line_search_failed) {
-            if (engine.getPartyID() == 0) {
-                std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                          << "  no descent found along search direction; stopping at"
-                          << " neg_log_lik=" << std::fixed << std::setprecision(6) << fx_val
-                          << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
-                          << std::endl;
-            }
-            result.converged = true;
-            break;
-        }
-
-        std::vector<AV> gradient_new;
-        f(x_new, &gradient_new);
-        std::vector<AV> gradient_delta = MakeVector(n, 1, engine);
-        for (size_t i = 0; i < n; ++i) {
-            gradient_delta[i] = gradient_new[i] - gradient[i];
-            gradient_delta[i].setPrecision(precision);
-        }
-
-        AV curvature = Dot(step, gradient_delta);
-        curvature.setPrecision(precision);
-        auto opened_curv = curvature.open();
-        double curv_val = static_cast<double>(opened_curv[0]) / scale;
-
-        if (curv_val > kSmallEpsilon) {
-            // rho = 1.0 / curvature
-            AV scale_sq(1, engine);
-            scale_sq += (DataType(1) << (2 * precision));
-            auto scale_sq_b = scale_sq.a2b();
-            auto curv_b = curvature.a2b();
-            auto rho_b = (*scale_sq_b) / (*curv_b);
-            AV rho = *(rho_b->b2a());
-            rho.setPrecision(precision);
-
-            h_inv = BfgsInverseUpdate(h_inv, step, gradient_delta, rho);
-            h_inv.setPrecision(precision);
-            result.hessian_updated = true;
-        }
-
-        x = x_new;
-        gradient = gradient_new;
-        auto opened_new_fx = fx_new.open();
-        double obj_change = std::abs(fx_val - static_cast<double>(opened_new_fx[0]) / scale);
-        fx = fx_new;
-
-        if (engine.getPartyID() == 0) {
-            std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                      << "  neg_log_lik=" << std::fixed << std::setprecision(6) << static_cast<double>(opened_new_fx[0]) / scale
-                      << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
-                      << "  alpha=" << std::fixed << std::setprecision(4) << alpha
-                      << "  |step|=" << std::scientific << std::setprecision(3) << max_step
-                      << "  d_obj=" << obj_change << std::endl;
-        }
-
-        if (max_step < kSmallEpsilon && max_grad < kSmallEpsilon) {
-            result.converged = true;
-            break;
-        }
-    }
-
-    result.params = x;
-    result.value = fx;
-    return result;
-}
-
-
-// Overload for an objective with no analytic gradient: differences it. This is
-// the signature the logistic-regression branch's callers use, and it keeps the
-// numerical path available as something to validate the analytic one against.
-//
-// The two overloads are distinguished by arity -- a one-argument callable is not
-// convertible to ValueGradFn -- so a lambda selects the right one on its own.
-OptResult MinimizeBFGS(const std::function<AV(const std::vector<AV>&)>& f,
-                       const std::vector<AV>& x0, int max_iterations = 20) {
-    ValueGradFn wrapped = [&f](const std::vector<AV>& x, std::vector<AV>* g) {
-        if (g != nullptr) *g = NumericalGradient(f, x);
-        return f(x);
-    };
-    return MinimizeBFGS(wrapped, x0, max_iterations);
-}
 
 }  // namespace cdough::regression

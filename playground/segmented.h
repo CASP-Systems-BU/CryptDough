@@ -249,52 +249,90 @@ ScanPlan BuildScanPlan(const std::vector<BV>& keys) {
     return plan;
 }
 
+// One level's operand indices, replicated across `blocks` consecutive blocks of
+// `n` rows, addressing the UNREVERSED buffer directly.
+//
+// A single block is an arithmetic progression, which simple_subset_reference can
+// express; several blocks are a UNION of progressions, which it cannot -- hence
+// the explicit map. It is a public view, so building it costs nothing in the
+// protocol.
+//
+// The reverse direction is folded into the index arithmetic rather than layered
+// as a second view, because mapping_reference asserts !has_mapping() and so
+// cannot be composed. Reversing within a block sends local offset `j` to
+// `n - 1 - j`, which is the only difference between the two directions.
+std::vector<cdough::VectorSizeType> BlockLevelMap(size_t n, size_t blocks, size_t start,
+                                                  size_t step, size_t count, bool reversed) {
+    std::vector<cdough::VectorSizeType> map(blocks * count);
+    for (size_t b = 0; b < blocks; ++b) {
+        for (size_t i = 0; i < count; ++i) {
+            const size_t local = start + i * step;
+            const size_t offset = reversed ? (n - 1 - local) : local;
+            map[b * count + i] = static_cast<cdough::VectorSizeType>(b * n + offset);
+        }
+    }
+    return map;
+}
+
 // Per-group inclusive scan using a precomputed plan. Same contract as SegScan.
+//
+// `blocks` evaluates the SAME plan over several independent copies of the table
+// laid out back to back, each `plan.n` rows. That is what lets one objective
+// evaluation cover several candidate parameter vectors at once: the rows, the
+// groups and therefore the plan are identical across candidates, so only the
+// values differ. Each level's multiply becomes `blocks` times wider at the SAME
+// round count -- the loop below is columns outer, levels inner, so the round
+// count is `columns * depth` regardless of `blocks`. That is the entire win.
+//
+// The plan itself is unchanged and still built once per cohort: the level bits
+// are tiled with cyclic_subset_reference, which repeats the whole vector and so
+// lines up with the block-major index maps above.
 void SegScanPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vector<AV>& out,
-                    SegDirection dir) {
+                    SegDirection dir, size_t blocks = 1) {
     assert(in.size() == out.size());
+    assert(blocks >= 1);
     const size_t n = plan.n;
     const std::vector<AV>& bits =
         (dir == SegDirection::Forward) ? plan.forward : plan.reverse;
     const bool reversed = (dir != SegDirection::Forward);
-    const std::vector<cdough::VectorSizeType> rev = reversed ? ReverseMap(n)
-                                                             : std::vector<cdough::VectorSizeType>{};
 
     for (size_t k = 0; k < in.size(); ++k) {
+        assert(in[k].size() == blocks * n);
         out[k].setPrecision(0);
         AV src = in[k];
         src.setPrecision(0);
         out[k] = src;  // deep element-wise copy, as aggregate() also does
 
-        // Reversing the accumulator lets one set of index arithmetic serve both
-        // directions; the mapping is a public view, so it writes through.
-        AV acc = reversed ? out[k].mapping_reference(rev) : out[k];
-        acc.setPrecision(0);
-
         for (int level = 0; level < plan.depth; ++level) {
             const ScanLevel geom = PlanLevel(n, level);
             if (geom.count == 0) continue;
-            AV a = acc.simple_subset_reference(geom.a_start, geom.step,
-                                               geom.a_start + (geom.count - 1) * geom.step);
-            AV b = acc.simple_subset_reference(geom.b_start, geom.step,
-                                               geom.b_start + (geom.count - 1) * geom.step);
+            // Mapped straight off out[k]: a public view, so it writes through.
+            AV a = out[k].mapping_reference(
+                BlockLevelMap(n, blocks, geom.a_start, geom.step, geom.count, reversed));
+            AV b = out[k].mapping_reference(
+                BlockLevelMap(n, blocks, geom.b_start, geom.step, geom.count, reversed));
             a.setPrecision(0);
             b.setPrecision(0);
-            b += *(bits[level] * a);  // later += same_group * earlier
+            AV level_bits = (blocks == 1) ? bits[level]
+                                          : bits[level].cyclic_subset_reference(blocks);
+            level_bits.setPrecision(0);
+            b += *(level_bits * a);  // later += same_group * earlier
         }
         out[k].setPrecision(0);
     }
 }
 
 // Broadcast each group's total to every row, using a precomputed plan.
-void SegTotalPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vector<AV>& out) {
+// `blocks` carries the same meaning as in SegScanPlanned.
+void SegTotalPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vector<AV>& out,
+                     size_t blocks = 1) {
     const size_t n = plan.n;
     std::vector<AV> suffix;
     suffix.reserve(in.size());
-    for (size_t k = 0; k < in.size(); ++k) suffix.emplace_back(n, in[k].engine);
+    for (size_t k = 0; k < in.size(); ++k) suffix.emplace_back(blocks * n, in[k].engine);
 
-    SegScanPlanned(plan, in, out, SegDirection::Forward);
-    SegScanPlanned(plan, in, suffix, SegDirection::Reverse);
+    SegScanPlanned(plan, in, out, SegDirection::Forward, blocks);
+    SegScanPlanned(plan, in, suffix, SegDirection::Reverse, blocks);
 
     for (size_t k = 0; k < in.size(); ++k) {
         AV self = Clone(in[k]);
@@ -308,19 +346,19 @@ void SegTotalPlanned(const ScanPlan& plan, const std::vector<AV>& in, std::vecto
 
 // Single-column convenience wrapper for the planned scan, mirroring the
 // SegScan/SegTotal pair above.
-AV SegScanPlanned(const ScanPlan& plan, const AV& in, SegDirection dir) {
+AV SegScanPlanned(const ScanPlan& plan, const AV& in, SegDirection dir, size_t blocks = 1) {
     std::vector<AV> ins{in};
     std::vector<AV> outs;
     outs.emplace_back(in.size(), in.engine);
-    SegScanPlanned(plan, ins, outs, dir);
+    SegScanPlanned(plan, ins, outs, dir, blocks);
     return outs[0];
 }
 
-AV SegTotalPlanned(const ScanPlan& plan, const AV& in) {
+AV SegTotalPlanned(const ScanPlan& plan, const AV& in, size_t blocks = 1) {
     std::vector<AV> ins{in};
     std::vector<AV> outs;
     outs.emplace_back(in.size(), in.engine);
-    SegTotalPlanned(plan, ins, outs);
+    SegTotalPlanned(plan, ins, outs, blocks);
     return outs[0];
 }
 

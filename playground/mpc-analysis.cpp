@@ -18,7 +18,7 @@
 //
 // Layout, in dependency order:
 //   primitives.h   types, constants, Clone; ClampAbs/ClampRange/Abs,
-//                  RecipSeeded/Div/Recip, Sqrt/Rsqrt, Exp/Log/Log1p,
+//                  SecureReciprocal, SecureSqrt, Exp/Log/Log1p,
 //                  Sigmoid/LogOnePlusExp; share and open helpers
 //   segmented.h    SegScan/SegTotal and the cached-group-bit
 //                  SegScanPlanned/SegTotalPlanned; First/LastOfGroup;
@@ -38,7 +38,7 @@
 //   - Values are raw scaled integers at precision 0, rescaled by hand.
 //   - `AV a = b` is a shallow copy; use Clone() before mutating.
 //   - BSharedVector::operator/ (circuits.h:39) is 64 sequential rounds and must
-//     not appear on a hot path; Div/Recip/RecipSeeded exist to avoid it.
+//     appear on a hot path; SecureReciprocal is the one division operator.
 //
 // Run:
 //   ../scripts/run_experiment.py -p 3 -r 200 mpc-analysis

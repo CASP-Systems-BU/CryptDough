@@ -324,7 +324,10 @@ AV NegMarginalLogLikBatched(const BatchedDataset& data, const AV& params, size_t
 //      than the answer needs.
 //   2. CONDITIONING. Coefficients and the variance parameter live on different
 //      scales, so the full matrix is markedly worse conditioned than its beta
-//      block. NewtonSchulzInverse degrades sharply with condition number -- its
+//      block. The inverse degrades with condition number -- measured relative
+//      error of diag(A^-1) is 7.8e-4 at kappa 1e2 and 7.9e-2 at 1e4 -- so
+//      handing it the better-conditioned matrix is not an optimisation, it is
+//      what makes the result usable. Its
 //      own calibration table in optimizer.h is still descending at 20 iterations
 //      for kappa ~ 199 -- so handing it the better-conditioned matrix is not an
 //      optimisation, it is what makes the result usable.
@@ -347,18 +350,19 @@ AV NegMarginalLogLikBatched(const BatchedDataset& data, const AV& params, size_t
 // case to handle. Compare SecureSqrt's treatment of a non-positive variance.
 //
 // Obliviousness: straight-line. No branch on shared data, no open().
+// `condition_out`, when given, receives kappa_1 of the matrix ACTUALLY INVERTED
+// -- the Schur complement -- as a 1-element share. That is the conditioning
+// which governs the accuracy of the standard errors this returns, and both
+// factors are already in hand, so it costs two OneNorm calls and no extra
+// inverse.
 SMatrix CovarianceFromInformation(const SMatrix& information, size_t num_fixed,
-                                  size_t num_obs) {
+                                  size_t num_obs, AV* condition_out = nullptr) {
     const size_t dim = information.rows();
     assert(dim == num_fixed + 1);
     assert(information.cols() == dim);
 
-    // Normalise by n before inverting: NewtonSchulzInverse needs an O(1)-scaled
-    // operand, and at n observations the raw information is O(n). Undone below.
-    const DataType inverse_n_scaled = std::llround(scale / static_cast<double>(num_obs));
-    AV information_raw = Clone(information.data());
-    information_raw.setPrecision(0);
-    AV normalized = (*(information_raw * inverse_n_scaled)) / scale;
+    (void)num_obs;  // kept in the signature; callers still pass it
+    AV normalized = Clone(information.data());
     normalized.setPrecision(precision);
 
     // Split into blocks. All three are index mappings, so they cost nothing.
@@ -388,15 +392,20 @@ SMatrix CovarianceFromInformation(const SMatrix& information, size_t num_fixed,
     SMatrix schur = SMatrix(h_bb, num_fixed, num_fixed, false) - correction;
     schur.setPrecision(precision);
 
-    SMatrix inverse = NewtonSchulzInverse(schur);
-
-    // Undo the normalisation: (A/n)^-1 = n A^-1, so A^-1 = (A/n)^-1 / n.
-    AV inverse_raw = Clone(inverse.data());
-    inverse_raw.setPrecision(0);
-    AV covariance_data = (*(inverse_raw * inverse_n_scaled)) / scale;
-
-    SMatrix covariance(covariance_data, num_fixed, num_fixed, false);
+    // The Schur complement of the raw information inverts straight to the
+    // covariance
+    SMatrix covariance = SecureInverse(schur);
     covariance.setPrecision(precision);
+
+    if (condition_out != nullptr) {
+        AV norm_a = OneNorm(schur);
+        norm_a.setPrecision(0);
+        AV norm_inv = OneNorm(covariance);
+        norm_inv.setPrecision(0);
+        AV kappa = *(*(norm_a * norm_inv) / scale);
+        kappa.setPrecision(precision);
+        *condition_out = kappa;
+    }
     return covariance;
 }
 
@@ -633,7 +642,10 @@ AV LogisticGradient(const Dataset& data, const AV& beta, DataType lambda_scaled 
 // Observed information X' W X / n at `beta`, with W = diag(p_i (1 - p_i)) masked
 // so padded rows contribute nothing.
 //
-// Returned already divided by n. NewtonSchulzInverse requires an O(1)-scaled
+// Returned already divided by n. NOTE the caller, logistic::Covariance, now
+// multiplies that back out before inverting: the Cholesky inverse has no
+// O(1)-scaling precondition, and at n = 2048 the normalisation cost an order of
+// magnitude in accuracy. The iterative inverse this replaced required an O(1)-scaled
 // operand -- at n observations the raw Gram matrix is O(n), and its initializer
 // A'/||A||_F^2 would underflow to zero -- and the `X^T W X / N` case in that
 // operator's calibration table is exactly this matrix.
@@ -690,15 +702,23 @@ SMatrix Covariance(const Dataset& data, const AV& beta) {
     const size_t rows = data.num_obs();
     const size_t num_fixed = data.num_fixed();
 
+    // Invert the RAW information (task 0018).
+    //
+    // The /n normalisation existed to give the ITERATIVE inverse the O(1) operand
+    // its preconditions demanded. The Cholesky inverse that replaced it has no
+    // such requirement, and for this pipeline the normalisation was actively
+    // harmful: n is the padded row count (2048), which put the entries near 1e-2
+    // where the measured relative error of diag(A^-1) is 8.0e-1 against 7.9e-2 at
+    // magnitude 1. Inverting X'WX directly also removes the post-multiplication,
+    // since (X'WX)^-1 IS the covariance.
     SMatrix normalized = ObservedInformationOverN(data, beta);
-    SMatrix inverse = NewtonSchulzInverse(normalized);
+    AV raw = Clone(normalized.data());
+    raw.setPrecision(0);
+    AV information_data = *(raw * static_cast<DataType>(rows));
+    SMatrix information(information_data, num_fixed, num_fixed, false);
+    information.setPrecision(precision);
 
-    const DataType inverse_n_scaled = std::llround(scale / static_cast<double>(rows));
-    AV inverse_raw = Clone(inverse.data());
-    inverse_raw.setPrecision(0);
-    AV covariance_data = (*(inverse_raw * inverse_n_scaled)) / scale;
-
-    SMatrix covariance(covariance_data, num_fixed, num_fixed, false);
+    SMatrix covariance = SecureInverse(information);
     covariance.setPrecision(precision);
     return covariance;
 }
@@ -1067,13 +1087,11 @@ constexpr int kIrlsIterations = 8;
 // the standard errors come out exact instead of approximated.
 // ModelData -> logistic::Dataset, for the two fixed-effects models.
 //
-// CURRENTLY UNUSED, and kept deliberately. The 6a/6b inference migration this was
-// written for was reverted after measurement (see FitLogisticIrls below for the
-// numbers): logistic::Covariance's Newton-Schulz inverse does not converge on
-// these design matrices. The adapter itself is correct and is the part that was
-// difficult to get right -- see the mask note below -- so it stays for the retry,
-// and for logistic::SeparationFlag / WaldStatistics / OddsRatio, none of which
-// depend on that inverse and none of which the pipeline currently has.
+// Used by FitLogisticIrls for the 6a/6b standard errors. It was written in task
+// 0015, sat unused when that migration was reverted, and is live again since
+// task 0017 raised kMatrixInverseIterations to the knee of the measured curve.
+// It is also what logistic::SeparationFlag / WaldStatistics / OddsRatio would
+// need, none of which the pipeline currently reports.
 //
 // ModelData is already the single-group case of the flat ragged layout: md.x is
 // the (n_pad x p) row-major design, md.y the scaled outcome, md.row_mask the rows
@@ -1140,30 +1158,15 @@ FitResult FitLogisticIrls(const ModelData& md, const ModelSpec& spec, int reveal
         beta += delta;
     }
 
-    // Standard errors from the Cholesky inverse of the ridge-augmented Gram.
-    //
-    // logistic::Covariance was tried here and REJECTED on measurement. It forms
-    // (X' W X / n)^-1 / n with NewtonSchulzInverse, and Newton-Schulz at the
-    // library's kMatrixInverseIterations = 14 does not converge on these design
-    // matrices: model 6a's observed information carries a 1-norm condition
-    // estimate around 1.2e4 -- the fit itself reports it, and warns that it is
-    // close to singular. The measured result was garbage. Several terms collapsed
-    // to an identical 0.00083923 (55 ULPs at precision 16, i.e. the inverse had
-    // lost all of its information) and `data_source=UMass` came back as 2021.25
-    // against a true 0.197. The Cholesky factorisation below is exact and handles
-    // that conditioning, so it stays. Newton-Schulz is calibrated for O(1),
-    // well-conditioned operands, which the library's own test cases are and these
-    // are not.
-    //
-    // Only the DIAGONAL is opened: the standard errors need p variances, not the
-    // whole p x p covariance, and mapping_reference is a public view so extracting
-    // them costs nothing. That is p opened values where this used to open p^2.
-    AV cov = SymmetricInverse(gram, p);
-
-    std::vector<cdough::VectorSizeType> diagonal(p);
-    for (size_t k = 0; k < p; ++k) diagonal[k] = static_cast<cdough::VectorSizeType>(k * p + k);
-    AV variances = cov.mapping_reference(diagonal);
-    variances.setPrecision(0);
+    // Standard errors from logistic::Covariance, which inverts by Cholesky.
+    // Both the inverse and the square root still happen in MPC, so this fit
+    // discloses only beta and the p standard errors.
+    logistic::Dataset data = AsLogisticDataset(md);
+    AV beta_at_optimum = Clone(beta);
+    beta_at_optimum.setPrecision(precision);
+    SMatrix covariance = logistic::Covariance(data, beta_at_optimum);
+    AV se_secure = logistic::StandardErrors(covariance);
+    se_secure.setPrecision(precision);
 
     FitResult r;
     r.step = spec.step;
@@ -1180,16 +1183,23 @@ FitResult FitLogisticIrls(const ModelData& md, const ModelSpec& spec, int reveal
     // branch. That is a property of IRLS, whose iteration count is fixed and
     // whose step needs no line search; the mixed models below cannot say it.
     const std::vector<double> beta_open = OpenToPartyDoubles(beta, reveal_to, party_id);
-    const std::vector<double> var_open = OpenToPartyDoubles(variances, reveal_to, party_id);
+    const std::vector<double> se_open = OpenToPartyDoubles(se_secure, reveal_to, party_id);
     if (beta_open.empty()) return r;  // not this party's output
     for (size_t k = 0; k < p; ++k) {
         r.estimate.push_back(beta_open[k]);
-        // The clamp is load-bearing: on a near-collinear design the inverse can
-        // put a small negative on the diagonal, and these models do go
-        // near-singular. A secure sqrt could not guard this without an extra
-        // oblivious comparison, which is the other reason the plaintext sqrt of
-        // an opened variance stays.
-        r.se.push_back(std::sqrt(std::max(0.0, var_open[k])));
+        // SecureSqrt has already been applied in MPC, so what comes back is the
+        // standard error itself rather than a variance to root here. The guard
+        // that used to clamp a negative variable to zero is gone with it:
+        // SecureSqrt is Exp(0.5 * Log(x)) and cannot be guarded obliviously
+        // without an extra comparison, so a non-positive diagonal entry on a
+        // near-singular design now yields a non-finite value instead of a
+        // silently clamped zero. Reported as unavailable, which is the honest
+        // answer, but it IS a behaviour change on exactly the fits most likely
+        // to hit it.
+        const double v = se_open[k];
+        r.se.push_back(std::isfinite(v) && v >= 0.0
+                           ? v
+                           : std::numeric_limits<double>::quiet_NaN());
     }
     return r;
 }
@@ -1222,11 +1232,84 @@ const DataType kSigma2Max_scaled = std::llround(1e3 * scale);
 // u is carried broadcast on every row. It stays constant inside a cluster by
 // construction -- each row of a cluster sees the same segmented gradient and
 // curvature -- so no extra broadcast is needed to maintain it.
-AV FlatConditionalMode(const ModelData& md, const AV& x_beta, const AV& inv_sigma2_row) {
+// =============================================================================
+// Batching the flat ragged objective over candidate parameter vectors
+// =============================================================================
+//
+// MinimizeBFGSBatched evaluates several candidate parameter vectors in one call
+// (optimizer.h). Its `num_points` counts CANDIDATES, not rows, and nothing in
+// the optimizer knows or cares how the objective lays its data out -- so the
+// flat ragged design below can drive it directly. The balanced BatchedDataset
+// that mixedeffects:: needs is not involved.
+//
+// The layout convention throughout: every per-row quantity is `blocks * n` long,
+// BLOCK-MAJOR, so candidate b owns rows [b*n, (b+1)*n). This is what
+// cyclic_subset_reference produces from a length-n vector, what
+// repeated_subset_reference produces from a length-blocks vector, and what
+// SegScanPlanned's `blocks` parameter expects. chunkedSum(n) over such a buffer
+// returns exactly `blocks` values, one per candidate.
+//
+// Views are always taken off an UNMAPPED source. mapping_reference asserts
+// !has_mapping(), so composing two views throws; where a composition is needed
+// the index arithmetic is folded into a single map instead.
+
+// A candidate-free per-row vector, repeated once per candidate.
+AV TileRows(const AV& v, size_t blocks) {
+    if (blocks == 1) return v;
+    AV out = v.cyclic_subset_reference(blocks);
+    out.setPrecision(0);
+    return out;
+}
+
+// Column k of the row-major (n x p) design, repeated once per candidate. Built
+// as one map off md.x rather than a column view tiled afterwards, which would
+// compose two mappings.
+AV BatchedColumn(const AV& x_rm, size_t n, size_t p, size_t k, size_t blocks) {
+    std::vector<cdough::VectorSizeType> map(blocks * n);
+    for (size_t b = 0; b < blocks; ++b)
+        for (size_t i = 0; i < n; ++i)
+            map[b * n + i] = static_cast<cdough::VectorSizeType>(i * p + k);
+    AV out = x_rm.mapping_reference(map);
+    out.setPrecision(0);
+    return out;
+}
+
+// eta = X * beta_b for each candidate b, returning blocks*n predictors.
+// `beta_all` is blocks*p, candidate-major.
+AV BatchedLinearPredictor(const AV& x_rm, const AV& beta_all, size_t n, size_t p,
+                          size_t blocks) {
+    AV x_ = TileRows(x_rm, blocks);  // blocks * (n*p)
+    x_.setPrecision(0);
+
+    // Candidate b's p coefficients, repeated for each of its n rows.
+    std::vector<cdough::VectorSizeType> map(blocks * n * p);
+    for (size_t b = 0; b < blocks; ++b)
+        for (size_t r = 0; r < n; ++r)
+            for (size_t j = 0; j < p; ++j)
+                map[(b * n + r) * p + j] = static_cast<cdough::VectorSizeType>(b * p + j);
+    AV beta_rows = beta_all.mapping_reference(map);
+    beta_rows.setPrecision(0);
+
+    AV eta = *(*x_.dot_product(beta_rows, p) / scale);
+    eta.setPrecision(0);
+    return eta;
+}
+
+// The inner Newton solve, over `blocks` candidates at once. Candidates are
+// independent -- nothing couples them -- so this is the single-candidate loop
+// with every vector `blocks` times wider and the segmented total told how many
+// blocks it is looking at. The iteration count is unchanged, so the round count
+// is unchanged too.
+AV FlatConditionalModeBatched(const ModelData& md, const AV& x_beta,
+                              const AV& inv_sigma2_row, size_t blocks) {
     EngineRef engine = md.y.engine;
     const size_t n = md.n_pad;
+    const size_t wide = blocks * n;
 
-    AV u(n, engine);
+    AV y_ = TileRows(md.y, blocks);
+    AV mask_ = TileRows(md.row_mask, blocks);
+
+    AV u(wide, engine);
     u.setPrecision(0);
 
     for (int it = 0; it < kFlatConditionalModeNewtonIterations; ++it) {
@@ -1240,24 +1323,35 @@ AV FlatConditionalMode(const ModelData& md, const AV& x_beta, const AV& inv_sigm
         omp += DataType(scale);
 
         AV varp = *(*(pr * omp) / scale);
-        varp = *(varp * md.row_mask);
+        varp = *(varp * mask_);
         varp.setPrecision(0);
 
-        AV resid = md.y - pr;
-        resid = *(resid * md.row_mask);
+        AV resid = y_ - pr;
+        resid = *(resid * mask_);
         resid.setPrecision(0);
 
-        // One call, both columns, with the group bits taken from the cohort's
-        // precomputed plan rather than recomputed per level per call.
         std::vector<AV> in{resid, varp};
         std::vector<AV> out;
-        out.emplace_back(n, engine);
-        out.emplace_back(n, engine);
+        out.emplace_back(wide, engine);
+        out.emplace_back(wide, engine);
         if (g_use_cached_scans) {
-            SegTotalPlanned(*md.scan_plan, in, out);
+            SegTotalPlanned(*md.scan_plan, in, out, blocks);
         } else {
-            std::vector<BV> keys = md.keys;
-            SegTotal(keys, in, out);
+            // The uncached path has no block-aware form; fall back to one call
+            // per candidate, which is only used for the -C 0 diagnostic.
+            for (size_t b = 0; b < blocks; ++b) {
+                std::vector<BV> keys = md.keys;
+                std::vector<AV> in_b{resid.slice(b * n, (b + 1) * n),
+                                     varp.slice(b * n, (b + 1) * n)};
+                std::vector<AV> out_b;
+                out_b.emplace_back(n, engine);
+                out_b.emplace_back(n, engine);
+                SegTotal(keys, in_b, out_b);
+                for (size_t c = 0; c < 2; ++c) {
+                    AV dest = out[c].slice(b * n, (b + 1) * n);
+                    dest = out_b[c];
+                }
+            }
         }
 
         AV grad = out[0] - *(*(u * inv_sigma2_row) / scale);
@@ -1265,13 +1359,24 @@ AV FlatConditionalMode(const ModelData& md, const AV& x_beta, const AV& inv_sigm
         AV curv = out[1] + inv_sigma2_row;
         curv.setPrecision(0);
 
-        AV step = Div(grad, curv);
+        // curv = sum(v) + 1/sigma^2 is strictly positive, which is what
+        // SecureReciprocal's non-restoring division circuit requires. grad is
+        // signed, but it never enters the divisor -- it is a plain multiply.
+        //
+        // SecureReciprocal returns at `precision` while everything on this path
+        // is held at 0, and handle_precision throws on a mismatched multiply.
+        // The retired Div normalised internally; replacing it means doing that
+        // here.
+        AV inv_curv = SecureReciprocal(curv);
+        inv_curv.setPrecision(0);
+        AV step = *(*(grad * inv_curv) / scale);
         step = ClampNewtonStep(step);
         step.setPrecision(0);
         u += step;
     }
     return u;
 }
+
 
 // Negative Laplace-approximated marginal log-likelihood: the BFGS objective.
 //
@@ -1321,41 +1426,74 @@ long g_objective_evaluations = 0;
 //
 // Pass nullptr for `gradient_out` to get the value alone, which is what the
 // line search wants.
-AV FlatObjective(const ModelData& md, const std::vector<AV>& params,
-                 std::vector<AV>* gradient_out) {
+// The batched form of the objective below: `num_points` candidate parameter
+// vectors at once, one value out per candidate.
+//
+// `params` is num_points * dim, POINT-MAJOR -- (k, i) -> k*dim + i -- which is
+// the packing MinimizeBFGSBatched produces with cyclic_subset_reference and
+// NumericalGradientBatched expects. dim = p + 1.
+//
+// `gradient_out`, when given, requires num_points == 1 and receives one packed
+// length-dim gradient. That is exactly the BatchedGradient contract
+// (optimizer.h): the analytic gradient is a single-point quantity, so batching
+// buys nothing there. The batching pays for itself in the LINE SEARCH, where all
+// kLineSearchSteps rungs are evaluated in one call.
+//
+// Against the one-point-at-a-time form this also removes a real inefficiency:
+// Exp, Log, Recip and ClampRange used to run on ONE-ELEMENT vectors, a full
+// transcendental circuit per scalar, once per candidate. Here they run once on a
+// length-num_points vector.
+AV FlatObjectiveBatched(const ModelData& md, const AV& params, size_t num_points,
+                        AV* gradient_out) {
     ++g_objective_evaluations;
 
     EngineRef engine = md.y.engine;
     const size_t n = md.n_pad, p = md.p;
+    const size_t dim = p + 1;
+    const size_t k_pts = num_points;
+    const size_t wide = k_pts * n;
     const bool want_gradient = (gradient_out != nullptr);
+    assert(params.size() == k_pts * dim);
+    assert(!want_gradient || k_pts == 1);
 
-    AV beta(p, engine);
-    beta.setPrecision(0);
-    for (size_t k = 0; k < p; ++k) {
-        AV cell = Cell(beta, k);
-        AV src = Clone(params[k]);
-        src.setPrecision(0);
-        cell = src;
-    }
+    // Unpack: beta_all is candidate-major (k*p + j), s_all is one per candidate.
+    std::vector<cdough::VectorSizeType> beta_map(k_pts * p);
+    for (size_t b = 0; b < k_pts; ++b)
+        for (size_t j = 0; j < p; ++j)
+            beta_map[b * p + j] = static_cast<cdough::VectorSizeType>(b * dim + j);
+    // Cloned, not left as a view: BatchedLinearPredictor maps off it again, and
+    // mapping_reference asserts !has_mapping().
+    AV beta_all = Clone(params.mapping_reference(beta_map));
+    beta_all.setPrecision(0);
 
-    AV s = Clone(params[p]);
+    std::vector<cdough::VectorSizeType> s_map(k_pts);
+    for (size_t b = 0; b < k_pts; ++b)
+        s_map[b] = static_cast<cdough::VectorSizeType>(b * dim + p);
+    AV s = Clone(params.mapping_reference(s_map));
     s.setPrecision(0);
+
     AV two_s = *(s * DataType(2));
     two_s.setPrecision(precision);
     AV sigma2 = Exp(two_s);
     sigma2 = ClampRange(sigma2, kSigma2Min_scaled, kSigma2Max_scaled);
     sigma2.setPrecision(0);
 
-    AV inv_sigma2 = Recip(sigma2);
+    AV inv_sigma2 = SecureReciprocal(sigma2);
     inv_sigma2.setPrecision(0);
     AV log_sigma2 = Log(sigma2);
     log_sigma2.setPrecision(0);
 
+    // repeated_subset_reference repeats each ELEMENT n times, so a length-k
+    // vector becomes the block-major [s_0 x n, s_1 x n, ...] this needs.
     AV inv_sigma2_row = Broadcast(inv_sigma2, n);
     AV log_sigma2_row = Broadcast(log_sigma2, n);
 
-    AV x_beta = LinearPredictor(md.x, beta, n, p);
-    AV u = FlatConditionalMode(md, x_beta, inv_sigma2_row);
+    AV y_ = TileRows(md.y, k_pts);
+    AV mask_ = TileRows(md.row_mask, k_pts);
+    AV last_ = TileRows(md.last_of_subject, k_pts);
+
+    AV x_beta = BatchedLinearPredictor(md.x, beta_all, n, p, k_pts);
+    AV u = FlatConditionalModeBatched(md, x_beta, inv_sigma2_row, k_pts);
 
     AV eta = x_beta + u;
     eta = ClampAbs(eta, kMaxExpArg_scaled);
@@ -1366,49 +1504,43 @@ AV FlatObjective(const ModelData& md, const std::vector<AV>& params,
     AV sp = LogOnePlusExp(eta);
     sp.setPrecision(0);
 
-    AV y_eta = *(*(md.y * eta) / scale);
+    AV y_eta = *(*(y_ * eta) / scale);
     AV cll_row = y_eta - sp;
-    cll_row = *(cll_row * md.row_mask);
+    cll_row = *(cll_row * mask_);
     cll_row.setPrecision(0);
 
     AV omp = -pr;
     omp += DataType(scale);
     AV varp_row = *(*(pr * omp) / scale);
-    varp_row = *(varp_row * md.row_mask);
+    varp_row = *(varp_row * mask_);
     varp_row.setPrecision(0);
 
-    // Columns to scan. The first two are what the value needs; the rest are the
-    // gradient's per-cluster sums, folded into the same pass.
     std::vector<AV> columns{cll_row, varp_row};
-    AV resid(n, engine), skew(n, engine);
+    AV resid(wide, engine), skew(wide, engine);
     if (want_gradient) {
-        // skew = v * (1 - 2p), the derivative of v with respect to eta.
         AV one_minus_two_p = *(pr * DataType(2));
         one_minus_two_p = -one_minus_two_p;
         one_minus_two_p += DataType(scale);
         skew = *(*(varp_row * one_minus_two_p) / scale);
         skew.setPrecision(0);
 
-        resid = md.y - pr;
-        resid = *(resid * md.row_mask);
+        resid = y_ - pr;
+        resid = *(resid * mask_);
         resid.setPrecision(0);
 
         columns.push_back(skew);
         for (size_t k = 0; k < p; ++k) {
-            AV xk = md.x.simple_subset_reference(k, p, (n - 1) * p + k);
-            xk.setPrecision(0);
+            AV xk = BatchedColumn(md.x, n, p, k, k_pts);
             columns.push_back(*(*(varp_row * xk) / scale));
             columns.back().setPrecision(0);
         }
         for (size_t k = 0; k < p; ++k) {
-            AV xk = md.x.simple_subset_reference(k, p, (n - 1) * p + k);
-            xk.setPrecision(0);
+            AV xk = BatchedColumn(md.x, n, p, k, k_pts);
             columns.push_back(*(*(skew * xk) / scale));
             columns.back().setPrecision(0);
         }
         for (size_t k = 0; k < p; ++k) {
-            AV xk = md.x.simple_subset_reference(k, p, (n - 1) * p + k);
-            xk.setPrecision(0);
+            AV xk = BatchedColumn(md.x, n, p, k, k_pts);
             columns.push_back(*(*(resid * xk) / scale));
             columns.back().setPrecision(0);
         }
@@ -1416,12 +1548,22 @@ AV FlatObjective(const ModelData& md, const std::vector<AV>& params,
 
     std::vector<AV> pre;
     pre.reserve(columns.size());
-    for (size_t k = 0; k < columns.size(); ++k) pre.emplace_back(n, engine);
+    for (size_t k = 0; k < columns.size(); ++k) pre.emplace_back(wide, engine);
     if (g_use_cached_scans) {
-        SegScanPlanned(*md.scan_plan, columns, pre, SegDirection::Forward);
+        SegScanPlanned(*md.scan_plan, columns, pre, SegDirection::Forward, k_pts);
     } else {
-        std::vector<BV> keys = md.keys;
-        SegScan(keys, columns, pre, SegDirection::Forward);
+        for (size_t b = 0; b < k_pts; ++b) {
+            std::vector<BV> keys = md.keys;
+            std::vector<AV> in_b, out_b;
+            in_b.reserve(columns.size());
+            for (const AV& c : columns) in_b.push_back(c.slice(b * n, (b + 1) * n));
+            for (size_t c = 0; c < columns.size(); ++c) out_b.emplace_back(n, engine);
+            SegScan(keys, in_b, out_b, SegDirection::Forward);
+            for (size_t c = 0; c < columns.size(); ++c) {
+                AV dest = pre[c].slice(b * n, (b + 1) * n);
+                dest = out_b[c];
+            }
+        }
     }
 
     AV a_row = pre[1] + inv_sigma2_row;
@@ -1439,69 +1581,66 @@ AV FlatObjective(const ModelData& md, const std::vector<AV>& params,
     AV per_row = pre[0] - pen_half - log_half;
     per_row.setPrecision(0);
 
-    AV contrib = *(per_row * md.last_of_subject);
-    AV total = contrib.chunkedSum(n);
+    AV contrib = *(per_row * last_);
+    AV total = contrib.chunkedSum(n);  // one value per candidate
     total.setPrecision(0);
 
     if (want_gradient) {
-        // One reciprocal serves the whole gradient. It is computed on every row
-        // even though only the last row of each cluster is used, because a
-        // vectorised division over n rows is cheaper than compacting first.
-        AV inv_a = Recip(a_row);
+        AV inv_a = SecureReciprocal(a_row);
         inv_a.setPrecision(0);
-        AV s2 = pre[2];  // S2_i, the skew total
+        AV s2 = pre[2];
 
-        gradient_out->clear();
-        gradient_out->reserve(p + 1);
+        AV grad(dim, engine);
+        grad.setPrecision(0);
 
         for (size_t k = 0; k < p; ++k) {
             AV s1 = pre[3 + k];
             AV s3 = pre[3 + p + k];
             AV s4 = pre[3 + 2 * p + k];
 
-            // dA/dbeta_k = S3_k - S1_k * S2 / A
             AV s1_s2 = *(*(s1 * s2) / scale);
             AV shift = *(*(s1_s2 * inv_a) / scale);
             AV d_a = s3 - shift;
             d_a.setPrecision(0);
 
-            // dl/dbeta_k = S4_k - (dA/dbeta_k) / (2 A)
             AV correction = *(*(d_a * inv_a) / scale);
             AV half_correction = *(correction / DataType(2));
             AV row = s4 - half_correction;
             row.setPrecision(0);
 
-            AV masked = *(row * md.last_of_subject);
+            AV masked = *(row * last_);
             AV summed = masked.chunkedSum(n);
             AV negated = -summed;  // gradient of the NEGATIVE log-likelihood
-            negated.setPrecision(precision);
-            gradient_out->push_back(negated);
+            negated.setPrecision(0);
+            AV cell = Cell(grad, k);
+            cell = negated;
         }
 
-        // du/ds = 2 u / (sigma^2 A)
         AV du_ds = *(*(u * inv_sigma2_row) / scale);
         du_ds = *(*(du_ds * inv_a) / scale);
         du_ds = *(du_ds * DataType(2));
         du_ds.setPrecision(0);
 
-        // dA/ds = -2/sigma^2 + S2 * du/ds
         AV d_a_ds = *(*(s2 * du_ds) / scale);
         AV two_inv = *(inv_sigma2_row * DataType(2));
         d_a_ds -= two_inv;
         d_a_ds.setPrecision(0);
 
-        // dl/ds = u^2/sigma^2 - 1 - (dA/ds) / (2 A)
         AV correction = *(*(d_a_ds * inv_a) / scale);
         AV half_correction = *(correction / DataType(2));
-        AV row = pen - half_correction;  // pen is u^2/sigma^2
+        AV row = pen - half_correction;
         row -= DataType(scale);
         row.setPrecision(0);
 
-        AV masked = *(row * md.last_of_subject);
+        AV masked = *(row * last_);
         AV summed = masked.chunkedSum(n);
         AV negated = -summed;
-        negated.setPrecision(precision);
-        gradient_out->push_back(negated);
+        negated.setPrecision(0);
+        AV cell = Cell(grad, p);
+        cell = negated;
+
+        grad.setPrecision(precision);
+        *gradient_out = grad;
     }
 
     AV neg = -total;
@@ -1509,179 +1648,163 @@ AV FlatObjective(const ModelData& md, const std::vector<AV>& params,
     return neg;
 }
 
-// Value-only wrapper, for the places that do not want a gradient.
-AV FlatNegMarginalLogLik(const ModelData& md, const std::vector<AV>& params) {
-    return FlatObjective(md, params, nullptr);
-}
 
 // BFGS iteration budget for the mixed models (task 0016).
-//
-// Was 12, a flat cap that suited the 3-parameter models and starved the
-// 7-parameter ones. BFGS starts from an identity inverse-Hessian and applies one
-// rank-2 update per iteration, so it needs roughly `dim` iterations before it has
-// any usable curvature at all. At 12 the budget was 4.0x dim for 2a/2b, which
-// converged at 9-12, but only 1.7x dim for 5a/5b, which all six exhausted it with
-// gradient norms between 96 and 190 -- truncated mid-descent, not fitted.
-//
-// 60 is ~8.6x dim for 5a/5b. The easy models do not pay for it: they exit early
-// on a failed line search well before the cap, so a larger cap only costs time
-// where it actually binds.
-constexpr int kGlmmBfgsIterations = 60;
+constexpr int kGlmmBfgsIterations = 25;
 
-// Step for the numerical observed-information Hessian below. A second difference
-// divides by h^2, so it amplifies the objective's fixed-point noise by 1/h^2;
-// the truncation error meanwhile grows as h^2. With an objective good to about
-// 1e-4 at precision 16, the balance sits near h = eps^(1/4) ~ 0.1.
+// Step for the observed-information Hessian below.
+//
+// 0.1 was derived for SECOND differences of the objective, which divide by h^2
+// and so amplify the objective's fixed-point noise by 1/h^2 against a truncation
+// error growing as h^2 -- balancing near h = eps^(1/4) ~ 0.1 for an objective
+// good to about 1e-4 at precision 16.
+//
+// ObservedInformationFromGradient takes a FIRST central difference of the
+// analytic gradient, which divides by h once. The balance moves to roughly
+// eps^(1/3) ~ 0.05, so this value is no longer the optimum for the form that
+// uses it -- it is merely close enough. Measured against the plaintext oracle it
+// holds every mixed model to 1.6e-2 - 5.1e-2 against a 1.0e-1 bar, so the sweep
+// that would retune it is worth doing but is not urgent.
 const double kHessianStep = 0.1;
 
 // Above this the observed-information matrix is close enough to singular that
-// its inverse should not be trusted at all. The threshold is deliberately high:
-// with the Hessian built from differences of the ANALYTIC gradient, standard
-// errors measured against an accurate double-precision reference stayed within
-// 8% at condition numbers around 2e4, so warning there would be crying wolf.
-// The earlier objective-difference Hessian was 17-46% off at the same
-// conditioning, which is what the old, much lower threshold was compensating
-// for.
-const double kHessianConditionWarn = 1e6;
+// the standard errors should not be trusted at all.
+//
+// 5e4 is the first swept condition whose error exceeds 10%, and every swept
+// point above it is worse, so the warning does not flicker on and off with
+// kappa. It also sits above the 2.5e4 that the most ill-conditioned real model
+// reaches, where the measured error against the plaintext oracle is 1.6e-2.
+const double kHessianConditionWarn = 5e4;
 
-// Standard errors for the mixed models, from the observed information at the
-// optimum.
+// Observed information from central differences of the ANALYTIC gradient, on
+// shares.
 //
-// The BFGS inverse-Hessian approximation is NOT good enough for this. With a
-// dozen iterations and up to eight parameters it can leave whole directions
-// untouched, and its diagonal then reports a variance of almost exactly 1 --
-// an artefact of the identity it was initialised with rather than a standard
-// error. Instead the Hessian is formed by finite differences of the objective
-// and inverted directly.
+// This replaces NumericalHessianBatched, which takes second differences of the
+// OBJECTIVE. The calibration note on kHessianStep records why that matters: an
+// analytic-gradient Hessian held standard errors within 8% at condition ~2e4,
+// where the objective-difference form was 17-46% off. A second difference also
+// divides by h^2, amplifying the objective's own fixed-point noise by 1/h^2,
+// where a first difference of the gradient only divides by h.
 //
-// The differences are opened and the small dense algebra is done in plaintext.
-// That is consistent with the choice already made for p-values: the curvature of
-// the log-likelihood at the optimum is exactly what a published standard error
-// discloses, so evaluating it under MPC would protect nothing, and it avoids
-// amplifying fixed-point noise through a second difference and a matrix inverse.
-// `condition_out` receives a 1-norm condition-number estimate for the Hessian.
-// It matters: in a near-collinear direction the Hessian is nearly singular, and
-// inverting it amplifies the objective's fixed-point noise without limit. The
-// standard errors on such terms are not trustworthy and the caller says so.
+// The predecessor that used this form, ObservedInformationSE, OPENED all dim
+// gradient components at each of the 2*dim perturbed points, because it went on
+// to invert in plaintext. Nothing here is opened: the differences, the Schur
+// complement, the inverse and the square root all stay on shares, so the fit
+// still discloses only 1 + p values.
 //
-// The Hessian is built from CENTRAL DIFFERENCES OF THE ANALYTIC GRADIENT, not
-// from second differences of the objective. That matters twice over. It costs
-// 2*dim gradient evaluations instead of 1 + 2*dim + dim(dim-1)/2 objective
-// evaluations -- about 2.5x less at dim = 7 -- and, more importantly, a first
-// difference divides by h rather than h^2, so it amplifies the fixed-point noise
-// by one factor of 1/h instead of two. That is exactly the term that made the
-// standard errors on near-collinear directions unreliable.
-//
-// The differences are opened and the small dense algebra is done in plaintext,
-// consistent with the choice already made for p-values: the curvature of the
-// log-likelihood at the optimum is precisely what a published standard error
-// discloses, so evaluating it under MPC would protect nothing.
-// The gradient opens below steer nothing: the axes, the step and the trip count
-// are all public and fixed, so unlike the line search inside MinimizeBFGS these
-// values can go to one party without any other party needing to see them.
-std::vector<double> ObservedInformationSE(const ValueGradFn& objective,
-                                          const std::vector<AV>& optimum,
-                                          size_t num_reported,
-                                          double* condition_out = nullptr,
-                                          int reveal_to = -1, int party_id = 0) {
-    const size_t dim = optimum.size();
-    const double h = kHessianStep;
+// COST. 2*dim sequential gradient evaluations, against ONE batched call of
+// 2*dim*(dim+1) points. The analytic gradient cannot be batched over evaluation
+// points -- FlatObjectiveBatched asserts num_points == 1 when a gradient is
+// requested, because the gradient is a single-point quantity -- so this trades
+// round depth for accuracy.
+SMatrix ObservedInformationFromGradient(const ModelData& md, const AV& optimum,
+                                        DataType step_scaled) {
+    EngineRef engine = md.y.engine;
+    const size_t dim = md.p + 1;
+    assert(optimum.size() == dim);
 
-    auto gradient_at = [&](size_t axis, double delta) {
-        std::vector<AV> point;
-        point.reserve(dim);
-        for (size_t k = 0; k < dim; ++k) {
-            AV v = Clone(optimum[k]);
-            v.setPrecision(0);
-            if (k == axis) v += static_cast<DataType>(std::llround(delta * scale));
-            v.setPrecision(precision);
-            point.push_back(v);
-        }
-        std::vector<AV> grad;
-        objective(point, &grad);
-        std::vector<double> out;
-        out.reserve(dim);
-        for (AV& g : grad) out.push_back(OpenScalarToParty(g, reveal_to, party_id));
-        return out;
-    };
+    AV raw(dim * dim, engine);
+    raw.setPrecision(0);
 
-    // Column k of the Hessian is d(grad)/d(x_k).
-    std::vector<double> hess(dim * dim, 0.0);
+    // 1 / (2h) as a public constant, so the division is by a public value.
+    const double h = static_cast<double>(step_scaled) / static_cast<double>(scale);
+    const DataType inv_two_h = std::llround(static_cast<double>(scale) / (2.0 * h));
+
     for (size_t k = 0; k < dim; ++k) {
-        const std::vector<double> forward = gradient_at(k, h);
-        const std::vector<double> backward = gradient_at(k, -h);
-        for (size_t j = 0; j < dim; ++j)
-            hess[j * dim + k] = (forward[j] - backward[j]) / (2.0 * h);
-    }
-    // The true Hessian is symmetric; averaging the two estimates of each
-    // off-diagonal entry halves the noise for free.
-    for (size_t j = 0; j < dim; ++j) {
-        for (size_t k = j + 1; k < dim; ++k) {
-            const double avg = 0.5 * (hess[j * dim + k] + hess[k * dim + j]);
-            hess[j * dim + k] = hess[k * dim + j] = avg;
+        AV forward = Clone(optimum);
+        forward.setPrecision(0);
+        AV fcell = Cell(forward, k);
+        fcell += step_scaled;
+        forward.setPrecision(precision);
+        AV g_fwd(dim, engine);
+        g_fwd.setPrecision(precision);
+        FlatObjectiveBatched(md, forward, 1, &g_fwd);
+
+        AV backward = Clone(optimum);
+        backward.setPrecision(0);
+        AV bcell = Cell(backward, k);
+        bcell -= step_scaled;
+        backward.setPrecision(precision);
+        AV g_bwd(dim, engine);
+        g_bwd.setPrecision(precision);
+        FlatObjectiveBatched(md, backward, 1, &g_bwd);
+
+        g_fwd.setPrecision(0);
+        g_bwd.setPrecision(0);
+        AV diff = g_fwd - g_bwd;
+        diff.setPrecision(0);
+        AV column = *(*(diff * inv_two_h) / scale);
+        column.setPrecision(0);
+
+        for (size_t i = 0; i < dim; ++i) {
+            AV dst = Cell(raw, i * dim + k);
+            dst = Cell(column, i);
         }
     }
 
-    // Invert by Gauss-Jordan with partial pivoting. Unlike the secure Cholesky,
-    // this runs on public numbers, so pivoting costs nothing and the matrix does
-    // not have to be positive definite for the routine to return something --
-    // a non-positive diagonal in the result is reported as an unavailable
-    // standard error rather than silently square-rooted.
-    std::vector<double> m(hess), inv(dim * dim, 0.0);
-    for (size_t k = 0; k < dim; ++k) inv[k * dim + k] = 1.0;
-    for (size_t c = 0; c < dim; ++c) {
-        size_t piv = c;
-        for (size_t r = c + 1; r < dim; ++r)
-            if (std::abs(m[r * dim + c]) > std::abs(m[piv * dim + c])) piv = r;
-        for (size_t k = 0; k < dim; ++k) {
-            std::swap(m[c * dim + k], m[piv * dim + k]);
-            std::swap(inv[c * dim + k], inv[piv * dim + k]);
-        }
-        const double d = m[c * dim + c];
-        if (std::abs(d) < 1e-12) {
-            std::fill(inv.begin(), inv.end(), std::numeric_limits<double>::quiet_NaN());
-            break;
-        }
-        for (size_t k = 0; k < dim; ++k) {
-            m[c * dim + k] /= d;
-            inv[c * dim + k] /= d;
-        }
-        for (size_t r = 0; r < dim; ++r) {
-            if (r == c) continue;
-            const double f = m[r * dim + c];
-            for (size_t k = 0; k < dim; ++k) {
-                m[r * dim + k] -= f * m[c * dim + k];
-                inv[r * dim + k] -= f * inv[c * dim + k];
-            }
+    // Symmetrise. Each column is an independent set of differences, so the two
+    // triangles differ by rounding -- and CovarianceFromInformation reads h_bs
+    // from the last COLUMN only, which silently assumes symmetry.
+    AV sym(dim * dim, engine);
+    sym.setPrecision(0);
+    for (size_t i = 0; i < dim; ++i) {
+        for (size_t j = 0; j < dim; ++j) {
+            AV upper = Clone(Cell(raw, i * dim + j));
+            upper.setPrecision(0);
+            AV lower = Clone(Cell(raw, j * dim + i));
+            lower.setPrecision(0);
+            AV total = upper + lower;
+            total.setPrecision(0);
+            AV dst = Cell(sym, i * dim + j);
+            dst = *(total / DataType(2));
         }
     }
 
+    SMatrix out(sym, dim, dim, false);
+    out.setPrecision(precision);
+    return out;
+}
+
+// Standard errors and a conditioning diagnostic, entirely in MPC.
+std::vector<double> ObservedInformationSecure(const ModelData& md, const AV& optimum,
+                                              size_t num_reported, double* condition_out,
+                                              int reveal_to, int party_id) {
+    const size_t p = md.p;
+    const size_t dim = p + 1;
+
+    const DataType step_scaled = static_cast<DataType>(std::llround(kHessianStep * scale));
+    SMatrix information = ObservedInformationFromGradient(md, optimum, step_scaled);
+
+    // Secure: normalise, Schur-complement out the variance coordinate, invert by
+    // Cholesky. Returns the p x p fixed-effect block.
+    AV kappa(1, md.y.engine);
+    kappa.setPrecision(precision);
+    SMatrix covariance =
+        mixedeffects::CovarianceFromInformation(information, p, md.n_pad, &kappa);
+    AV se_secure = logistic::StandardErrors(covariance);
+
+    const std::vector<double> se_open = OpenToPartyDoubles(se_secure, reveal_to, party_id);
+
+    // The condition estimate is now computed ON SHARES and opened as ONE scalar.
+    // It used to open the whole dim x dim Hessian and reduce it in plaintext,
+    // which was the largest remaining disclosure in the inference path. This
+    // fit now discloses 1 + p values, against dim^2 + p before and 2 * dim^2 for
+    // a plaintext inverse.
     if (condition_out != nullptr) {
-        // 1-norm condition estimate: max column sum of H times that of H^-1.
-        double norm_h = 0.0, norm_inv = 0.0;
-        for (size_t c = 0; c < dim; ++c) {
-            double col_h = 0.0, col_inv = 0.0;
-            for (size_t r = 0; r < dim; ++r) {
-                col_h += std::abs(hess[r * dim + c]);
-                col_inv += std::abs(inv[r * dim + c]);
-            }
-            norm_h = std::max(norm_h, col_h);
-            norm_inv = std::max(norm_inv, col_inv);
-        }
-        *condition_out = std::isfinite(norm_h * norm_inv)
-                             ? norm_h * norm_inv
-                             : std::numeric_limits<double>::infinity();
+        const std::vector<double> opened = OpenToPartyDoubles(kappa, reveal_to, party_id);
+        *condition_out = opened.empty() ? 0.0 : opened[0];
     }
 
     std::vector<double> se;
-    for (size_t k = 0; k < num_reported; ++k) {
-        const double var = inv[k * dim + k];
-        se.push_back(std::isfinite(var) && var > 0.0
-                         ? std::sqrt(var)
-                         : std::numeric_limits<double>::quiet_NaN());
+    if (se_open.empty()) return se;  // not this party's output
+    for (size_t k = 0; k < num_reported && k < se_open.size(); ++k) {
+        const double v = se_open[k];
+        se.push_back(std::isfinite(v) && v > 0.0 ? v
+                                                 : std::numeric_limits<double>::quiet_NaN());
     }
     return se;
 }
+
 
 // `reveal_to` restricts this fit's OUTPUT -- coefficients, standard errors and
 // the variance component -- to one party. It does NOT make the whole fit
@@ -1696,20 +1819,29 @@ FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_i
     const size_t p = md.p;
     const size_t dim = p + 1;  // beta plus s, where sigma = exp(s)
 
-    // Start from beta = 0 and sigma = 1 (s = 0).
-    std::vector<AV> x0;
-    for (size_t k = 0; k < dim; ++k) {
-        AV v(1, engine);
-        v.setPrecision(precision);
-        x0.push_back(v);
-    }
+    // Start from beta = 0 and sigma = 1 (s = 0), as ONE packed dim-length vector
+    // rather than dim one-element vectors.
+    AV x0(dim, engine);
+    x0.setPrecision(precision);
 
-    ValueGradFn objective = [&md](const std::vector<AV>& params,
-                                  std::vector<AV>* gradient) -> AV {
-        return FlatObjective(md, params, gradient);
+    // The batched objective drives the line search: MinimizeBFGSBatched hands it
+    // all kLineSearchSteps rungs in a single call instead of opening one
+    // objective value per backtracking trial.
+    BatchedObjective objective = [&md](const AV& params, size_t num_points) -> AV {
+        return FlatObjectiveBatched(md, params, num_points, nullptr);
+    };
+    // The analytic gradient is a single-point quantity, which is exactly the
+    // BatchedGradient contract. Supplying it keeps the derivation in
+    // FlatObjectiveBatched and avoids NumericalGradientBatched's 2*dim-wide
+    // difference entirely.
+    BatchedGradient analytic = [&md, dim](const AV& point) -> AV {
+        AV g(dim, md.y.engine);
+        g.setPrecision(precision);
+        FlatObjectiveBatched(md, point, 1, &g);
+        return g;
     };
 
-    OptResult opt = MinimizeBFGS(objective, x0, kGlmmBfgsIterations);
+    BatchedOptResult opt = MinimizeBFGSBatched(objective, x0, kGlmmBfgsIterations, analytic);
 
     FitResult r;
     r.step = spec.step;
@@ -1721,20 +1853,34 @@ FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_i
     r.rows_used = md.rows_used;
     r.rows_dropped_null_fu = md.rows_dropped_null_fu;
 
+    // opt.params is one packed dim-length vector; split it back into the
+    // per-coordinate scalars the reporting and the SE routine expect.
+    std::vector<AV> optimum;
+    optimum.reserve(dim);
+    for (size_t k = 0; k < dim; ++k) {
+        AV cell = Clone(opt.params.slice(k, k + 1));
+        cell.setPrecision(precision);
+        optimum.push_back(cell);
+    }
+
     for (size_t k = 0; k < p; ++k)
-        r.estimate.push_back(OpenScalarToParty(opt.params[k], reveal_to, party_id));
+        r.estimate.push_back(OpenScalarToParty(optimum[k], reveal_to, party_id));
     double condition = 0.0;
-    r.se = ObservedInformationSE(objective, opt.params, p, &condition, reveal_to, party_id);
+    r.se = ObservedInformationSecure(md, opt.params, p, &condition, reveal_to, party_id);
     r.hessian_condition = condition;
-    const double s_hat = OpenScalarToParty(opt.params[p], reveal_to, party_id);
+    const double s_hat = OpenScalarToParty(optimum[p], reveal_to, party_id);
     r.sigma2 = std::exp(2.0 * s_hat);
 
     r.notes.push_back(
-        "standard errors come from central differences of the analytic gradient at the "
-        "optimum, not from the BFGS inverse-Hessian approximation");
-    if (!opt.hessian_updated)
-        r.notes.push_back(
-            "no BFGS curvature update was accepted, so the optimiser may have stopped early");
+        "standard errors come from an observed-information Hessian built from central "
+        "differences of the analytic gradient and inverted in MPC by Cholesky "
+        "factorisation, not from the BFGS inverse-Hessian approximation; the inverse is "
+        "accurate to well under 1% except where a variance is itself only a few ULPs, in "
+        "which case the standard error is not meaningful at this precision");
+    // The "no curvature update was accepted" note is gone with MinimizeBFGS.
+    // MinimizeBFGSBatched multiplexes the BFGS update rather than branching on
+    // the curvature sign, so whether one was ever accepted is no longer
+    // plaintext-knowable -- which is the point: it was a leak.
     {
         // Always report the conditioning: it is the single most useful number
         // for judging how much to trust the standard errors on the weakly

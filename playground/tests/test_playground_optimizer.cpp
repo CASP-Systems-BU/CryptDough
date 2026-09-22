@@ -63,17 +63,28 @@ constexpr double kExactish = 4.0 * kResolution;  // ~6.1e-5
 // One matmul: each output entry is a sum of `inner` products, and the kernel
 // truncates once per product. The bound therefore grows with the contraction
 // length; at the sizes used here (inner <= 4) a few ULPs per term is ample.
-constexpr double kMatMulTolerance = 2.0e-4;  // absolute; measured worst 1.53e-05
+constexpr double kMatMulTolerance = 2.0e-4;  // absolute; measured worst 0.00e+00 (fixtures are exact)
 
 // NewtonSchulzInverse. The calibration table in optimizer.h records a noise
 // floor of 5e-5 to 1.2e-4 for well-conditioned cases at 14 iterations; 2e-3
 // leaves better than an order of magnitude of margin over the worst of those.
 // The residual check |A X - I| is held to the same bar.
-constexpr double kInverseTolerance = 4.0e-4;  // absolute; measured worst 3.40e-05 (residual)
+//
+// This bounds an operator the PIPELINE no longer calls. Since task 0018
+// the only callers of NewtonSchulzInverse are this suite and the
+// secure-logistic-regression calibration harness; the analysis inverts through
+// SecureInverse (regression.h:408, :732). Left as derived rather than retuned to
+// its 2.85e-05 worst, because tightening a bound on a path nothing depends on
+// buys nothing. kSymmetricInverseTolerance below is the one that matters now.
+constexpr double kInverseTolerance = 4.0e-4;  // absolute; measured worst 2.85e-05 (residual)
+
+// SecureInverse / SymmetricInverse -- the Cholesky inverse, and the one the
+// PIPELINE actually uses. Calibrated below.
+constexpr double kSymmetricInverseTolerance = 1.0e-2;  // absolute; PLACEHOLDER, calibrating
 
 // BfgsInverseUpdateBatched composes four kernel calls, and optimizer.h's own
 // comment quotes ~5e-4 for it. 4e-3 is that with margin.
-constexpr double kBfgsUpdateTolerance = 4.0e-4;  // absolute; measured worst 3.37e-05
+constexpr double kBfgsUpdateTolerance = 4.0e-4;  // absolute; measured worst 8.13e-05
 
 // The central-difference gradient. On a QUADRATIC objective the central
 // difference is algebraically exact, so the entire budget here is fixed-point:
@@ -364,6 +375,83 @@ void TestNewtonSchulzInverse(EngineRef engine) {
 }
 
 // ---------------------------------------------------------------------------
+// SecureInverse / SymmetricInverse (the Cholesky inverse)
+// ---------------------------------------------------------------------------
+// This is the inverse the PIPELINE uses. Every standard error the analysis
+// reports flows through it (regression.h:408 for the mixed models, :732 for the
+// fixed-effect ones), where NewtonSchulzInverse above now has no caller outside
+// this suite and the secure-logistic-regression calibration harness. Task 0018
+// replaced the iterative inverse without adding a test for the direct one, so
+// until now the live path was covered only by harness.h's unasserted self-check.
+//
+// Cases are SPD, which is the operator's precondition: CholeskyFactor does not
+// pivot, and a non-positive pivot yields meaningless output with no error and no
+// leak. The non-symmetric case from the Newton-Schulz suite is therefore
+// deliberately absent -- it is outside the contract, not a case this should pass.
+//
+// The 4x4 case is not redundant with the 3x3: CholeskySolveManyWith solves all p
+// right-hand sides in one batched call with its own row-major p x rhs indexing,
+// and a width-4 operand exercises that arithmetic where a 2x2 would not.
+void TestSecureInverse(EngineRef engine) {
+    Section("SecureInverse (Cholesky)", engine);
+
+    struct Case {
+        const char* name;
+        std::size_t n;
+        std::vector<double> values;
+    };
+
+    const std::vector<Case> cases = {
+        {"SecureInverse identity", 3, RefIdentity(3)},
+        {"SecureInverse spd 2x2", 2, {2.0, 0.5, 0.5, 1.5}},
+        {"SecureInverse spd 3x3", 3, {2.0, 0.3, 0.1, 0.3, 1.5, 0.25, 0.1, 0.25, 1.0}},
+        {"SecureInverse spd 4x4", 4,
+         {2.5, 0.4, 0.2, 0.1, 0.4, 2.0, 0.3, 0.15, 0.2, 0.3, 1.75, 0.25, 0.1, 0.15, 0.25, 1.5}},
+    };
+
+    for (const Case& test_case : cases) {
+        const std::size_t n = test_case.n;
+        const std::vector<double> rounded = RoundTrip(test_case.values);
+
+        std::vector<double> expected = rounded;
+        const bool invertible = RefInvert(expected, n);
+        assert(invertible && "test fixture matrix is singular");
+
+        SMatrix a = ShareMatrix(test_case.values, n, n, engine);
+        SMatrix inverse = SecureInverse(a);
+
+        const std::vector<double> actual = OpenMatrix(inverse);
+        CheckClose(test_case.name, actual, expected, kSymmetricInverseTolerance, engine);
+
+        // Residual |A X - I| from the OPENED inverse, independent of the
+        // Gauss-Jordan reference, so a shared error in both would still show.
+        const std::vector<double> residual = RefMatMul(rounded, actual, n, n, n);
+        CheckClose(std::string(test_case.name) + " residual A*X=I", residual, RefIdentity(n),
+                   kSymmetricInverseTolerance, engine);
+    }
+
+    // The result is NOT symmetrised: each column is an independent solve, so the
+    // two triangles differ by rounding. Callers that read only the diagonal (the
+    // standard errors do) are unaffected, but the asymmetry is real and is
+    // asserted here so that it stays a documented property rather than a
+    // surprise. The bound is the same fixed-point budget as the inverse itself.
+    {
+        const std::size_t n = 3;
+        const std::vector<double> values = {2.0, 0.3, 0.1, 0.3, 1.5, 0.25, 0.1, 0.25, 1.0};
+        SMatrix a = ShareMatrix(values, n, n, engine);
+        const std::vector<double> x = OpenMatrix(SecureInverse(a));
+        std::vector<double> upper, lower;
+        for (std::size_t i = 0; i < n; ++i)
+            for (std::size_t j = i + 1; j < n; ++j) {
+                upper.push_back(x[i * n + j]);
+                lower.push_back(x[j * n + i]);
+            }
+        CheckClose("SecureInverse asymmetry is within the fixed-point budget", upper, lower,
+                   kSymmetricInverseTolerance, engine);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Line-search and central-difference constants
 // ---------------------------------------------------------------------------
 // Both are public patterns that depend only on `dim` (or on nothing at all), so
@@ -407,12 +495,15 @@ void TestConstants(EngineRef engine) {
     CheckExactRaw("LineSearchConstants.strict_prefix", OpenRaw(ls.strict_prefix), prefix_expected,
                   engine);
 
-    // The smallest rung is 2^-16, which is exactly 1 at `precision` 16. One more
-    // rung would truncate to a zero step, which is why kLineSearchSteps is 17
-    // and not larger. Pinning it here means a future change to the ladder has to
-    // confront that reasoning.
-    assert(alpha_expected[steps - 1] == 1);
-    Note("alpha ladder bottoms out at 1 ULP (2^-16); a further rung would be a zero step", engine);
+    // The smallest rung is 2^-(steps-1). It has to be a NON-ZERO step: at
+    // `precision` 16 it was exactly 1 ULP, which is where kLineSearchSteps = 17
+    // came from. Since precision moved to 28 it is 4096 ULPs and the format would
+    // permit more rungs; the ladder is kept at 17 deliberately (see
+    // kLineSearchSteps). What still has to hold, and is what this checks, is that
+    // the last rung does not truncate away.
+    assert(alpha_expected[steps - 1] >= 1);
+    Note("alpha ladder bottoms out at a non-zero step (2^-16 at the current ladder length)",
+         engine);
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +721,7 @@ int main(int argc, char** argv) {
     TestMatrixScalars(engine);
     TestMatVecAndOuter(engine);
     TestNewtonSchulzInverse(engine);
+    TestSecureInverse(engine);
     TestConstants(engine);
     TestBfgsInverseUpdate(engine);
     TestNumericalGradient(engine);

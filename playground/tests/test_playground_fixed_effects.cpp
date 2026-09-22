@@ -135,14 +135,14 @@ constexpr double kExactish = 4.0 * kResolution;  // ~6.1e-5
 // The negative log-likelihood sums 38 unmasked terms, each a LogOnePlusExp
 // (measured ~1.8e-4) plus a product. 38 * 2e-4 ~ 8e-3 if the errors aligned;
 // they are not systematically signed, so this is a conservative bound.
-constexpr double kNegLogLikTolerance = 1.5e-2;  // absolute; measured worst 4.90e-03 -- left as derived
+constexpr double kNegLogLikTolerance = 1.5e-2;  // absolute; measured worst 2.65e-03 -- left as derived
 
 // The ridge penalty is two multiplies and a sum.
 constexpr double kPenaltyTolerance = 1.0e-4;  // absolute; measured worst 9.00e-06
 
 // The analytic gradient: one Sigmoid over n elements, then a matmul contracting
 // over n = 40. The contraction is where the error accumulates.
-constexpr double kGradientTolerance = 3.0e-3;  // absolute; measured worst 6.25e-04
+constexpr double kGradientTolerance = 3.0e-3;  // absolute; measured worst 5.49e-04
 
 // X'WX/n. Same contraction, with the weights costing one more Sigmoid and two
 // multiplies per row.
@@ -151,18 +151,18 @@ constexpr double kInformationTolerance = 2.0e-4;  // absolute; measured worst 1.
 // The covariance inverts a matrix whose entries are O(0.2) and whose inverse is
 // therefore O(5), so the inverse's absolute error is the operator's noise floor
 // amplified by the scale of the answer. Relative is the only sensible mode here.
-constexpr double kCovarianceTolerance = 1.0e-3;  // relative; measured worst 3.53e-05
+constexpr double kCovarianceTolerance = 1.0e-3;  // relative; measured worst 1.29e-04
 
 // Standard errors take a square root, which halves relative error, but add
 // SecureSqrt's own composed Exp-of-Log error (~4.7e-4 relative, measured).
-constexpr double kStandardErrorTolerance = 1.0e-3;  // relative; measured worst 9.33e-05
+constexpr double kStandardErrorTolerance = 1.0e-3;  // relative; measured worst 7.93e-05
 
 // The Wald statistic is one division of two quantities each carrying the above.
-constexpr double kWaldTolerance = 5.0e-4;  // relative; measured worst 1.03e-05
+constexpr double kWaldTolerance = 5.0e-4;  // relative; measured worst 9.28e-06
 
 // Odds ratios exponentiate beta +- 1.96 se, so the standard error's relative
 // error is multiplied by roughly 1.96 * se before the exponential.
-constexpr double kOddsRatioTolerance = 3.0e-3;  // relative; measured worst 3.22e-04
+constexpr double kOddsRatioTolerance = 3.0e-3;  // relative; measured worst 3.07e-04
 
 // ---------------------------------------------------------------------------
 // Plaintext mirror

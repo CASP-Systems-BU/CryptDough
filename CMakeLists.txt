@@ -102,7 +102,7 @@ endif()
 
 # Option: per-iteration BFGS diagnostics in the playground regression targets.
 #
-# DECLASSIFIES OPTIMIZER STATE. The oblivious optimizer in playground/optimizer.h
+# DECLASSIFIES OPTIMIZER STATE. The oblivious optimizer in playground/library/optimizer.h
 # opens exactly one bit per iteration (the termination flag). Enabling this opens
 # the gradient, the step, the selected alpha, and the objective on every
 # iteration in order to print them, so a build with it on makes no privacy claim.

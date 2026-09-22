@@ -114,7 +114,7 @@ const std::vector<double> kParams = {
 constexpr double kExactish = 4.0 * kResolution;  // ~6.1e-5
 
 // One matmul contracting over p = 2.
-constexpr double kLinearPredictorTolerance = 2.0e-4;  // absolute; measured worst 2.38e-05
+constexpr double kLinearPredictorTolerance = 2.0e-4;  // absolute; measured worst 1.14e-05
 
 // sigma^2 = Exp(2s): one Exp, relative.
 constexpr double kSigmaSquaredTolerance = 1.0e-3;  // relative; measured worst 1.73e-04 -- left as derived
@@ -130,11 +130,11 @@ constexpr double kConditionalModeTolerance = 6.0e-4;  // absolute; measured wors
 // each a LogOnePlusExp (~1.8e-4) plus a product, then adds two Logs (~7e-5 each)
 // and a penalty built from the conditional mode above. Composition bound:
 // 4 * 2e-4 + 2 * 7e-5 + the mode's contribution ~ 2e-3.
-constexpr double kGroupLogLikTolerance = 4.0e-3;  // absolute; measured worst 7.05e-04
+constexpr double kGroupLogLikTolerance = 4.0e-3;  // absolute; measured worst 5.53e-04
 
 // The marginal objective sums G = 3 group contributions, so three times the
 // above with margin.
-constexpr double kMarginalTolerance = 1.0e-2;  // absolute; measured worst 1.78e-03
+constexpr double kMarginalTolerance = 1.0e-2;  // absolute; measured worst 1.25e-03
 
 // Mixed-model standard errors (task 0022). The differencing step is the measured
 // optimum of a bias-variance trade-off -- see the sweep in
@@ -143,12 +143,11 @@ constexpr double kMarginalTolerance = 1.0e-2;  // absolute; measured worst 1.78e
 constexpr double kMixedHessianStep = 0.2;
 const DataType kMixedHessianStep_scaled =
     static_cast<DataType>(std::llround(kMixedHessianStep * scale));
-constexpr double kMixedStandardErrorTolerance = 1.2e-2;   // relative; measured worst 3.67e-03
+constexpr double kMixedStandardErrorTolerance = 1.2e-2;   // relative; measured worst 3.04e-03
 constexpr double kMixedCovarianceSymmetryTolerance = 1.0e-4;  // absolute; exact by construction
 
-// The Schur complement tested as algebra on a well-conditioned 3x3. One matrix
-// inverse and one scalar reciprocal, so the budget is NewtonSchulzInverse's own.
-constexpr double kSchurTolerance = 5.0e-3;  // relative  // absolute; measured worst 1.78e-03
+// The Schur complement tested as algebra on a well-conditioned 3x3.
+constexpr double kSchurTolerance = 2.0e-4;  // relative; measured worst 6.79e-05
 
 // ---------------------------------------------------------------------------
 // Plaintext mirror

@@ -22,16 +22,16 @@ using SMatrix = SecureMatrix<DataType>;
 using PMatrix = PlainMatrix<DataType>;
 
 const int precision = 16;
-const DataType scale = 1 << precision;
+const DataType scale = DataType(1) << precision;
 
 const double kLn2 = 0.69314718055994531;
 const double kLn2_inv = 1.44269504088896341;
 const double kSqrt2 = 1.41421356237309505;
 const double kSqrt1_2 = 0.70710678118654752;
-const float kSmallEpsilon = 0.0001;
-const float kSeriesTolerance = 0.0001;
-const float kNumericalGradientStep = 0.05;
-const float kMaxExpArg = 10.0;
+const double kSmallEpsilon = 0.0001;
+const double kSeriesTolerance = 0.0001;
+const double kNumericalGradientStep = 0.05;
+const double kMaxExpArg = 10.0;
 
 // 1 / sqrt(2*pi), the standard normal density's normalizing constant.
 const double kSqrt2Pi_inv = 0.39894228040143268;
@@ -50,11 +50,13 @@ const DataType kLn2_scaled = std::llround(kLn2 * scale);
 const DataType kLn2_inv_scaled = std::llround(kLn2_inv * scale);
 const DataType kSqrt2_scaled = std::llround(kSqrt2 * scale);
 const DataType kSqrt1_2_scaled = std::llround(kSqrt1_2 * scale);
-const DataType kSmallEpsilon_scaled = (kSmallEpsilon * scale);
-const DataType kSeriesTolerance_scaled = (kSeriesTolerance * scale);
-const DataType kHalf_scaled = (0.5 * scale);
-const DataType kMaxNewtonStep_scaled = (4.0 * scale);
-const DataType kMaxExpArg_scaled = (kMaxExpArg * scale);
+// llround throughout: at scale 2^32 an implicit double->integer truncation
+// loses whole units, and these are comparison bounds.
+const DataType kSmallEpsilon_scaled = std::llround(kSmallEpsilon * scale);
+const DataType kSeriesTolerance_scaled = std::llround(kSeriesTolerance * scale);
+const DataType kHalf_scaled = std::llround(0.5 * scale);
+const DataType kMaxNewtonStep_scaled = std::llround(4.0 * scale);
+const DataType kMaxExpArg_scaled = std::llround(kMaxExpArg * scale);
 const DataType kSqrt2Pi_inv_scaled = std::llround(kSqrt2Pi_inv * scale);
 const DataType kAsP_scaled = std::llround(kAsP * scale);
 const DataType kAsB1_scaled = std::llround(kAsB1 * scale);
@@ -682,63 +684,6 @@ AV TwoSidedPValue(const AV& z) {
 
 namespace cdough::regression {
 
-// --- Div / Recip -------------------------------------------------------------
-// Minimax linear seed for 1/m on m in [1, 2):  r0 = (24 - 8m)/17, max relative
-// error 1/17 = 5.88%. Newton (r <- r(2 - m r)) squares that error each step:
-// 3.5e-3, 1.2e-5, 1.4e-10 -- three steps land well under one fixed-point ulp.
-const double kRecipSeedA = 24.0 / 17.0;
-const double kRecipSeedB = 8.0 / 17.0;
-const DataType kRecipSeedA_scaled = std::llround(kRecipSeedA * scale);
-const DataType kRecipSeedB_scaled = std::llround(kRecipSeedB * scale);
-constexpr int kRecipNewtonSteps = 3;
-
-// Sigmoid's and Log's denominators are confined to known intervals, so they can
-// skip Div's normalisation ladder entirely and go straight to a seed. The
-// minimax linear seed for 1/d on [L, U] is a + b*d with
-//     b = -2 / (L*U + (L+U)^2/4),   a = -b*(L+U),
-// which equioscillates at L, (L+U)/2 and U.
-//
-// Sigmoid: den = 1 + exp(-|eta|), so den is in (1, 2]. Seed error 5.88%,
-// three Newton steps reach 1.4e-10.
-const DataType kRecipUnitA_scaled = std::llround((24.0 / 17.0) * scale);
-const DataType kRecipUnitB_scaled = std::llround((8.0 / 17.0) * scale);
-constexpr int kRecipUnitSteps = 3;
-
-// Log: den = m + 1 with m range-reduced into [sqrt(1/2), sqrt(2)], so den is in
-// [1.7071, 2.4142]. Seed error 1.49%, two Newton steps reach 5.0e-8.
-const DataType kRecipLogA_scaled = std::llround(0.985061500 * scale);
-const DataType kRecipLogB_scaled = std::llround(0.239015999 * scale);
-constexpr int kRecipLogSteps = 2;
-
-// Denominators are clamped into this band before normalisation. Below the low
-// bound a fixed-point denominator is indistinguishable from zero anyway.
-const double kDivDenMin = 1.0 / 4096.0;
-const double kDivDenMax = 1.0 * (1 << 24);
-const DataType kDivDenMin_scaled = std::llround(kDivDenMin * scale);
-const DataType kDivDenMax_scaled = std::llround(kDivDenMax * scale);
-
-// --- Sqrt / Rsqrt ------------------------------------------------------------
-// Degree-2 minimax seed for m^{-1/2} on m in [0.5, 2), found by Remez exchange:
-// max relative error 2.40%. Newton (g <- g(3 - m g^2)/2) is quadratic, giving
-// 8.7e-4 then 1.1e-6 -- two steps, not one: after a single step the error is
-// still ~57 ulp at precision 16, which is too coarse for a standard error.
-const double kRsqrtSeedC0 = 1.8885658148542937;
-const double kRsqrtSeedC1 = -1.1615489719711822;
-const double kRsqrtSeedC2 = 0.2896606126125612;
-const DataType kRsqrtSeedC0_scaled = std::llround(kRsqrtSeedC0 * scale);
-const DataType kRsqrtSeedC1_scaled = std::llround(kRsqrtSeedC1 * scale);
-const DataType kRsqrtSeedC2_scaled = std::llround(kRsqrtSeedC2 * scale);
-constexpr int kRsqrtNewtonSteps = 2;
-
-const double kSqrtArgMin = 1.0 / 65536.0;
-const double kSqrtArgMax = 1.0 * (1 << 28);
-const DataType kSqrtArgMin_scaled = std::llround(kSqrtArgMin * scale);
-const DataType kSqrtArgMax_scaled = std::llround(kSqrtArgMax * scale);
-
-// Normalisation ladders. {16,8,4,2,1} covers any exponent in [0, 31] for Div;
-// Sqrt steps in powers of four, so {8,4,2,1} covers x in [4^-15, 4^16).
-constexpr int kDivLadder[] = {16, 8, 4, 2, 1};
-constexpr int kSqrtLadder[] = {8, 4, 2, 1};
 
 std::vector<AV> Clone(const std::vector<AV>& vs) {
     std::vector<AV> out;
@@ -795,98 +740,30 @@ AV Abs(const AV& x) {
     return out;
 }
 
-// Reciprocal of a denominator already known to lie in a fixed public interval.
+
+// --- Inverse square root -----------------------------------------------------
+// SecureSqrt is Exp(0.5*Log(x)) and SecureReciprocal is a boolean division
+// circuit, so that composition costs TWO division circuits (~1000 rounds) per
+// pivot against ~10 for the fused seeded Newton below. Measured effect on the
+// Cholesky inverse error ||A A^-1 - I||_inf: 2.7e-4 with this operator (task
+// 0009) against 7.9e-4 with the composition. Now that the Cholesky inverse is
+// the library's only matrix inverse, this pivot path is the inner loop of every
+// standard error the pipeline reports.
 //
-// This is the fast path that matters. Div's normalisation ladder is ten
-// conditional shifts and ten sign tests, and it exists only to bring an
-// arbitrary denominator into [1, 2). Sigmoid and Log both know their
-// denominator's range up front, so for them the whole ladder is dead work --
-// and they are called on every row, several times per objective evaluation.
-// Given a minimax linear seed for the interval, all that remains is
-// r <- r(2 - d r), which is two multiplications per step.
-AV RecipSeeded(const AV& den, DataType seed_a_scaled, DataType seed_b_scaled, int steps) {
-    AV d_ = Clone(den);
-    d_.setPrecision(0);
-
-    AV r = -(*(*(d_ * seed_b_scaled) / scale));
-    r += seed_a_scaled;
-    for (int i = 0; i < steps; ++i) {
-        AV dr = *(*(d_ * r) / scale);
-        AV corr = -dr;
-        corr += DataType(2) * DataType(scale);  // 2 - d*r
-        r = *(*(r * corr) / scale);
-    }
-    r.setPrecision(0);
-    return r;
-}
-
-// Secure fixed-point division num / den, for den > 0.
-//
-// This exists to keep BSharedVector::operator/ (circuits.h:39 -- 64 sequential
-// non-restoring iterations, ~24k AND gates and ~700 rounds *per element*) off
-// the hot path. It is the single biggest cost lever in this program.
-//
-// The denominator is normalised into [1, 2) by a public ladder of conditional
-// power-of-two shifts, and the *same* shifts are applied to the numerator. The
-// quotient is therefore invariant, and the numerator is held at the magnitude of
-// the answer throughout -- which is what stops a large denominator from
-// underflowing the result. A minimax linear seed plus three Newton steps
-// (r <- r(2 - d r), multiplications only) then inverts the normalised
-// denominator, to a relative error of ~1.4e-10, far under one ulp at
-// precision 16.
-AV Div(const AV& num, const AV& den) {
-    AV n_ = Clone(num);
-    n_.setPrecision(0);
-    AV d_ = ClampRange(den, kDivDenMin_scaled, kDivDenMax_scaled);
-    d_.setPrecision(0);
-
-    // Down ladder: the condition "remaining exponent >= s" is exactly den >= 2^s,
-    // so the greedy pass over {16,8,4,2,1} builds floor(log2 den) in binary.
-    for (int s : kDivLadder) {
-        AV diff = d_ - (DataType(scale) << s);
-        AV cond = *(diff.gtez());  // 1 if den >= 2^s
-        AV d_shift = *(d_ / (DataType(1) << s));
-        d_ -= *(cond * (d_ - d_shift));
-        AV n_shift = *(n_ / (DataType(1) << s));
-        n_ -= *(cond * (n_ - n_shift));
-    }
-
-    // Up ladder: "at least s more doublings" is den < 2^(1-s).
-    for (int s : kDivLadder) {
-        const DataType threshold = (s >= precision + 1) ? DataType(1)
-                                                        : (DataType(scale) >> (s - 1));
-        AV diff = -d_;
-        diff += (threshold - 1);
-        AV cond = *(diff.gtez());  // 1 if den < 2^(1-s)
-        AV d_shift = *(d_ * (DataType(1) << s));
-        d_ += *(cond * (d_shift - d_));
-        AV n_shift = *(n_ * (DataType(1) << s));
-        n_ += *(cond * (n_shift - n_));
-    }
-
-    // d_ is now in [1, 2). Seed r0 = (24 - 8 d)/17, then Newton.
-    AV r = -(*(*(d_ * kRecipSeedB_scaled) / scale));
-    r += kRecipSeedA_scaled;
-    for (int i = 0; i < kRecipNewtonSteps; ++i) {
-        AV dr = *(*(d_ * r) / scale);
-        AV corr = -dr;
-        corr += DataType(2) * DataType(scale);  // 2 - d*r
-        r = *(*(r * corr) / scale);
-    }
-
-    AV out = *(*(n_ * r) / scale);
-    out.setPrecision(precision);
-    return out;
-}
-
-// 1 / x for x > 0.
-AV Recip(const AV& x) {
-    AV one(x.size(), x.engine);
-    one.setPrecision(0);
-    one += DataType(scale);
-    one.setPrecision(precision);
-    return Div(one, x);
-}
+// SqrtBoth returns root AND inv_root from one range reduction: the pivot needs
+// 1/sqrt(d), and sqrt(d) then comes free as d * (1/sqrt(d)).
+const double kRsqrtSeedC0 = 1.8885658148542937;
+const double kRsqrtSeedC1 = -1.1615489719711822;
+const double kRsqrtSeedC2 = 0.2896606126125612;
+const DataType kRsqrtSeedC0_scaled = std::llround(kRsqrtSeedC0 * scale);
+const DataType kRsqrtSeedC1_scaled = std::llround(kRsqrtSeedC1 * scale);
+const DataType kRsqrtSeedC2_scaled = std::llround(kRsqrtSeedC2 * scale);
+constexpr int kRsqrtNewtonSteps = 2;
+const double kSqrtArgMin = 1.0 / 65536.0;
+const double kSqrtArgMax = 1.0 * (1 << 28);
+const DataType kSqrtArgMin_scaled = std::llround(kSqrtArgMin * scale);
+const DataType kSqrtArgMax_scaled = std::llround(kSqrtArgMax * scale);
+constexpr int kSqrtLadder[] = {8, 4, 2, 1};
 
 // sqrt(x) and 1/sqrt(x) for x > 0, computed together because they share the
 // range reduction and the Newton iteration.
@@ -968,8 +845,23 @@ SqrtPair SqrtBoth(const AV& x) {
 }
 
 AV Sqrt(const AV& x) { return SqrtBoth(x).root; }
-
 AV Rsqrt(const AV& x) { return SqrtBoth(x).inv_root; }
+
+// A single element as a 1-long view. Assigning to the returned value writes
+// through to the underlying buffer.
+AV Cell(const AV& m, size_t idx) { return m.slice(idx, idx + 1); }
+
+// A public vector, secret shared. Used for the unit vectors that turn a
+// Cholesky solve into a matrix inverse.
+AV PublicVector(EngineRef engine, const std::vector<double>& values) {
+    cdough::Vector<DataType> v(values.size(), 0);
+    for (size_t i = 0; i < values.size(); ++i) {
+        v[i] = static_cast<DataType>(std::llround(values[i] * scale));
+    }
+    AV out = engine.template public_share_a<DataType>(v);
+    out.setPrecision(0);
+    return out;
+}
 
 // Secret-share a vector of doubles from party 0 at the module precision.
 AV ShareDoubles(EngineRef engine, const std::vector<double>& values) {

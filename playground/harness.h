@@ -59,9 +59,16 @@ double ReportAccuracy(int party_id, const std::string& label,
     return worst_rel;
 }
 
-// Exercises Div / Recip / Sqrt / Rsqrt against the standard library. These are
-// the kernels this program adds, so they are checked before anything is built
-// on top of them.
+// Exercises the division and square-root kernels against the standard library.
+// These are checked before anything is built on top of them.
+//
+// Div / Recip / Sqrt / Rsqrt were retired in task 0017 phase 6; what is measured
+// now is SecureReciprocal (a boolean division circuit) and SecureSqrt
+// (Exp(0.5 * Log(x))). The ranges below were chosen for the seeded Newton
+// operators and their normalisation ladder, so some of them now sit outside what
+// the replacements are calibrated for -- primitives.h documents SecureReciprocal
+// as confident over [1e-4, 1e4] and SecureSqrt over [1.53e-5, 1e5]. Failures at
+// the extremes are the operators' documented limits, not a regression.
 void TestNewKernels(EngineRef engine, int party_id) {
     single_cout("\n================ new fixed-point kernels ================");
 
@@ -74,15 +81,26 @@ void TestNewKernels(EngineRef engine, int party_id) {
         div_expected[i] = num[i] / den[i];
         div_labels[i] = den[i];
     }
-    AV div_res = Div(ShareDoubles(engine, num), ShareDoubles(engine, den));
-    ReportAccuracy(party_id, "Div (label = denominator)", div_labels, div_expected,
+    // Both operands must be pinned to precision 0 before the explicit `/ scale`:
+    // a multiply of two values that still carry `precision` truncates once by
+    // itself, so dividing again scales the answer down by a further `scale`.
+    // Written without the pin this test reported 100% error on a correct
+    // operator, which is exactly what the production call sites avoid by
+    // setting precision 0 first.
+    AV div_den = ShareDoubles(engine, den);
+    AV div_inv = SecureReciprocal(div_den);
+    div_inv.setPrecision(0);
+    AV div_num = ShareDoubles(engine, num);
+    div_num.setPrecision(0);
+    AV div_res = *(*(div_num * div_inv) / scale);
+    ReportAccuracy(party_id, "Divide (label = denominator)", div_labels, div_expected,
                    OpenToDoubles(div_res));
 
     const std::vector<double> rec_in = {0.03125, 0.1, 0.5, 1.0, 1.5, 2.0, 7.0, 100.0, 4096.0};
     std::vector<double> rec_expected(rec_in.size());
     for (size_t i = 0; i < rec_in.size(); ++i) rec_expected[i] = 1.0 / rec_in[i];
-    ReportAccuracy(party_id, "Recip", rec_in, rec_expected,
-                   OpenToDoubles(Recip(ShareDoubles(engine, rec_in))));
+    ReportAccuracy(party_id, "SecureReciprocal", rec_in, rec_expected,
+                   OpenToDoubles(SecureReciprocal(ShareDoubles(engine, rec_in))));
 
     const std::vector<double> sq_in = {0.01, 0.25, 0.5, 1.0, 2.0, 3.0, 10.0, 100.0, 1024.0, 65536.0};
     std::vector<double> sq_expected(sq_in.size()), rsq_expected(sq_in.size());
@@ -90,9 +108,13 @@ void TestNewKernels(EngineRef engine, int party_id) {
         sq_expected[i] = std::sqrt(sq_in[i]);
         rsq_expected[i] = 1.0 / std::sqrt(sq_in[i]);
     }
-    SqrtPair sp = SqrtBoth(ShareDoubles(engine, sq_in));
-    ReportAccuracy(party_id, "Sqrt", sq_in, sq_expected, OpenToDoubles(sp.root));
-    ReportAccuracy(party_id, "Rsqrt", sq_in, rsq_expected, OpenToDoubles(sp.inv_root));
+    // SqrtBoth returned root and inv_root from one fused iteration; the two now
+    // cost two separate operators.
+    AV sq_shared = ShareDoubles(engine, sq_in);
+    AV sq_root = SecureSqrt(sq_shared);
+    ReportAccuracy(party_id, "SecureSqrt", sq_in, sq_expected, OpenToDoubles(sq_root));
+    ReportAccuracy(party_id, "1/SecureSqrt", sq_in, rsq_expected,
+                   OpenToDoubles(SecureReciprocal(SecureSqrt(sq_shared))));
 
     const std::vector<double> exp_in = {-10.0, -5.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0};
     std::vector<double> exp_expected(exp_in.size());
@@ -703,27 +725,26 @@ void BenchmarkObjective(EngineRef engine, int party_id, const SecureCohort& coho
     ModelData md = BuildDesign(cohort, spec);
     const size_t dim = md.p + 1;
 
-    std::vector<AV> params;
-    for (size_t k = 0; k < dim; ++k) {
-        AV v(1, engine);
-        v.setPrecision(precision);
-        params.push_back(v);
-    }
-    auto objective = [&md](const std::vector<AV>& p) { return FlatNegMarginalLogLik(md, p); };
+    // One packed dim-length vector, matching what MinimizeBFGSBatched passes.
+    AV params(dim, engine);
+    params.setPrecision(precision);
+    BatchedObjective objective = [&md](const AV& pts, size_t num_points) {
+        return FlatObjectiveBatched(md, pts, num_points, nullptr);
+    };
 
     // One untimed call first, so any lazily built correlated randomness is not
     // charged to the measurement.
-    objective(params).open();
+    objective(params, 1).open();
 
     g_objective_evaluations = 0;
     auto start = Clock::now();
-    objective(params).open();
+    objective(params, 1).open();
     const double one_eval = seconds_since(start);
 
     start = Clock::now();
-    std::vector<AV> numeric = NumericalGradient(objective, params);
-    std::vector<double> numeric_open;
-    for (AV& g : numeric) numeric_open.push_back(OpenScalar(g));
+    AV selector = MakeCentralDifferenceSelector(dim, engine);
+    AV numeric = NumericalGradientBatched(objective, params, selector);
+    const std::vector<double> numeric_open = OpenToDoubles(numeric);
     const double numeric_gradient = seconds_since(start);
     const long evals_in_gradient = g_objective_evaluations - 1;
 
@@ -732,11 +753,10 @@ void BenchmarkObjective(EngineRef engine, int party_id, const SecureCohort& coho
     // otherwise show up only as a mysteriously worse fit.
     g_objective_evaluations = 0;
     start = Clock::now();
-    std::vector<AV> analytic;
-    AV value = FlatObjective(md, params, &analytic);
+    AV analytic(dim, engine);
+    AV value = FlatObjectiveBatched(md, params, 1, &analytic);
     value.open();
-    std::vector<double> analytic_open;
-    for (AV& g : analytic) analytic_open.push_back(OpenScalar(g));
+    const std::vector<double> analytic_open = OpenToDoubles(analytic);
     const double analytic_gradient = seconds_since(start);
     const long evals_in_analytic = g_objective_evaluations;
 
@@ -811,7 +831,11 @@ void BenchmarkObjective(EngineRef engine, int party_id, const SecureCohort& coho
     den += DataType(scale) + DataType(scale) / 2;  // a denominator inside [1, 2]
     den.setPrecision(precision);
     start = Clock::now();
-    AV rec = Div(md.y, den);
+    AV inv_den = SecureReciprocal(den);
+    inv_den.setPrecision(0);
+    AV y_raw = Clone(md.y);
+    y_raw.setPrecision(0);
+    AV rec = *(*(y_raw * inv_den) / scale);
     rec.open();
     const double one_div = seconds_since(start);
 
