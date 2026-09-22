@@ -9,8 +9,8 @@
 
 #include "./cohort.h"
 #include "./nodes.h"
-#include "./primitives.h"
-#include "./regression.h"
+#include "./library/primitives.h"
+#include "./library/regression.h"
 #include "./reporting.h"
 
 // Running ONE lineage node, and handing its result to the party that owns it.

@@ -5,7 +5,7 @@
 #include <tuple>
 #include <vector>
 
-#include "./primitives.h"
+#include "./library/primitives.h"
 
 // Per-group (segmented) scans over a table sorted by its grouping key, and the
 // group-boundary indicators built on them.

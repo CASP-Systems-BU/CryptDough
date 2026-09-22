@@ -199,12 +199,10 @@ AV ShareScalar(double value, EngineRef engine) {
     return engine.secret_share_a(plain, 0, precision);
 }
 
-// Opens a 1-element AV back to a double. Every party must call this: open() is
-// a communication round.
-double OpenScalar(const AV& value) {
-    auto opened = value.open();
-    return static_cast<double>(opened[0]) / scale;
-}
+// OpenScalar comes from library/primitives.h. The local copy that used to sit
+// here was the same function: its body matched that one's `scaled == true` path
+// exactly, and once the pipeline's primitives moved into the library header the
+// two overloads made every unqualified call ambiguous.
 
 }  // namespace
 

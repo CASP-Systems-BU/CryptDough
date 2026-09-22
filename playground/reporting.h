@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "./regression.h"
+#include "./library/regression.h"
 
 // Coefficient tables, and the plaintext IRLS oracle the secure fixed-effects
 // models are scored against.

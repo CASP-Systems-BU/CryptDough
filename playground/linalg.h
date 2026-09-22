@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <vector>
 
-#include "./primitives.h"
+#include "./library/primitives.h"
 
 // Small dense secure linear algebra: the weighted Gram matrix, and Cholesky
 // factorisation, solve and inverse for a symmetric positive definite matrix.

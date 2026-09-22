@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "./cohort.h"
-#include "./primitives.h"
+#include "./library/primitives.h"
 
 // The aggregate lineage nodes: the three sisa_perct_cnt tables.
 

@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "./primitives.h"
+#include "./library/primitives.h"
 
 // The upstream ETL, ported from
 //   https://cs-people.bu.edu/liagos/pilot/pcc_sisa_lineage.html

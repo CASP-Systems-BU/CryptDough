@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "./primitives.h"
+#include "./library/primitives.h"
 #include "./segmented.h"
 
 // The analysis cohort: the plaintext and secret-shared row layouts, the

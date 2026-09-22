@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-#include "./regression.h"
+#include "./library/regression.h"
 #include "./secure.h"
 #include "./sqlite_oracle.h"  // no-op unless HAVE_SQLITE3
 
@@ -867,7 +867,7 @@ void BenchmarkObjective(EngineRef engine, int party_id, const SecureCohort& coho
 
     // What is left on the table, and at what price.
     const double per_cluster_work =
-        static_cast<double>(kNewtonIterations) * one_div + one_div + one_log;
+        static_cast<double>(kFlatConditionalModeNewtonIterations) * one_div + one_div + one_log;
     const double mean_cluster =
         static_cast<double>(md.rows_used) / std::max<double>(1.0, static_cast<double>(cohort.num_subjects));
     const double reclaimable = per_cluster_work * (1.0 - 1.0 / mean_cluster);
