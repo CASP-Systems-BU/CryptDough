@@ -1,0 +1,20 @@
+// GENERATED FILE -- DO NOT EDIT.
+//
+// Produced by configure_file() from playground/sql/sequencing_sql.h.in, with the
+// query bodies read verbatim out of playground/sql/*.sql. Edit the .sql files;
+// cmake re-runs automatically when they change (CMAKE_CONFIGURE_DEPENDS).
+//
+// The .sql file is the single source of truth: scripts/testing/
+// validate_mpc_analysis.py reads it directly, so the C++ and Python oracles
+// execute identical text and cannot drift apart.
+
+#pragma once
+
+namespace cdough::regression {
+
+// playground/sql/sequencing.sql -- lineage node flagged_dx pass 2, corrected.
+inline constexpr const char* kSequencingSql = R"SEQSQL(
+@SEQUENCING_SQL@
+)SEQSQL";
+
+}  // namespace cdough::regression

@@ -36,7 +36,7 @@ void startmpc_print(Args&&... args) {
  * @param socket_maps
  */
 void send_connections(int host_rank, int to_rank, int thread_num, std::string ip_addr,
-                      int connect_start_port, std::vector<std::vector<int>>* socket_maps) {
+                      int connect_start_port, std::vector<std::vector<Conn>>* socket_maps) {
     // Create a socket connection for each thread
     for (int i = 0; i < thread_num; i++) {
         int connect_port = connect_start_port + i;
@@ -44,7 +44,14 @@ void send_connections(int host_rank, int to_rank, int thread_num, std::string ip
                        connect_port);
 
         assert(socket_maps->size() > i && (*socket_maps)[i].size() > to_rank);
-        (*socket_maps)[i][to_rank] = socket_connect(ip_addr, connect_port);
+        int fd = socket_connect(ip_addr, connect_port);
+#if defined(CDOUGH_ENABLE_TLS)
+        // We initiated the TCP connection, so we are the TLS client here.
+        (*socket_maps)[i][to_rank] =
+            Conn::client(fd, "to rank " + std::to_string(to_rank) + " thread " + std::to_string(i));
+#else
+        (*socket_maps)[i][to_rank] = Conn::plain(fd);
+#endif
     }
 }
 
@@ -59,7 +66,7 @@ void send_connections(int host_rank, int to_rank, int thread_num, std::string ip
  * @param socket_maps
  */
 void listen_connections(int host_rank, int from_rank, int thread_num, int listen_start_port,
-                        std::vector<std::vector<int>>* socket_maps) {
+                        std::vector<std::vector<Conn>>* socket_maps) {
     // Create a socket connection for each thread
     for (int i = 0; i < thread_num; i++) {
         int listen_port = listen_start_port + i;
@@ -70,11 +77,20 @@ void listen_connections(int host_rank, int from_rank, int thread_num, int listen
         listen(listen_sockfd, 0);
 
         assert(socket_maps->size() > i && (*socket_maps)[i].size() > from_rank);
-        (*socket_maps)[i][from_rank] = accept(listen_sockfd, NULL, NULL);
+        int fd = accept(listen_sockfd, NULL, NULL);
+        if (fd < 0) throw std::runtime_error("accept failed on port " + std::to_string(listen_port));
+        close(listen_sockfd);  // one connection per port; stop listening once accepted
+#if defined(CDOUGH_ENABLE_TLS)
+        // The peer connected to us, so we are the TLS server here.
+        (*socket_maps)[i][from_rank] = Conn::server(
+            fd, "from rank " + std::to_string(from_rank) + " thread " + std::to_string(i));
+#else
+        (*socket_maps)[i][from_rank] = Conn::plain(fd);
+#endif
     }
 }
 
-std::pair<int, int> startmpc_init(int thread_num, std::vector<std::vector<int>>& socket_maps) {
+std::pair<int, int> startmpc_init(int thread_num, std::vector<std::vector<Conn>>& socket_maps) {
     const char* startmpc_exec_env = std::getenv("STARTMPC_EXEC_MODE");
     const char* host_count_env = std::getenv("STARTMPC_HOST_COUNT");
     const char* host_rank_env = std::getenv("STARTMPC_HOST_RANK");

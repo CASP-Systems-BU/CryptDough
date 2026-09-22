@@ -1,0 +1,86 @@
+# Single-machine, multi-container smoke test for the multi-party nocopy path.
+#
+# This exists to validate the SSH wiring (port 2222, the Host node* client block,
+# the mounted keys, scp of the binary to an identical path, and startmpc remote
+# mode) WITHOUT needing the cluster.
+#
+# NOT for benchmarking. These containers share a bridge network, which NATs and
+# adds latency; measured communication cost here is meaningless. Use
+# docker/run-node.sh with --network host on real machines for numbers.
+#
+#   # once, to create the shared keypair:
+#   mkdir -p ~/.cdough-cluster && ssh-keygen -t ed25519 -N '' -f ~/.cdough-cluster/id_ed25519
+#   cp ~/.cdough-cluster/id_ed25519.pub ~/.cdough-cluster/authorized_keys
+#
+#   docker compose -f docker/compose.yaml up -d
+#   docker compose -f docker/compose.yaml exec node0 ssh node1 hostname
+#   docker compose -f docker/compose.yaml exec node0 \
+#       ../scripts/run_experiment.py -s lan -c nocopy -n 2 -T 2 test_primitives
+#   docker compose -f docker/compose.yaml down -v
+
+x-node: &node
+  image: cryptdough:latest
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  environment:
+    CDOUGH_SSHD: "1"
+  volumes:
+    # Same keypair in every container: node0 authenticates to the others.
+    - ${CDOUGH_KEY_DIR:-~/.cdough-cluster}:/keys:ro
+  shm_size: 1gb
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  # Docker's embedded DNS resolves the service names, which is exactly what
+  # socket_connect's getaddrinfo (network_utils.h:66-75) needs.
+  networks:
+    - cdough
+  command: ["sleep", "infinity"]
+
+services:
+  node0:
+    <<: *node
+    hostname: node0
+    container_name: cdough-node0
+    volumes:
+      - ${CDOUGH_KEY_DIR:-~/.cdough-cluster}:/keys:ro
+      - node0-build:/opt/cryptdough/build
+
+  node1:
+    <<: *node
+    hostname: node1
+    container_name: cdough-node1
+    volumes:
+      - ${CDOUGH_KEY_DIR:-~/.cdough-cluster}:/keys:ro
+      - node1-build:/opt/cryptdough/build
+
+  node2:
+    <<: *node
+    hostname: node2
+    container_name: cdough-node2
+    volumes:
+      - ${CDOUGH_KEY_DIR:-~/.cdough-cluster}:/keys:ro
+      - node2-build:/opt/cryptdough/build
+
+  node3:
+    <<: *node
+    hostname: node3
+    container_name: cdough-node3
+    volumes:
+      - ${CDOUGH_KEY_DIR:-~/.cdough-cluster}:/keys:ro
+      - node3-build:/opt/cryptdough/build
+
+networks:
+  cdough:
+    driver: bridge
+
+# Each party needs its own build directory: run_experiment.py scp's the binary
+# from node0 to the same absolute path on every peer, so they must not share a
+# volume or they would race writing the same file.
+volumes:
+  node0-build:
+  node1-build:
+  node2-build:
+  node3-build:

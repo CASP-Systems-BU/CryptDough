@@ -48,6 +48,20 @@ if (COMM_THREADS)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D NOCOPY_COMMUNICATOR_THREADS=${COMM_THREADS}")
 endif (COMM_THREADS)
 
+# Option: mutually-authenticated TLS 1.3 on every party-to-party connection.
+#
+# OFF by default so that benchmark builds are byte-for-byte what they always were --
+# TLS record encryption sits on the critical path and would make published numbers
+# incomparable. Turn it ON for real deployments across untrusted networks, where the
+# plaintext PRG seed exchange in backend/common/rand_setup.h would otherwise hand an
+# on-path attacker every common PRG. All parties must agree: it changes the wire format.
+option(TLS "Encrypt and authenticate party-to-party traffic with TLS 1.3" OFF)
+if (TLS)
+    find_package(OpenSSL REQUIRED)
+    add_compile_definitions(CDOUGH_ENABLE_TLS)
+    message(STATUS "TLS enabled: OpenSSL ${OPENSSL_VERSION}")
+endif (TLS)
+
 set(SINGLE 0 CACHE STRING "whether this is a communicator (0) or single (1) execution")
 if(SINGLE EQUAL 1)
     add_definitions(-DSINGLE_EXECUTION)
@@ -164,11 +178,30 @@ find_library(SODIUM_LIBRARY NAMES sodium HINTS ${LIBSODIUM_LIBRARY_DIRS} /usr/lo
 find_path(NTL_INCLUDE_DIR NAMES NTL/ZZ.h HINTS ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/include)
 find_library(NTL_LIBRARY NAMES ntl HINTS ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/lib ${CMAKE_CURRENT_SOURCE_DIR}/build/ntl-install/lib64)
 
-# SQLite for TPCH query tests
+# SQLite for TPCH query tests and the analysis-pipeline verification oracle
 find_package(SQLite3)
+
+# The sequencing SQL is kept in playground/sql/ as the single source of truth:
+# playground/sqlite_oracle.h embeds it via the header generated here, and
+# scripts/testing/validate_mpc_analysis.py reads the same file directly, so both
+# oracles provably execute identical text. Neither consumer holds a copy.
+set(SEQUENCING_SQL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/playground/sql)
+file(READ ${SEQUENCING_SQL_DIR}/sequencing.sql SEQUENCING_SQL)
+configure_file(
+    ${SEQUENCING_SQL_DIR}/sequencing_sql.h.in
+    ${CMAKE_BINARY_DIR}/generated/sequencing_sql.h
+    @ONLY)
+# Re-run cmake when the query changes, so the embedded copy cannot go stale.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${SEQUENCING_SQL_DIR}/sequencing.sql
+    ${SEQUENCING_SQL_DIR}/sequencing_sql.h.in)
 
 # Base list of link libraries
 set(LINK_LIBRARIES "${MPI_LIBRARIES}" "${SODIUM_LIBRARY}" "${NTL_LIBRARY}")
+
+if (TLS)
+    list(APPEND LINK_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+endif (TLS)
 
 # Add libOTe and SecureJoin for 2pc only
 if (PROTOCOL EQUAL "2" AND LINK_LIBOTE)
@@ -249,8 +282,17 @@ function(configure_target _target)
     enable_pch(${fileName})
     add_secure_join(${fileName})
     
-    if (ARG_LINK_SQL)
+    # SQLite is used only as a verification oracle (the bench/queries/ targets and
+    # playground/mpc-analysis). find_package(SQLite3) above is not REQUIRED, so a
+    # host without libsqlite3-dev must still build: HAVE_SQLITE3 lets the
+    # dependent code compile itself out and say so at runtime.
+    #
+    # SQLite3_INCLUDE_DIRS was missing here. The TPCH targets compiled only
+    # because sqlite3.h happens to sit on the default include path.
+    if (ARG_LINK_SQL AND SQLite3_FOUND)
         target_link_libraries(${fileName} ${LINK_LIBRARIES} ${SQLite3_LIBRARIES})
+        target_include_directories(${fileName} PRIVATE ${SQLite3_INCLUDE_DIRS})
+        target_compile_definitions(${fileName} PRIVATE HAVE_SQLITE3)
     else()
         target_link_libraries(${fileName} ${LINK_LIBRARIES})
     endif()
@@ -259,7 +301,8 @@ function(configure_target _target)
         PUBLIC
             ${SODIUM_INCLUDE_DIR}
             ${NTL_INCLUDE_DIR}
-            ${CMAKE_SOURCE_DIR}/include)
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_BINARY_DIR}/generated)
 
     # message(STATUS "Includes for: ${fileName}")
     # get_target_property(incs ${fileName} INTERFACE_INCLUDE_DIRECTORIES)
@@ -285,6 +328,10 @@ file(GLOB EXE_PLAYGROUND playground/*.cpp)
 # CMake target name from the bare filename, which would otherwise collide with the
 # same-named targets built from tests/.
 file(GLOB EXE_PLAYGROUND_TESTS playground/tests/*.cpp)
+# mpc-analysis carries the SQLite verification oracle (tasks/0012), so it moves to
+# the LINK_SQL list below. Removed by absolute path: file(GLOB) returns those.
+set(EXE_PLAYGROUND_SQL ${CMAKE_CURRENT_SOURCE_DIR}/playground/mpc-analysis.cpp)
+list(REMOVE_ITEM EXE_PLAYGROUND ${EXE_PLAYGROUND_SQL})
 file(GLOB EXE_BENCH bench/*.cpp)
 file(GLOB EXE_MICRO bench/micro/*.cpp)
 file(GLOB EXE_ML bench/models/*.cpp)
@@ -301,7 +348,7 @@ foreach (_target
     configure_target(${_target})
 endforeach ()
 
-foreach (_target ${TPCH_QUERIES} ${SECRETFLOW_QUERIES} ${OTHER_QUERIES})
+foreach (_target ${TPCH_QUERIES} ${SECRETFLOW_QUERIES} ${OTHER_QUERIES} ${EXE_PLAYGROUND_SQL})
     configure_target(${_target} LINK_SQL)
 endforeach()
 

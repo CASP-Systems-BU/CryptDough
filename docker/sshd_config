@@ -1,0 +1,24 @@
+# Dropped into /etc/ssh/sshd_config.d/ inside the CryptDough image.
+#
+# Port 2222, not 22: with `--network host` the container shares the host's network
+# namespace, so port 22 is already taken by the host's own sshd.
+Port 2222
+
+# Key-based auth only. The keypair is mounted in at run time; see docker/README.md.
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+
+# startmpc's remote mode runs `ssh <host> "export STARTMPC_...; cd <dir> && <cmd>"`,
+# so the server must accept those variables rather than scrubbing them.
+AcceptEnv STARTMPC_* LANG LC_*
+
+# Benchmark runs can sit quiet for a long time between phases.
+ClientAliveInterval 60
+ClientAliveCountMax 60
+TCPKeepAlive yes
+
+UsePAM yes
+X11Forwarding no
+PrintMotd no

@@ -1,7 +1,8 @@
 # Secure Matrix Inversion via Newton–Schulz Iterations
 
 ## Metadata
-- Task ID: 0007
+- Task ID: 0010 (renumbered from 0007 on merge into `orchestration`, where
+  0007 was already taken by the dockerize task)
 - Title: Secure matrix inversion operator using Newton–Schulz iterations
 - Requested by: Adam Godel
 - Owner: Claude
@@ -220,3 +221,16 @@ way round.
 ## Change Log
 - 2026-09-09: Initial draft created and approved.
 - 2026-09-09: Implemented; iteration bound calibrated on the 3PC LAN cluster; marked Done.
+
+## Note after merging into `orchestration`
+
+`ScaledIdentity`, `TransposeData`, `Transpose`, `AsColumnWise`, `MatMul`,
+`ScaleMatrix`, `FrobeniusNormSquared`, `kMatrixInverseIterations` and
+`NewtonSchulzInverse` all live in `playground/optimizer.h`, alongside the BFGS
+driver from task 0009. `SecureReciprocal`, which `NewtonSchulzInverse` depends
+on, was kept in the same header rather than in `primitives.h`: it goes through
+the boolean division circuit, and task 0009 removed that from every hot path in
+favour of `Recip`. `playground/secure-logistic-regression.cpp` exercises
+`NewtonSchulzInverse` directly; nothing in the analysis pipeline calls it -- the p x p covariance matrices there are small and
+symmetric positive definite, so `linalg.h`'s Cholesky inverse is the cheaper
+route.

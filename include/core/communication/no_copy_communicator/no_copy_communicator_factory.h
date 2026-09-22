@@ -50,7 +50,7 @@ namespace {
                     if (!partyInfo.sendRing.isRingEmpty()) {
                         NoCopyRingEntry* entry = partyInfo.sendRing.currentEntry();
                         size_t r =
-                            send_wrapper(partyInfo.sockfd, entry->buffer, entry->buffer_size);
+                            send_wrapper(partyInfo.conn, entry->buffer, entry->buffer_size);
                         assert(r == entry->buffer_size);
                         partyInfo.sendRing.pop(entry);
                     }
@@ -191,11 +191,11 @@ class NoCopyCommunicatorFactory : public CommunicatorFactory<NoCopyCommunicatorF
      * outer vector is assigned to a thread. The inner vector maps from party ID
      * to socket file descriptor:
      *
-     * socket_maps[Thread #][Party ID] -> Socket file descriptor
+     * socket_maps[Thread #][Party ID] -> Conn (socket, plus TLS session when enabled)
      *
      * NOTE: this used to be a vector<map<int, int>>, but this led to a
      * concurrent write and thus an infrequent race condition.
      */
-    std::vector<std::vector<int>> socketMaps_;
+    std::vector<std::vector<Conn>> socketMaps_;
 };
 }  // namespace cdough
