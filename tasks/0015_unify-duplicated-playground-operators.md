@@ -660,6 +660,15 @@ That is the deduplication delivered and verified.
 
 **The sign flip:** model 5b, `any`, `gender=female` estimate **+0.05374146 -> -0.01293945**.
 
+> **SUPERSEDED by [tasks/0016](0016_consistent-iteration-budgets.md).** This was reported here as
+> the headline accuracy concern, caused by the 3-term series. That framing is wrong. Model 5b
+> `[all systems]` was stopping at \|grad\| = 114, i.e. nowhere near a stationary point, in this run
+> AND in the baseline. As 0016 improved its convergence the estimate moved monotonically to about
+> **-0.068**: +0.05374 at \|grad\| 114, -0.01294 at \|grad\| 114, -0.06255 at \|grad\| 51.9,
+> -0.06818 at \|grad\| 29.9. **The baseline's positive value was the artefact.** The coefficient is
+> genuinely negative; the series change moved the number, but the sign was never trustworthy either
+> side of it. The real defect was the iteration budget, which 0016 fixes.
+
 Largest same-sign moves:
 
 | model | scope | term | baseline | final | rel |
@@ -702,6 +711,60 @@ produced with five; the measured penalty for three is a sign flip on a reported 
 means `kMaxSeriesTerms` in `library/primitives.h`, or separate `kExpSeriesTerms` /
 `kLogSeriesTerms` as root had -- a constant, not an algorithm, but it is inside `library/` and so
 needs the same kind of exception the `Exp` fix got. **Flagged for decision; not changed.**
+
+## State of the fourteen model fits (final tree, measured)
+
+Read off `runs-verify/S3-models.txt`. BFGS prints its trace *before* each model's header, so the
+per-model attribution below is by preceding block, not following.
+
+| model | fit | iters | flag | final \|grad\| | stop reason | condition |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2a UMass | mixed, Laplace | 11 | converged | 1.50e+0 | line search failed | 9.6e1 |
+| 2a all | mixed, Laplace | 9 | converged | 3.58e+0 | line search failed | 1.3e2 |
+| 2a non-UMass | mixed, Laplace | 12 | — | 3.58e-1 | iteration cap | 2.7e2 |
+| 2b UMass | mixed, Laplace | 10 | converged | 1.67e-2 | line search failed | 4.1e1 |
+| 2b all | mixed, Laplace | 10 | converged | 5.22e-2 | line search failed | 4.4e1 |
+| 2b non-UMass | mixed, Laplace | 12 | converged | 2.21e-1 | line search failed | 1.4e2 |
+| **5a UMass** | mixed, Laplace | **12** | **—** | **9.65e+1** | **iteration cap** | 1.2e4 |
+| **5a all** | mixed, Laplace | **12** | **—** | **1.41e+2** | **iteration cap** | 1.2e4 |
+| **5a non-UMass** | mixed, Laplace | **12** | **—** | **1.64e+2** | **iteration cap** | 1.4e4 |
+| **5b UMass** | mixed, Laplace | **12** | **—** | **1.90e+2** | **iteration cap** | 4.8e3 |
+| **5b all** | mixed, Laplace | **12** | **—** | **1.14e+2** | **iteration cap** | 1.1e4 |
+| **5b non-UMass** | mixed, Laplace | **12** | **—** | **1.48e+2** | **iteration cap** | — |
+| 6a all | IRLS | 8 | converged | n/a | fixed trip count | 1.2e4 |
+| 6b all | IRLS | 8 | converged | n/a | fixed trip count | — |
+
+### The six 5a/5b fits are not converging, and never were
+
+All six exhaust `kGlmmBfgsIterations = 12` with a gradient norm between **96 and 190**. They are
+truncated mid-descent, not fitted. Their reported coefficients are wherever BFGS happened to be at
+iteration 12.
+
+**This is pre-existing.** The same six fail identically in `BASELINE-models.txt`. Convergence
+flags across the three runs: baseline 6 of 14 flagged converged, stage 1 and final both 7 of 14 —
+`2b UMass` improved, nothing regressed.
+
+This reframes the sign flip reported above. `5b any gender=female` going +0.0537 -> -0.0129 is a
+shift in where a **non-converged** optimizer stopped on a design whose observed information has a
+1-norm condition estimate of 1.1e4. That coefficient was not trustworthy before the change either.
+The series-term reduction made the fits noisier; it is not what makes 5a/5b unfitted.
+
+### What separates the families
+
+- **2a/2b** carry time only (`visit_num` or `fu_month`) and are well conditioned, 4.1e1 to 2.7e2.
+  They stop on line-search failure at gradients of 1.7e-2 to 3.6.
+- **5a/5b** add `newage`, the `gender` levels, `hispanic` and a `data_source` interaction. Condition
+  jumps to 4.8e3 - 1.4e4, i.e. near-collinear, and BFGS cannot make progress within 12 iterations.
+- **6a/6b** are IRLS with no random intercept. `converged` for these is not a test: `FitLogisticIrls`
+  assigns `r.converged = true` unconditionally and `r.iterations = kIrlsIterations` (8), because IRLS
+  has a fixed trip count and no line search. That is also exactly why these two are the only fits
+  that leak nothing beyond their outputs.
+
+### Consequence for the task
+
+The two headline problems in the pipeline's statistical output are **not** duplication artefacts:
+`kGlmmBfgsIterations = 12` is too small for the covariate models, and their designs are
+near-collinear. Both predate this work and neither is addressed by it. Worth its own task.
 
 ## Risks and Mitigations
 - Risk: silent numerical drift in the pipeline's 17 outputs.

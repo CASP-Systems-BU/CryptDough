@@ -671,40 +671,7 @@ AV TwoSidedPValue(const AV& z) {
 
 
 // =============================================================================
-// APPENDED: pipeline-only fixed-point support (was playground/primitives.h)
-//
 // Pipeline-only fixed-point support for the MPC analysis pipeline.
-//
-// Every operator that playground/library/primitives.h defines is used FROM
-// THERE -- this header does not redefine any of them. What is left here is the
-// part the library has no counterpart for:
-//
-//   - the seeded division / square-root family (RecipSeeded, Div, Recip,
-//     SqrtBoth, Sqrt, Rsqrt). The library offers SecureReciprocal and
-//     SecureSqrt, but those are different operators, not other spellings of
-//     these: SecureReciprocal is a boolean division circuit and SecureSqrt is
-//     Exp(0.5 * Log(x)), while these are seeded Newton iterations with an
-//     explicit normalisation ladder. Div and Rsqrt have no library counterpart
-//     at all. Swapping them is a cost-and-range decision, not a rename, so it
-//     is deliberately not folded into this deduplication.
-//   - the sharing / opening plumbing (ShareDoubles, OpenToDoubles, OpenScalar,
-//     OpenRawToParty, OpenToPartyDoubles, OpenScalarToParty, RandomRingVector),
-//     which is how the pipeline gets data in and results out.
-//   - small construction and shaping helpers (Clone over a vector, MakeVector,
-//     MakeMatrix, ClampRange, Abs).
-//
-// The two conventions from the library header still hold:
-//   - Values are RAW SCALED INTEGERS held at precision 0, with an explicit
-//     `/ scale` after every multiply. handle_precision (protocol.h:115) throws
-//     on a precision mismatch, so mixing conventions is a runtime error.
-//   - `AV a = b` is a SHALLOW copy sharing the underlying buffer, while
-//     `operator=` is a deep element-wise copy. Use Clone() before mutating a
-//     copy of anything you do not own.
-//
-// These headers define non-inline functions, so each belongs to exactly one
-// translation unit. That is how the playground is built -- CMakeLists.txt globs
-// playground/*.cpp into one binary per file -- and it matches the convention
-// established by the logistic-regression branch.
 // =============================================================================
 
 #include <algorithm>

@@ -883,23 +883,7 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
 
 
 // =============================================================================
-// APPENDED: the pipeline's quasi-Newton optimiser (was playground/optimizer.h)
-//
-// The pipeline's quasi-Newton optimiser.
-//
-// The secure matrix helpers (ScaledIdentity, Identity, TransposeData, Transpose,
-// AsColumnWise, ScaleMatrix, FrobeniusNormSquared) and NewtonSchulzInverse now
-// come from library/optimizer.h -- the copies that used to live here were
-// byte-identical to the library's, apart from NewtonSchulzInverse, whose library
-// form uses the vectorized matrix multiply. MatMul went with them: it existed
-// only to serve this header's own Newton-Schulz, which the pipeline never calls
-// (ObservedInformationSE inverts in plaintext by Gauss-Jordan).
-//
-// What remains is the part the library has no counterpart for: a BFGS driver
-// over `std::vector<AV>` parameter vectors with a value-plus-gradient objective
-// (task 0009). library/optimizer.h's MinimizeBFGSBatched packs several candidate
-// parameter vectors into one AV instead, which is a different interface built on
-// the balanced dataset layout, not another spelling of this one.
+// The pipeline's quasi-Newton optimizer
 // =============================================================================
 
 #include <cassert>

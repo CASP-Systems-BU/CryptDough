@@ -809,8 +809,6 @@ AV SeparationFlag(const Dataset& data, const AV& beta,
 
 
 // =============================================================================
-// APPENDED: the fourteen pipeline regression fits (was playground/regression.h)
-//
 // The fourteen regression fits: design-matrix construction, IRLS for the
 // fixed-effects models (steps 6a/6b), and the flat ragged-cluster
 // Laplace-approximated mixed model with an analytic gradient (steps 2 and 5).
@@ -834,7 +832,15 @@ namespace cdough::regression {
 // silently change both the pipeline's numbers and 67% more work in the hottest
 // loop it has. The pipeline's own figure therefore gets its own name rather
 // than inheriting a constant tuned for a different solver.
-constexpr int kFlatConditionalModeNewtonIterations = 3;
+// Raised from 3 to 5 with the BFGS budget below (task 0016). The Laplace
+// objective AND its analytic gradient are both evaluated at the conditional mode
+// this loop finds, so an under-solved mode biases the function BFGS is
+// minimising. Raising the outer budget without raising this one would let 5a/5b
+// converge to a stationary point of the wrong objective and report success --
+// worse than the honest non-convergence it replaced. Five is what
+// library/regression.h's own mixedeffects::ConditionalModeBatched uses, via
+// kNewtonIterations, for the identical solve.
+constexpr int kFlatConditionalModeNewtonIterations = 5;
 
 // =============================================================================
 // Model specifications and design matrices
@@ -1508,7 +1514,19 @@ AV FlatNegMarginalLogLik(const ModelData& md, const std::vector<AV>& params) {
     return FlatObjective(md, params, nullptr);
 }
 
-constexpr int kGlmmBfgsIterations = 12;
+// BFGS iteration budget for the mixed models (task 0016).
+//
+// Was 12, a flat cap that suited the 3-parameter models and starved the
+// 7-parameter ones. BFGS starts from an identity inverse-Hessian and applies one
+// rank-2 update per iteration, so it needs roughly `dim` iterations before it has
+// any usable curvature at all. At 12 the budget was 4.0x dim for 2a/2b, which
+// converged at 9-12, but only 1.7x dim for 5a/5b, which all six exhausted it with
+// gradient norms between 96 and 190 -- truncated mid-descent, not fitted.
+//
+// 60 is ~8.6x dim for 5a/5b. The easy models do not pay for it: they exit early
+// on a failed line search well before the cap, so a larger cap only costs time
+// where it actually binds.
+constexpr int kGlmmBfgsIterations = 60;
 
 // Step for the numerical observed-information Hessian below. A second difference
 // divides by h^2, so it amplifies the objective's fixed-point noise by 1/h^2;
