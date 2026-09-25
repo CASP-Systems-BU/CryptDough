@@ -333,3 +333,142 @@ well inside the earlier budget.
   complement, and the 8%-at-2e4 figure it was set against is now the form actually in use.
 - **Standard errors whose variance is O(ULP)** (the `newage` terms, 1.55 and 0.05 ULPs) still cannot
   be computed at this precision and should be reported as unavailable rather than printed.
+
+## Phase E — tolerances re-measured and constants recalibrated
+
+Every affected tolerance was re-measured against a fresh run of the four suites, and the two
+constants whose referent had changed were recalibrated against new evidence rather than adjusted by
+judgement. Result: **113 checks, 0 failures** (was 104 — the nine new ones are below).
+
+### Two scope gaps, which matter more than any of the numbers
+
+**`kInverseTolerance` bounds an operator the pipeline no longer calls.** `NewtonSchulzInverse`'s only
+remaining callers are `test_playground_optimizer` and the `secure-logistic-regression` calibration
+harness. Every standard error the analysis reports now flows through `SecureInverse`
+(`regression.h:408` mixed, `:732` fixed) — **which had no unit test at all**, only `harness.h:647`'s
+unasserted self-check. Phase C replaced the inverse without adding a test for the replacement.
+
+Added `TestSecureInverse`: identity, SPD 2x2, SPD 3x3, and an SPD 4x4 chosen because
+`CholeskySolveManyWith` solves all `p` right-hand sides in one batched call with its own row-major
+`p x rhs` indexing, which a 2x2 would not exercise. Residual `|A X - I|` checked independently of the
+Gauss-Jordan reference, plus an assertion pinning the documented column-wise asymmetry (measured
+1.53e-05, one ULP). The non-symmetric case from the Newton-Schulz suite is deliberately ABSENT:
+`CholeskyFactor` does not pivot, so a non-SPD operand is outside the contract, not a case to pass.
+
+`kInverseTolerance` is left as derived rather than retuned to its 2.85e-05 worst — tightening a bound
+on a path nothing depends on buys nothing. Whether `NewtonSchulzInverse` should now be DELETED (phase
+C planned it; it survived) is a separate decision and is not taken here.
+
+**`kMixedHessianStep = 0.2` also guards a path the pipeline no longer takes.**
+`mixedeffects::Covariance` on a `BatchedDataset` still builds its Hessian from `NumericalHessianBatched`
+— second differences of the objective — so 0.2 as an `eps^(1/4)` optimum is still correct THERE. The
+pipeline's mixed models go through `ObservedInformationFromGradient` on ragged `ModelData` with its own
+`kHessianStep`. The two are calibrated separately and neither covers the other. Documented as a gap
+rather than unified, because sharing a path would need a gradient function for `BatchedDataset` — an
+architectural change, not a recalibration.
+
+### `kHessianStep` — swept, and 0.1 survives for a new reason
+
+The phase F note predicted the optimum would fall to `eps^(1/3)` ~ 0.05 now that the difference is
+first-order. **That prediction was wrong.** Worst relative SE difference over all twelve mixed models,
+each value a full rebuild + synthetic run + oracle comparison:
+
+| h | worst | verdict |
+| --- | --- | --- |
+| 0.05 | 1.213e-01 | FAIL |
+| **0.1** | **5.136e-02** | **PASS** |
+| 0.2 | 2.810e-01 | FAIL |
+| 0.4 | 8.535e-01 | FAIL |
+
+0.1 is a genuine interior optimum and the only passing value, so the constant is unchanged — but it is
+now a MEASURED optimum rather than an inherited derivation, and the reasoning that predicted 0.05 was
+simply wrong about the magnitude of the gradient's own noise.
+
+The two tails fail for opposite reasons, which anyone retuning this should know. Above 0.1 it is
+truncation bias: every model degrades together, roughly 4x per doubling of h, the `h^2` a central
+difference predicts. Below 0.1 it is noise, and noise is **not uniform** — at 0.05 NINE of twelve
+models beat their 0.1 figure, several by 5-7x (2a any reaches 1.976e-03 against 1.309e-02), and the
+gate fails on a single spike, 2b any at 1.213e-01 against 2.279e-02. A smaller step is better on
+average and unreliable in the tail, which is exactly the trade a worst-case gate should refuse.
+
+### `kHessianConditionWarn` — recalibrated 1e6 -> 5e4
+
+The threshold's referent changed to the Schur complement, and the reported quantity is a STANDARD
+ERROR — `sqrt(variance)`, whose relative error is about half the variance's. Real models cannot
+calibrate it because none of them break, so `probe_cond` (scaffolding, `playground/tests/`) sweeps
+`SecureInverse` over a worst-case geometric spectrum at n = 7, magnitude 1:
+
+| kappa | 1e2 | 1e3 | 5e3 | 1e4 | 2.5e4 | 5e4 | 1e5 | 1e6 | 1e7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| var err | 7.8e-4 | 5.7e-3 | 4.9e-2 | 7.9e-2 | 1.0e-1 | 3.7e-1 | 2.1e-1 | 8.5e-1 | 9.8e-1 |
+| **se err** | 3.9e-4 | 2.8e-3 | 2.5e-2 | 4.0e-2 | **5.0e-2** | **2.1e-1** | 1.1e-1 | 6.1e-1 | 8.5e-1 |
+
+5e4 is the first swept condition exceeding 10% standard-error error, and every point above it is worse,
+so the warning does not flicker with kappa. The old 1e6 was ~20x too permissive: at 1e6 the error is
+6.1e-1, meaning the standard error is meaningless and nothing warned.
+
+**It is a screen, not a guarantee, and this is the phase's most useful finding.** Since the Hessian
+moved to analytic-gradient differences, kappa predicts accuracy far more weakly than it did. Joining
+the reported condition estimate to the oracle error per model:
+
+| model | scope | kappa | SE err | | model | scope | kappa | SE err |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2b | umass | 1.59e+01 | 8.53e-03 | | 5b | umass | 2.84e+03 | 2.27e-02 |
+| 2b | nonumass | 1.63e+01 | 5.19e-03 | | 5b | any | 6.61e+03 | 2.98e-02 |
+| 2b | any | 2.24e+01 | 2.28e-02 | | 5a | umass | 6.67e+03 | 1.34e-02 |
+| 2a | umass | 3.04e+01 | 1.29e-02 | | **5a** | **any** | **7.48e+03** | **5.14e-02** |
+| 2a | nonumass | 3.29e+01 | 1.02e-02 | | 5b | nonumass | 2.33e+04 | 2.85e-02 |
+| 2a | any | 4.57e+01 | 1.31e-02 | | 5a | nonumass | 2.50e+04 | 1.60e-02 |
+
+The WORST error, 5.14e-02, is at kappa 7.48e+03 — while the HIGHEST kappa, 2.50e+04, returns
+1.60e-02. A fit under the threshold is not thereby certified accurate; one above it is genuinely
+suspect. No current model trips 5e4, so the change adds no output noise on this data.
+
+The warning branch was verified to actually fire: temporarily set to 1e3, model 5a nonumass
+(kappa 2.50e+04) emitted "close to singular; treat every standard error from this fit as indicative
+only". Source and binary restored to 5e4 afterwards and re-confirmed silent.
+
+### Tolerances: one tightened, the rest corrected
+
+`kSchurTolerance` **5.0e-3 -> 2.0e-4**. Measured worst fell 1.78e-03 -> 6.79e-05 when the inverse
+changed — a real 26x improvement, not run-to-run noise — leaving the old bound at 74x the worst, where
+it could no longer catch a regression. 2.0e-4 restores the 3x discipline. A malformed duplicated
+`// relative // absolute` comment on that line is also fixed.
+
+`kSymmetricInverseTolerance` **new, 3.0e-4**, at 3x the measured worst 8.80e-05 (the 4x4 residual).
+Recorded alongside it: on these small, well-conditioned, O(1)-scaled fixtures the ITERATIVE inverse is
+tighter, 2.85e-05 against 8.80e-05, because it iterates to a noise floor on exactly the operand its
+preconditions assume. The direct factorisation wins where the pipeline lives — 0.12-0.51% at kappa
+1.1e4 on 5a, against 55-ULP noise — and has no iteration count to calibrate. The unit fixtures cannot
+show that, which is why `probe_cond` sweeps conditioning separately.
+
+Stale "measured worst" figures corrected everywhere else; bounds left alone because all retain margin.
+Two had drifted materially: `kCovarianceTolerance` 3.53e-05 -> 1.29e-04 (3.7x) and
+`kBfgsUpdateTolerance` 3.37e-05 -> 8.13e-05 (2.4x). `kMatMulTolerance`'s recorded 1.53e-05 was
+misattributed — it is the Newton-Schulz identity figure; the matmul fixtures measure exactly 0.00e+00,
+so that bound stays on its first-principles derivation rather than a 3x-of-zero.
+
+| constant | file | before | after | measured worst |
+| --- | --- | --- | --- | --- |
+| `kSchurTolerance` | mixed_effects | 5.0e-3 | **2.0e-4** | 6.79e-05 |
+| `kSymmetricInverseTolerance` | optimizer | — | **3.0e-4** | 8.80e-05 |
+| `kHessianConditionWarn` | regression.h | 1e6 | **5e4** | se err > 10% at 5e4 |
+| `kHessianStep` | regression.h | 0.1 | 0.1 (confirmed) | 5.136e-02 at h=0.1 |
+| `kInverseTolerance` | optimizer | 4.0e-4 | unchanged | 2.85e-05 (dead path) |
+| `kCovarianceTolerance` | fixed_effects | 1.0e-3 | unchanged | 1.29e-04 |
+| `kStandardErrorTolerance` | fixed_effects | 1.0e-3 | unchanged | 7.93e-05 |
+| `kMixedStandardErrorTolerance` | mixed_effects | 1.2e-2 | unchanged | 3.04e-03 |
+| `kBfgsUpdateTolerance` | optimizer | 4.0e-4 | unchanged | 8.13e-05 |
+| `kMatMulTolerance` | optimizer | 2.0e-4 | unchanged | 0.00e+00 |
+
+### Still open
+
+- Whether to DELETE `NewtonSchulzInverse` and its calibration sweep, as phase C planned. It is dead to
+  the pipeline but still has two callers and a passing test.
+- Whether to give `mixedeffects::Covariance` a gradient-difference Hessian so the suite and the
+  pipeline calibrate the same code.
+- Standard errors whose variance is O(ULP) (`newage`, 1.55 and 0.05 ULPs) should be reported as
+  unavailable rather than printed.
+- 2b any's 1.635e-02 -> 2.279e-02 move from phase F is unexplained, though far inside tolerance. It is
+  also the model that spikes at h = 0.05, which suggests its Hessian is the noisiest of the twelve.
+

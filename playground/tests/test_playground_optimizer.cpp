@@ -79,8 +79,11 @@ constexpr double kMatMulTolerance = 2.0e-4;  // absolute; measured worst 0.00e+0
 constexpr double kInverseTolerance = 4.0e-4;  // absolute; measured worst 2.85e-05 (residual)
 
 // SecureInverse / SymmetricInverse -- the Cholesky inverse, and the one the
-// PIPELINE actually uses. Calibrated below.
-constexpr double kSymmetricInverseTolerance = 1.0e-2;  // absolute; PLACEHOLDER, calibrating
+// PIPELINE actually uses for every standard error it reports.
+//
+// Calibrated in task 0018 phase E at 3x the measured worst (8.80e-05, the 4x4
+// residual), matching the discipline stated in test_playground_mixed_effects.
+constexpr double kSymmetricInverseTolerance = 3.0e-4;  // absolute; measured worst 8.80e-05
 
 // BfgsInverseUpdateBatched composes four kernel calls, and optimizer.h's own
 // comment quotes ~5e-4 for it. 4e-3 is that with margin.

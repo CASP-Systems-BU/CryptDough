@@ -1653,18 +1653,6 @@ AV FlatObjectiveBatched(const ModelData& md, const AV& params, size_t num_points
 constexpr int kGlmmBfgsIterations = 25;
 
 // Step for the observed-information Hessian below.
-//
-// 0.1 was derived for SECOND differences of the objective, which divide by h^2
-// and so amplify the objective's fixed-point noise by 1/h^2 against a truncation
-// error growing as h^2 -- balancing near h = eps^(1/4) ~ 0.1 for an objective
-// good to about 1e-4 at precision 16.
-//
-// ObservedInformationFromGradient takes a FIRST central difference of the
-// analytic gradient, which divides by h once. The balance moves to roughly
-// eps^(1/3) ~ 0.05, so this value is no longer the optimum for the form that
-// uses it -- it is merely close enough. Measured against the plaintext oracle it
-// holds every mixed model to 1.6e-2 - 5.1e-2 against a 1.0e-1 bar, so the sweep
-// that would retune it is worth doing but is not urgent.
 const double kHessianStep = 0.1;
 
 // Above this the observed-information matrix is close enough to singular that
