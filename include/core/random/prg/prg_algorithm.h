@@ -4,11 +4,17 @@
 #include <sodium.h>
 #include <stdlib.h>
 
+#if defined(CDOUGH_ENABLE_TLS)
+#include <openssl/evp.h>
+#endif
+
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #define __DEFAULT_PRGALGORITHM_BUFFER_SIZE (1 << 20)
@@ -224,10 +230,48 @@ class AESPRGAlgorithm : public DeterministicPRGAlgorithm {
         unsigned char mac[crypto_aead_aes256gcm_ABYTES];
         // This will be set to zero on init and never modified.
         static const std::array<uint8_t, MAX_AES_QUERY_BYTES> zero_message = {0};
-        // call AES
-        crypto_aead_aes256gcm_encrypt_detached(dest.data(), mac, NULL, zero_message.data(),
-                                               message_len, NULL, 0, NULL, nonce_char, seed);
+        static const bool hardware_aes =
+            sodium_init() >= 0 && crypto_aead_aes256gcm_is_available() != 0;
+        if (hardware_aes) {
+            if (crypto_aead_aes256gcm_encrypt_detached(dest.data(), mac, NULL,
+                                                       zero_message.data(), message_len, NULL,
+                                                       0, NULL, nonce_char, seed) != 0) {
+                throw std::runtime_error("AESPRGAlgorithm: libsodium AES-256-GCM failed");
+            }
+        } else {
+            portableAesGcmKeystream(dest, zero_message.data(), nonce_char);
+        }
         nonce++;
+    }
+
+    /**
+     * AES-256-GCM encryption of zeros without hardware AES. It produces the same
+     * bytes as libsodium's path, so parties on different CPUs stay in sync.
+     * @param dest The span to fill with keystream.
+     * @param zeros At least dest.size() zero bytes.
+     * @param nonce_char The 12-byte GCM nonce.
+     */
+    void portableAesGcmKeystream(std::span<uint8_t> dest, const uint8_t* zeros,
+                                 const unsigned char* nonce_char) {
+#if defined(CDOUGH_ENABLE_TLS)
+        std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> context(
+            EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free);
+        int written = 0;
+        if (!context ||
+            EVP_EncryptInit_ex(context.get(), EVP_aes_256_gcm(), NULL, seed, nonce_char) != 1 ||
+            EVP_EncryptUpdate(context.get(), dest.data(), &written, zeros,
+                              static_cast<int>(dest.size())) != 1 ||
+            written != static_cast<int>(dest.size())) {
+            throw std::runtime_error("AESPRGAlgorithm: OpenSSL AES-256-GCM failed");
+        }
+#else
+        (void)dest;
+        (void)zeros;
+        (void)nonce_char;
+        throw std::runtime_error(
+            "AESPRGAlgorithm: this CPU has no hardware AES, so libsodium cannot run "
+            "AES-256-GCM. Rebuild with -DTLS=ON to use OpenSSL's portable AES instead.");
+#endif
     }
 };
 

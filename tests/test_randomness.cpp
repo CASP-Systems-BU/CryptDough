@@ -1,3 +1,4 @@
+#include <array>
 #include <iostream>
 #include <set>
 
@@ -40,6 +41,31 @@ void test_local_prg_randomness(Engine& engine) {
     assert(s.size() >= test_size * 0.99);
 
     return;
+}
+
+// ***************************************** //
+//     Test AES PRG Known-Answer Vector      //
+// ***************************************** //
+// Parties on different CPUs must derive the same common-PRG stream. libsodium runs
+// AES-256-GCM only with hardware AES, and elsewhere the PRG falls back to OpenSSL, so
+// both paths are pinned to one keystream (computed independently with Python's
+// cryptography AESGCM: key 00..1f, nonce = little-endian call counter).
+void test_aes_prg_known_answer() {
+    std::vector<unsigned char> seed(crypto_aead_aes256gcm_KEYBYTES);
+    for (size_t i = 0; i < seed.size(); i++) seed[i] = static_cast<unsigned char>(i);
+    AESPRGAlgorithm prg_algorithm(seed);
+
+    const std::array<std::array<uint8_t, 16>, 2> expected = {{
+        {0x0e, 0xbc, 0xb5, 0xde, 0xb5, 0x2c, 0x83, 0xbd, 0x08, 0xa8, 0xa9, 0x35, 0x18, 0x2c,
+         0x91, 0x99},
+        {0xe2, 0x2c, 0x82, 0x3f, 0xa4, 0xaf, 0xec, 0x07, 0x4a, 0x04, 0x05, 0xc3, 0x3c, 0xc1,
+         0x88, 0xcb},
+    }};
+    for (const auto& block : expected) {
+        std::array<uint8_t, 16> keystream{};
+        prg_algorithm.fillBytes(keystream);
+        assert(keystream == block);
+    }
 }
 
 // ***************************************** //
@@ -397,6 +423,9 @@ int main(int argc, char** argv) {
     test_local_prg_randomness<int32_t>(engine);
     test_local_prg_randomness<int64_t>(engine);
     if (pID == 0) std::cout << "Local Randomness...OK" << std::endl;
+
+    test_aes_prg_known_answer();
+    if (pID == 0) std::cout << "AES PRG known-answer vector...OK" << std::endl;
 
     // test XChaCha20
     // unsigned
