@@ -80,6 +80,7 @@ void listen_connections(int host_rank, int from_rank, int thread_num, int listen
         int fd = accept(listen_sockfd, NULL, NULL);
         if (fd < 0) throw std::runtime_error("accept failed on port " + std::to_string(listen_port));
         close(listen_sockfd);  // one connection per port; stop listening once accepted
+        set_tcp_nodelay(fd);
 #if defined(CDOUGH_ENABLE_TLS)
         // The peer connected to us, so we are the TLS server here.
         (*socket_maps)[i][from_rank] = Conn::server(

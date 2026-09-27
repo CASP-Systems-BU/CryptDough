@@ -125,7 +125,22 @@ would not model a compute party whose only egress is the proxy.
 - Each job keeps one thread at ~100% CPU (busy wait), so 15 concurrent jobs would
   oversubscribe the owners' 8 cores about 2x.
 
-### Options for the blocker (decision needed)
+### After the PRG fix (`5a8c739`, 2026-09-26/27)
+- `test_randomness` passes on both ARM owners (OpenSSL path) and on blinky (libsodium
+  path), including the new known-answer vector, which pins both paths to the same keystream.
+- Smoke test `-N 6a:any` over the WAN: all three parties exit 0, `patients` = 188/115/115,
+  and the output CSV is **bit-identical** to 0019's LAN run (estimates, SEs, z). The
+  mixed-architecture run is exact.
+- **Timing:** connect 0.4 s; ingest + relational 182 s (~180x the LAN); **6a fit 17,583 s
+  (4.9 h) vs 14.8 s on the LAN, ~1,190x**. That is ~6.6x worse than pure RTT scaling
+  (53.5 / ~0.3 ms), i.e. ~360 ms per protocol round instead of ~54 ms.
+- Suspected cause: no `TCP_NODELAY` on the communicator's sockets. Nagle holds small
+  follow-up writes until an ACK arrives, and Linux delays ACKs by up to 40 ms, so each
+  round can absorb several stalls. The ARM cores may contribute.
+- At ~1,190x, the mixed fits (607–1,870 s on the LAN) would take **8–26 days each**:
+  not feasible as-is.
+
+### Options for the blocker (resolved: A, committed as 5a8c739)
 - **A. Fix the PRG (code change).** Generate the keystream with OpenSSL's
   `EVP_aes_256_gcm`, which has a portable software path and is already linked for TLS.
   Its output is byte-identical to libsodium's on x86, so existing results do not move.

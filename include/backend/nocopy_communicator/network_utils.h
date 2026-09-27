@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -359,6 +360,21 @@ class Conn {
     int fd_ = -1;
 };
 
+/**
+ * @brief Disable Nagle's algorithm on a connected party-to-party socket.
+ *
+ * MPC traffic is a long sequence of small, latency-bound rounds. With Nagle on, a
+ * small write waits for the ACK of earlier unacknowledged data, and the peer may delay
+ * that ACK (up to 40 ms on Linux), so on a WAN each round can absorb several stalls.
+ */
+inline void set_tcp_nodelay(int fd) {
+    int opt = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+        close(fd);
+        throw std::runtime_error("Could not set TCP_NODELAY");
+    }
+}
+
 inline int socket_create(int port) {
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock == -1) {
@@ -447,6 +463,7 @@ inline int socket_connect(const std::string& hostname, int port) {
 
         if (connect(sockfd, res->ai_addr, res->ai_addrlen) == 0) {
             freeaddrinfo(res);
+            set_tcp_nodelay(sockfd);
             return sockfd;
         }
         close(sockfd);
