@@ -6,7 +6,7 @@
 - Requested by: Adam Godel
 - Owner: Adam Godel
 - Date: 2026-09-26
-- Status: Blocked (PRG on ARM owners; see Findings)
+- Status: Done
 - Estimated effort: 1 day (dominated by the ARM image builds and the run itself)
 - Related documents: [0008](0008_cross-org-3pc-deployment.md), [0013](0013_single-owner-node-runner.md), [docker/DEPLOYMENT.md](../docker/DEPLOYMENT.md), [report.md](../report.md)
 - Branch: logistic-regression @ `03f28f95efcf`
@@ -139,6 +139,64 @@ would not model a compute party whose only egress is the proxy.
   round can absorb several stalls. The ARM cores may contribute.
 - At ~1,190x, the mixed fits (607–1,870 s on the LAN) would take **8–26 days each**:
   not feasible as-is.
+
+### After TCP_NODELAY (`255fb00`, 2026-09-27)
+- `set_tcp_nodelay()` is applied on both the connecting and the accepted sockets. It passes
+  `test_randomness` with TLS on and off, and a local synthetic `6a` is bit-identical to 0019.
+- WAN smoke `-N 6a:any`: all parties exit 0, and the CSV is again **bit-identical** to 0019.
+
+  | stage | LAN (0019) | WAN, no NODELAY | WAN, NODELAY |
+  |---|---|---|---|
+  | ingest + relational | ~1 s | 182 s | **109 s** |
+  | 6a IRLS fit | 14.8 s | 17,583 s | **8,872 s** (~600x LAN) |
+
+- Fit traffic: 94.4 MB, measured with a local byte profile of the same node. The traffic
+  runs in a ring (1→0, 0→2, 2→1). Throughput varies between 0.3 and 1.2 MB/min,
+  depending on the phase. That is round-bound, not bandwidth-bound.
+- Still ~3x above pure RTT scaling. Remaining suspects: slow ARM cores on the critical
+  path of every round, and the extra hop through the relay.
+- Projection at ~600x: mixed fits (607–1,870 s on the LAN) would take **4–13 days each**.
+
+### Owners moved to CloudLab UMass (2026-09-27)
+The Utah nodes were retired at the requester's direction. New owners: pc08 (198.22.255.18,
+rank 1) and pc22 (198.22.255.32, rank 2), Xeon E5-2660 v3, 40 cores, x86_64 with AES-NI.
+The RTT from blinky and from wormhole is 3.5 ms. Same setup as before: each party builds
+its own image at `255fb00` (fingerprint `47c69a39…`), generates its own keypair and its
+own data half (hashes match 0019), and pre-flight passes.
+
+| | LAN (0019) | Utah (53.5 ms) | UMass (3.5 ms) |
+|---|---|---|---|
+| ingest + relational | ~1 s | 109 s | **11 s** |
+| 6a IRLS fit | 14.8 s | 8,872 s | **420 s** (~28x); CSV bit-identical to 0019 |
+| mixed-model BFGS iteration (2a:umass) | ~67 s | — | **1,641 s, 1,650 s** (~24.5x) |
+
+Full-pipeline projection: ~25x each model's 0019 LAN time. The longest fit (5a
+non-UMass, 25 iterations) takes ~13 h; the 14 models back to back ~4.7 days. As 15
+concurrent jobs, it finishes in ~13–14.5 h (0019 measured <=10% concurrency overhead).
+
+### Full run launch (2026-09-27 12:52)
+15 concurrent jobs: `describe` plus 13 `-N` nodes on base 31000 + 100k, and `2a:umass`
+(already running from the measurement) on 33100.
+
+- **Bug: `-cl 1` (conflict_list) is broken under `-D`.** `SecureConflictCount`
+  (`playground/secure.h:443`) sizes its vectors from the owners' raw file row counts,
+  which only the owner knows. Owner A computes m=512, owner B m=512, and the compute
+  party, which holds neither file, m=2. The parties desynchronize: the opened count was
+  `3248614333095933440`, and the job then hung. This is the "public values must not be
+  read off private data" failure from DEPLOYMENT.md. Synthetic mode (0019) never hits it,
+  because every party generates both halves. Not fixed here: `describe` was rerun without
+  `-cl 1` (it is opt-in). All 9 aggregate rows are identical to 0019.
+- `6a:any` aborted once at startup: all three parties reported `Conn::send_all: send failed`
+  within 0.4 s of launch. The relay and port wiring checked out. A relaunch on the same
+  ports ran cleanly. Not reproduced; logged as transient.
+
+### Full run result (Sun 12:52 → Mon 01:58, 13.1 h wall clock)
+- All 15 jobs exited 0 on all three parties. The per-model runtime and accuracy table is in
+  [report.md](../report.md#results-2026-09-27-commit-255fb00-umass-owners-rtt-35-ms).
+- Every model ran 21–30x its LAN time. 6a/6b are bit-identical to 0019; every 2a/2b fit is
+  within 0.08 SE of the oracle; 5a/5b are comparable to the LAN run, except 5a:any, which
+  stopped at a worse point (NLL excess 0.48 vs 0.02, sigma^2 0.056 vs 0.196).
+- Open: the `-cl` conflict_list bug under `-D` (above).
 
 ### Options for the blocker (resolved: A, committed as 5a8c739)
 - **A. Fix the PRG (code change).** Generate the keystream with OpenSSL's
