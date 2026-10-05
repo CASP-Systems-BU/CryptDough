@@ -38,6 +38,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # python3-pip and python3-venv are deliberately absent: they drag in Ubuntu's pip,
 # setuptools and wheel, which carry known CVEs and are only needed to populate the
 # venv. The venv is built in its own stage below and copied in without them.
+# Do not add them back here: the fixed noble builds of python3-pip and python3-wheel
+# are Ubuntu Pro (ESM) only, so `apt-get upgrade` cannot clear their scan findings.
 #
 # `apt-get upgrade` picks up security updates published after the ubuntu:24.04 base
 # image was cut, so the result does not depend on how stale the local base image is.

@@ -34,3 +34,6 @@ docker/cryptdough-sample-*.txt
 .DS_Store
 .vscode/
 .idea/
+
+# Saved images copied back to the repository root
+/*.tar.gz
