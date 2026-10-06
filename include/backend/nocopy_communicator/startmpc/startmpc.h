@@ -91,7 +91,19 @@ void listen_connections(int host_rank, int from_rank, int thread_num, int listen
     }
 }
 
-std::pair<int, int> startmpc_init(int thread_num, std::vector<std::vector<Conn>>& socket_maps) {
+// Port layout. Each (party pair, lane) gets one port: lower rank i connects to
+// higher rank j on
+//
+//     base_port + host_count * lanes * i + lanes * j + lane
+//
+// A lane is one worker thread of one engine: lanes = num_engines * thread_num
+// and lane = engine_index * thread_num + thread. With one engine this is exactly
+// the per-thread layout this file has always used, and with -t 1 engine k takes
+// the slot thread k would take under -t K (semantic task 0024/0025). Engines
+// therefore never collide, and docker/check-manifest.sh can compute every range
+// from (parties, threads * engines) alone.
+std::pair<int, int> startmpc_init(int thread_num, std::vector<std::vector<Conn>>& socket_maps,
+                                  int engine_index = 0, int num_engines = 1) {
     const char* startmpc_exec_env = std::getenv("STARTMPC_EXEC_MODE");
     const char* host_count_env = std::getenv("STARTMPC_HOST_COUNT");
     const char* host_rank_env = std::getenv("STARTMPC_HOST_RANK");
@@ -106,7 +118,7 @@ std::pair<int, int> startmpc_init(int thread_num, std::vector<std::vector<Conn>>
     }
 
     // Arbitrary start port
-    // Range of ports used: base_port -> (base_port + host_count * host_count)
+    // Range of ports used: base_port -> (base_port + host_count * host_count * lanes)
     int base_port = base_port_env ? std::atoi(base_port_env) : -1;
 
     for (auto& m : socket_maps) {
@@ -133,14 +145,20 @@ std::pair<int, int> startmpc_init(int thread_num, std::vector<std::vector<Conn>>
 
     std::vector<std::thread> connection_threads;
 
-    static int engineIndex = 0;
-    const int engineOffset = 100 * engineIndex;
+    if (num_engines < 1 || engine_index < 0 || engine_index >= num_engines) {
+        throw std::runtime_error(
+            "startmpc_init: engine " + std::to_string(engine_index) + " created, but -neng is " +
+            std::to_string(num_engines) +
+            ". Every engine needs a declared port slot: create at most -neng engines.");
+    }
+    const int lanes = num_engines * thread_num;
+    const int lane_offset = engine_index * thread_num;
 
     // Send connection attempt to parties with a higher host_rank
     for (int i = host_rank + 1; i < host_count; i++) {
         // Start port for connections to party i
         int connect_start_port =
-            base_port + engineOffset + (host_count * thread_num * host_rank) + (thread_num * i);
+            base_port + (host_count * lanes * host_rank) + (lanes * i) + lane_offset;
 
         connection_threads.emplace_back(send_connections, host_rank, i, thread_num, ip_addr_list[i],
                                         connect_start_port, &socket_maps);
@@ -150,13 +168,11 @@ std::pair<int, int> startmpc_init(int thread_num, std::vector<std::vector<Conn>>
     for (int i = 0; i < host_rank; i++) {
         // Start port for connections from party i
         int listen_start_port =
-            base_port + engineOffset + (host_count * thread_num * i) + (thread_num * host_rank);
+            base_port + (host_count * lanes * i) + (lanes * host_rank) + lane_offset;
 
         connection_threads.emplace_back(listen_connections, host_rank, i, thread_num,
                                         listen_start_port, &socket_maps);
     }
-
-    engineIndex++;
 
     for (auto& thread : connection_threads) {
         if (thread.joinable()) thread.join();

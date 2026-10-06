@@ -1829,7 +1829,9 @@ FitResult FitGlmmLaplace(const ModelData& md, const ModelSpec& spec, int party_i
         return g;
     };
 
-    BatchedOptResult opt = MinimizeBFGSBatched(objective, x0, kGlmmBfgsIterations, analytic);
+    const std::string log_label = spec.step + " " + ScopeName(spec.scope);
+    BatchedOptResult opt =
+        MinimizeBFGSBatched(objective, x0, kGlmmBfgsIterations, analytic, log_label);
 
     FitResult r;
     r.step = spec.step;

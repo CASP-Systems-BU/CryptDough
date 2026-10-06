@@ -16,6 +16,14 @@ struct CommFactoryArgs {
     double bandwidth = std::numeric_limits<double>::infinity();
     std::string host_prefix = "node";
     cdough::service::Setting setting = cdough::service::Setting::SAME;
+
+    // Instance parallelism (-neng): how many engines this process declares, and
+    // which one this factory belongs to, counted in creation order. Engines pair
+    // across parties by this index, so every party must create its engines in
+    // the same order. Communicators that lay out ports per engine (no-copy) need
+    // both; the MPI communicator separates engines by tag and ignores them.
+    int numEngines = 1;
+    int engineIndex = 0;
 };
 
 /**

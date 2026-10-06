@@ -3,6 +3,7 @@
 #include <NTL/GF2E.h>
 #include <NTL/GF2XFactoring.h>
 
+#include <atomic>
 #include <optional>
 
 #include "rand_setup.h"
@@ -111,6 +112,12 @@ auto cdough_runtime_init(int argc, char** argv, std::optional<int> partiesNum,
 
     // TODO: remove dependency on engine.
     // Initialize Communicator Factory
+    // Engines are numbered in the order this process creates them (-neng).
+    // Atomic so that concurrent cdough_init calls get distinct indices; it
+    // cannot make the ORDER agree across parties, which the caller must do.
+    static std::atomic<int> engines_created{0};
+    const int engine_index = engines_created.fetch_add(1);
+
     CommunicatorFactory communicatorFactory(engine, {
                                                         .argc = argc,
                                                         .argv = argv,
@@ -119,6 +126,8 @@ auto cdough_runtime_init(int argc, char** argv, std::optional<int> partiesNum,
                                                         .bandwidth = bandwidth,
                                                         .host_prefix = host_prefix,
                                                         .setting = setting,
+                                                        .numEngines = num_engines,
+                                                        .engineIndex = engine_index,
                                                     });
 
     auto partyId = communicatorFactory.getPartyId();

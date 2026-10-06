@@ -1,6 +1,9 @@
 #pragma once
 
 #include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <string>
 
 #include "./primitives.h"
 
@@ -890,9 +893,18 @@ LineSearchConstants MakeLineSearchConstants(EngineRef engine) {
 //      following iteration rather than at the end of the failing one, so that it
 //      shares the single opened flag. `result.iterations` is therefore one
 //      higher than before on that path. The returned parameters are unaffected.
+//
+// `log_label` names the fit in the per-iteration log, as "[BFGS <label>]", so
+// that fits running concurrently on separate engines (semantic task 0024) can be
+// told apart. Each log line is formatted into its own buffer and written to
+// std::cout in one call: streaming the manipulators straight into the shared
+// stream would both tear lines and leak std::fixed / setprecision between
+// threads.
 BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
                                      int max_iterations = 20,
-                                     const BatchedGradient& analytic_gradient = nullptr) {
+                                     const BatchedGradient& analytic_gradient = nullptr,
+                                     const std::string& log_label = "") {
+    const std::string log_tag = log_label.empty() ? "[BFGS]" : "[BFGS " + log_label + "]";
     const size_t n = x0.size();
     EngineRef engine = x0.engine;
 
@@ -968,16 +980,18 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
             const bool stopped_on_gradient = (static_cast<DataType>(opened_grad_big[0]) == 0);
 #endif
             if (engine.getPartyID() == 0) {
-                std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                          << "  time=" << std::fixed << std::setprecision(3) << elapsed << "s"
+                std::ostringstream line;
+                line << log_tag << " iter " << std::setw(3) << (iteration + 1)
+                     << "  time=" << std::fixed << std::setprecision(3) << elapsed << "s"
 #ifdef LOGISTIC_REGRESSION_LAYER_PRINT
-                          << (stopped_on_gradient
-                                  ? "  gradient below tolerance; stopping"
-                                  : "  no descent found along search direction; stopping")
+                     << (stopped_on_gradient
+                             ? "  gradient below tolerance; stopping"
+                             : "  no descent found along search direction; stopping")
 #else
-                          << "  stopping"
+                     << "  stopping"
 #endif
-                          << std::endl;
+                     << '\n';
+                std::cout << line.str() << std::flush;
             }
             result.converged = true;
             break;
@@ -1155,18 +1169,20 @@ BatchedOptResult MinimizeBFGSBatched(const BatchedObjective& f, const AV& x0,
 #endif
 
         if (engine.getPartyID() == 0) {
-            std::cout << "[BFGS] iter " << std::setw(3) << (iteration + 1)
-                      << "  time=" << std::fixed << std::setprecision(3) << elapsed << "s"
+            std::ostringstream line;
+            line << log_tag << " iter " << std::setw(3) << (iteration + 1)
+                 << "  time=" << std::fixed << std::setprecision(3) << elapsed << "s"
 #ifdef LOGISTIC_REGRESSION_LAYER_PRINT
-                      << "  neg_log_lik=" << std::fixed << std::setprecision(6) << fx_new_val
-                      << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
-                      << "  alpha=" << std::fixed << std::setprecision(4)
-                      << static_cast<double>(opened_alpha[0]) / scale
-                      << "  |step|=" << std::scientific << std::setprecision(3) << max_step
-                      << "  d_obj=" << std::scientific << std::setprecision(3)
-                      << std::abs(fx_val - fx_new_val)
+                 << "  neg_log_lik=" << std::fixed << std::setprecision(6) << fx_new_val
+                 << "  |grad|=" << std::scientific << std::setprecision(3) << max_grad
+                 << "  alpha=" << std::fixed << std::setprecision(4)
+                 << static_cast<double>(opened_alpha[0]) / scale
+                 << "  |step|=" << std::scientific << std::setprecision(3) << max_step
+                 << "  d_obj=" << std::scientific << std::setprecision(3)
+                 << std::abs(fx_val - fx_new_val)
 #endif
-                      << std::endl;
+                 << '\n';
+            std::cout << line.str() << std::flush;
         }
 
         x = Clone(x_new);

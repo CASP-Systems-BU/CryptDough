@@ -136,24 +136,34 @@ class NoCopyCommunicatorFactory : public CommunicatorFactory<NoCopyCommunicatorF
         this->bandwidth = args.bandwidth;
         socketMaps_.resize(threadsNum_);
 
+        // Multi-engine (-neng > 1) is validated with one worker thread per engine
+        // only (semantic task 0025). The lane layout in startmpc_init is general,
+        // but refuse the untested combination rather than run it.
+        if (args.numEngines > 1 && threadsNum_ > 1) {
+            throw std::runtime_error(
+                "NoCopyCommunicatorFactory: -neng > 1 requires -t 1 on the no-copy "
+                "communicator (got -neng " +
+                std::to_string(args.numEngines) + ", -t " + std::to_string(threadsNum_) + ")");
+        }
+
 #if defined(MPC_USE_NO_COPY_COMMUNICATOR)
-        std::tie(partyId, numParties) = startmpc_init(threadsNum_, socketMaps_);
+        std::tie(partyId, numParties) =
+            startmpc_init(threadsNum_, socketMaps_, args.engineIndex, args.numEngines);
 #endif
     }
 
     std::unique_ptr<Communicator> create() {
-        static int instanceCount = 0;
+        // One communicator per worker, each on its own socket map. The counter is
+        // per factory: a process-wide one, shared by every engine, only lined up
+        // with this factory's socketMaps_ because each engine happened to create
+        // exactly threadsNum_ communicators. Wrap around if more are created.
+        const int index = instanceCount_ % threadsNum_;
 
-        // Wrap around if more communicators than threads are created 
-        instanceCount = instanceCount % threadsNum_;
-
-        // Create a new communicator instance
         auto communicator = std::make_unique<NoCopyCommunicator>(
-            partyId, socketMaps_[instanceCount], numParties, host_prefix, this->latency,
+            partyId, socketMaps_[index], numParties, host_prefix, this->latency,
             this->bandwidth, setting_);
 
-        // Increment the instance count for the next communicator
-        instanceCount++;
+        instanceCount_++;
 
         return communicator;
     }
@@ -179,6 +189,9 @@ class NoCopyCommunicatorFactory : public CommunicatorFactory<NoCopyCommunicatorF
     int numParties;
 
     const int threadsNum_;
+
+    // Communicators created so far by THIS factory; see create().
+    int instanceCount_ = 0;
 
     const std::string host_prefix;
 

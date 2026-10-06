@@ -146,6 +146,73 @@ struct SecureCohort {
     size_t num_subjects = 0;
 };
 
+// =============================================================================
+// Moving a cohort onto another engine (semantic task 0024)
+//
+// The model fits can run concurrently on several engines (-neng), but a shared
+// vector is bound to the engine that made it, and every operation on it runs on
+// that engine's workers and communicators. So each extra engine gets its own
+// deep copy of the cohorts, built here once before any fit thread starts.
+//
+// This is a local copy with no communication. SharedVector::operator= copies the
+// contents element-wise and keeps the DESTINATION's engine, which is the same
+// assignment Clone() relies on. A replicated-3PC share depends only on the
+// party ID, and that is the same for every engine in this process, so the
+// copies are valid shares under the new engine. Protocols that bind per-engine
+// state into a share (MACs, OT correlations) would not have this property --
+// the driver refuses -neng > 1 on them.
+// =============================================================================
+
+AV CloneOnto(const AV& v, EngineRef engine) {
+    AV out(v.size(), engine);
+    out = v;
+    out.setPrecision(v.getPrecision());
+    return out;
+}
+
+BV CloneOnto(const BV& v, EngineRef engine) {
+    BV out(v.size(), engine);
+    out = v;
+    out.setPrecision(v.getPrecision());
+    return out;
+}
+
+template <typename Vec>
+std::vector<Vec> CloneOnto(const std::vector<Vec>& vs, EngineRef engine) {
+    std::vector<Vec> out;
+    out.reserve(vs.size());
+    for (const Vec& v : vs) out.push_back(CloneOnto(v, engine));
+    return out;
+}
+
+SecureCohort CloneCohortOnto(const SecureCohort& c, EngineRef engine) {
+    SecureCohort out(engine, c.n, c.n_pad);
+    out.scope = c.scope;
+    out.subject_key = CloneOnto(c.subject_key, engine);
+    out.keys = CloneOnto(c.keys, engine);
+    out.valid = CloneOnto(c.valid, engine);
+    out.newage = CloneOnto(c.newage, engine);
+    out.encounter_dt = CloneOnto(c.encounter_dt, engine);
+    out.visit_num = CloneOnto(c.visit_num, engine);
+    out.fu_month = CloneOnto(c.fu_month, engine);
+    out.fu_present = CloneOnto(c.fu_present, engine);
+    out.index_visit = CloneOnto(c.index_visit, engine);
+    out.final_visit = CloneOnto(c.final_visit, engine);
+    out.sisa = CloneOnto(c.sisa, engine);
+    out.sa = CloneOnto(c.sa, engine);
+    out.umass = CloneOnto(c.umass, engine);
+    out.gender_is = CloneOnto(c.gender_is, engine);
+    out.hispanic_is = CloneOnto(c.hispanic_is, engine);
+    out.last_of_subject = CloneOnto(c.last_of_subject, engine);
+    out.first_of_subject = CloneOnto(c.first_of_subject, engine);
+    out.scan_plan.n = c.scan_plan.n;
+    out.scan_plan.depth = c.scan_plan.depth;
+    out.scan_plan.forward = CloneOnto(c.scan_plan.forward, engine);
+    out.scan_plan.reverse = CloneOnto(c.scan_plan.reverse, engine);
+    out.num_subjects = c.num_subjects;
+    return out;
+}
+
 // Everything downstream of PlainCohort -- the synthetic generator, the
 // three-table CSV schema, and ShareCohort -- was removed with task 0011. The
 // pipeline now starts at cdrcatsse_match_pcc (etl.h) and reaches shares

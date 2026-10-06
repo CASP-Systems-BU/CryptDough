@@ -116,6 +116,18 @@ fi
 # --- the port range this party must open ------------------------------------
 base_port="$(value_of base_port)"
 threads="$(value_of threads)"
+num_engines="$(value_of num_engines)"
+num_engines="${num_engines:-1}"
+# Each (party pair, lane) owns one port, where a lane is one worker thread of
+# one engine: lanes = threads * num_engines. Mirrors startmpc_init in
+# include/backend/nocopy_communicator/startmpc/startmpc.h.
+lanes=""
+if [[ -n "${threads}" ]]; then
+    if (( num_engines > 1 && threads > 1 )); then
+        bad "num_engines=${num_engines} with threads=${threads}: -neng > 1 requires -t 1 on the no-copy communicator"
+    fi
+    lanes=$(( threads * num_engines ))
+fi
 # Count `- rank:` entries ONLY inside the top-level `parties:` block. A bare
 # grep over the whole file also catches list entries elsewhere -- the data
 # owners, for one -- and an inflated party count silently produces the wrong
@@ -126,9 +138,9 @@ nparties="$(awk '
     in_parties && /^[[:space:]]*-[[:space:]]*rank:/ { n++ }
     END { print n + 0 }
 ' "${MANIFEST}")"
-if [[ -n "${base_port}" && -n "${threads}" && "${nparties}" -gt 0 ]]; then
+if [[ -n "${base_port}" && -n "${lanes}" && "${nparties}" -gt 0 ]]; then
     echo
-    echo "Inbound ports each party must accept (num_parties=${nparties}, threads=${threads}):"
+    echo "Inbound ports each party must accept (num_parties=${nparties}, threads=${threads}, num_engines=${num_engines}):"
     for ((r = 0; r < nparties; r++)); do
         if (( r == 0 )); then
             printf '  rank 0: none (it only makes outbound connections)\n'
@@ -136,8 +148,8 @@ if [[ -n "${base_port}" && -n "${threads}" && "${nparties}" -gt 0 ]]; then
         fi
         printf '  rank %d: ' "$r"
         for ((j = 0; j < r; j++)); do
-            start=$(( base_port + nparties * threads * j + threads * r ))
-            printf '%d-%d (from rank %d) ' "${start}" "$(( start + threads - 1 ))" "$j"
+            start=$(( base_port + nparties * lanes * j + lanes * r ))
+            printf '%d-%d (from rank %d) ' "${start}" "$(( start + lanes - 1 ))" "$j"
         done
         printf '\n'
     done

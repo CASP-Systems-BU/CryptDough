@@ -121,8 +121,18 @@ simultaneity is not required.
 
 ## Ports
 
-For `H` parties and `-t T` worker threads, the pair (i→j) uses ports
-`base_port + H*T*i + T*j`, plus `100 * engine_index` when `-neng > 1`.
+For `H` parties, the pair (i→j) uses one port per **lane**, starting at
+`base_port + H*L*i + L*j`, where `L` is the number of lanes. A lane is one worker
+thread of one engine, so `L = T * E` for `-t T` and `-neng E`. With one engine that is
+the per-thread layout, and with `-t 1` engine k takes the port thread k would take
+under `-t E`. In the table below, read `T` as `L`.
+
+`-neng > 1` requires `-t 1` on this (no-copy) communicator; the factory refuses
+anything else. The parties must also run the same `-neng`: it changes every port.
+
+With `-neng E`, each engine adds one send thread per party that busy-polls its
+socket rings even when idle, so budget E cores per party for them. Keep
+`COMM_THREADS` at its default or 1; at `-t 1` it makes no difference.
 
 For three parties:
 

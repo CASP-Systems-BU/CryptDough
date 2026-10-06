@@ -56,6 +56,9 @@
 //   ./mpc-analysis -pa 0 -pb 1                # which party owns which half
 //   ./mpc-analysis -cc 50 -ic 5 -cl 1         # even split, 5% ID conflicts, and
 //                                             # run the conflict_list check
+//   ./mpc-analysis -S models -r 200 -neng 4  # the fourteen fits spread over 4
+//                                             # engines, one thread each (semantic
+//                                             # task 0024; replicated 3PC only)
 //
 // Running ONE node, for ONE data owner (see tasks/0013):
 //
@@ -75,6 +78,11 @@
 //         reason: every party pads from it and the non-owners cannot read the
 //         file's length.
 //     -o  where the owner writes the node's result, as CSV.
+
+#include <algorithm>
+#include <chrono>
+#include <numeric>
+#include <thread>
 
 #include "cdough.h"
 
@@ -154,6 +162,76 @@ const PlainCohort& PickPlain(const PlainCohort& any, const PlainCohort& umass,
     return any;
 }
 
+// =============================================================================
+// Parallel model fits (semantic task 0024)
+//
+// With -neng K > 1 the fourteen fits are spread over K independent engines, one
+// thread each. Two rules make that correct rather than correct by luck:
+//
+//   1. The engines are created one at a time on the main thread. Communicators
+//      are matched across parties by MPI tag, and tags are handed out in
+//      creation order, so engine k at party 0 pairs with engine k at every other
+//      party only if every party creates them in the same order.
+//   2. Which engine fits which model is a fixed function of the spec list and
+//      K, never a work queue. A queue would let the parties pick different fits
+//      on the same engine, and the run would hang or compute garbage.
+//
+// Each engine works on its own copy of the three cohorts (CloneCohortOnto);
+// nothing is shared between threads except read-only plaintext.
+// =============================================================================
+
+// The three analysis tables, bound to one engine.
+struct CohortSet {
+    SecureCohort any;
+    SecureCohort umass;
+    SecureCohort nonumass;
+};
+
+// Relative cost of one fit, as a static weight for the schedule. Measured on the
+// synthetic -r 200 cohort (semantic task 0024 pilot): a BFGS iteration costs
+// ~13.5 s whatever the population, because all three tables share one padded
+// length, so a mixed fit's cost is its iteration count. The covariate models
+// (5a/5b) ran to the 25-iteration cap (~340 s); the unadjusted ones took 9-19
+// (~115-250 s); IRLS is a handful of Cholesky solves. Only the ORDER these
+// weights induce matters, and the schedule must not depend on anything a party
+// learns at run time.
+int FitCostWeight(const ModelSpec& spec) {
+    if (!spec.random_intercept) return 1;
+    return spec.covars ? 6 : 3;
+}
+
+// Longest-processing-time-first, by the static weights above: take the fits
+// heaviest first and give each to the engine with the least weight so far,
+// lowest index on ties. Deterministic, so every party computes the same plan.
+// With one engine this is the spec order unchanged.
+std::vector<std::vector<size_t>> ScheduleFits(const std::vector<ModelSpec>& specs,
+                                              size_t num_engines) {
+    std::vector<std::vector<size_t>> plan(num_engines);
+    if (num_engines == 1) {
+        for (size_t i = 0; i < specs.size(); ++i) plan[0].push_back(i);
+        return plan;
+    }
+    std::vector<size_t> order(specs.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return FitCostWeight(specs[a]) > FitCostWeight(specs[b]);
+    });
+    std::vector<int> load(num_engines, 0);
+    for (size_t i : order) {
+        const size_t k = static_cast<size_t>(
+            std::min_element(load.begin(), load.end()) - load.begin());
+        plan[k].push_back(i);
+        load[k] += FitCostWeight(specs[i]);
+    }
+    return plan;
+}
+
+FitResult FitOne(const SecureCohort& c, const ModelSpec& spec, int reveal_to, int party_id) {
+    ModelData md = BuildDesign(c, spec, reveal_to, party_id);
+    return spec.random_intercept ? FitGlmmLaplace(md, spec, party_id, reveal_to)
+                                 : FitLogisticIrls(md, spec, reveal_to, party_id);
+}
+
 
 int main(int argc, char** argv) {
     EngineRef engine = cdough_init(argc, argv);
@@ -213,6 +291,26 @@ int main(int argc, char** argv) {
     // 0 routes the segmented scans through aggregators::aggregate instead of the
     // cached per-level group bits, for A/B measurement.
     g_use_cached_scans = engine.getArg<int>("cached-scans", "C", 1) != 0;
+    // Engines to spread the model fits over (semantic task 0024). The runtime
+    // itself registers this flag; 1 keeps the original sequential loop.
+    int num_engines = engine.getArg<int>("num-engines", "neng", 1);
+    if (num_engines < 1) {
+        if (pID == 0) std::cerr << "FATAL: -neng must be at least 1." << std::endl;
+        return 1;
+    }
+#if !(PROTOCOL_NUM == REPLICATED3 && \
+      (defined(MPC_USE_MPI_COMMUNICATOR) || defined(MPC_USE_NO_COPY_COMMUNICATOR)))
+    // CloneCohortOnto is only valid where a share depends on nothing but the
+    // party ID, and the engine pairing is verified for the MPI and no-copy
+    // communicators only (semantic tasks 0024, 0025).
+    if (num_engines > 1) {
+        if (pID == 0)
+            std::cerr << "FATAL: -neng > 1 is validated only for replicated 3PC over the MPI "
+                         "or no-copy communicator (semantic tasks 0024, 0025)."
+                      << std::endl;
+        return 1;
+    }
+#endif
 
     // ---------------------------------------------- one node, one data owner
     //
@@ -596,6 +694,62 @@ int main(int argc, char** argv) {
                 break;
             }
             case NodeKind::Model: {
+                // DEBUG ONLY (semantic task 0024, experiment 0003 post-hoc): fit the same
+                // node on -neng engines, to separate "running concurrently" from "running
+                // on a worker thread". `-dbg-fit serial` runs one worker thread per engine,
+                // each joined before the next starts; `concurrent` starts them all at once.
+                // The default, `main`, is the ordinary single-node path below.
+                const std::string dbg_fit = engine.getArg<std::string>("dbg-fit", "dbgf", "main");
+                if (dbg_fit != "main") {
+                    // `mainextra`: create the extra engines, then fit engine 0 only, on THIS
+                    // thread -- isolates "another engine exists" from "worker thread".
+                    if (dbg_fit != "serial" && dbg_fit != "concurrent" && dbg_fit != "mainextra") {
+                        if (pID == 0)
+                            std::cerr << "FATAL: -dbg-fit must be main, serial, concurrent or "
+                                         "mainextra"
+                                      << std::endl;
+                        return 1;
+                    }
+                    std::vector<Engine*> dbg_engines{&engine};
+                    for (int k = 1; k < num_engines; ++k)
+                        dbg_engines.push_back(&cdough_init(argc, argv));
+                    std::vector<CohortSet> dbg_cohorts;
+                    dbg_cohorts.reserve(dbg_engines.size());
+                    for (size_t k = 1; k < dbg_engines.size(); ++k)
+                        dbg_cohorts.push_back(CohortSet{CloneCohortOnto(any, *dbg_engines[k]),
+                                                        CloneCohortOnto(umass, *dbg_engines[k]),
+                                                        CloneCohortOnto(nonumass, *dbg_engines[k])});
+                    std::vector<FitResult> dbg_fits(dbg_engines.size());
+                    auto fit_on = [&](size_t k) {
+                        const SecureCohort& c_k =
+                            (k == 0) ? PickCohort(any, umass, nonumass, node.spec.scope)
+                                     : PickCohort(dbg_cohorts[k - 1].any, dbg_cohorts[k - 1].umass,
+                                                  dbg_cohorts[k - 1].nonumass, node.spec.scope);
+                        dbg_fits[k] = FitOne(c_k, node.spec, reveal_to, pID);
+                    };
+                    if (dbg_fit == "mainextra") dbg_fits.resize(1);
+                    std::vector<std::thread> dbg_threads;
+                    if (dbg_fit == "mainextra") fit_on(0);
+                    for (size_t k = 0; dbg_fit != "mainextra" && k < dbg_engines.size(); ++k) {
+                        dbg_threads.emplace_back(fit_on, k);
+                        if (dbg_fit == "serial") dbg_threads.back().join();
+                    }
+                    for (std::thread& t : dbg_threads)
+                        if (t.joinable()) t.join();
+                    if (mine) {
+                        for (size_t k = 0; k < dbg_fits.size(); ++k) {
+                            std::ostringstream line;
+                            line << "[DBG] mode=" << dbg_fit << " engine=" << k
+                                 << " iters=" << dbg_fits[k].iterations
+                                 << " cond=" << dbg_fits[k].hessian_condition << std::setprecision(9);
+                            for (size_t t = 0; t < dbg_fits[k].terms.size(); ++t)
+                                line << "  " << dbg_fits[k].terms[t] << '=' << dbg_fits[k].estimate[t];
+                            line << "  sigma2=" << dbg_fits[k].sigma2 << '\n';
+                            std::cout << line.str() << std::flush;
+                        }
+                    }
+                    break;
+                }
                 const SecureCohort& c = PickCohort(any, umass, nonumass, node.spec.scope);
                 ModelData md = BuildDesign(c, node.spec, reveal_to, pID);
                 const FitResult fit =
@@ -632,54 +786,127 @@ int main(int argc, char** argv) {
 
     // ------------------------------------------------------------- the models
     const std::vector<ModelSpec> specs = AllModelSpecs();
+    // More engines than fits would only add idle runtimes.
+    num_engines = std::min<int>(num_engines, static_cast<int>(specs.size()));
     if (pID == banner_party)
         std::cout << "\n################ " << specs.size()
                   << " regression models ################" << std::endl;
 
-    std::vector<FitResult> fits;
-    for (const ModelSpec& spec : specs) {
-        const SecureCohort& c = PickCohort(any, umass, nonumass, spec.scope);
-        ModelData md = BuildDesign(c, spec, reveal_to, pID);
-
-        FitResult r = spec.random_intercept ? FitGlmmLaplace(md, spec, pID, reveal_to)
-                                            : FitLogisticIrls(md, spec, reveal_to, pID);
-        fits.push_back(r);
-        if (pID == banner_party) PrintFit(r, spec);
-
-        // Score against the plaintext oracle. For the fixed-effects models this
-        // is the same estimator in double precision, so the two should agree to
-        // the fixed-point floor. For the mixed models it is NOT the same
-        // estimand -- it ignores the random intercept -- so it is reported as
-        // context, with the generating parameters as the real reference.
-        // The oracle needs both halves, so it only exists in the synthetic path.
-        if (pID == banner_party && have_oracle) {
-            const PlainCohort& pc = PickPlain(any_plain, umass_plain, nonumass_plain, spec.scope);
-            std::vector<double> x_rm, y, mask;
-            size_t pp = 0;
-            PlainDesign(pc, spec, x_rm, y, mask, pp);
-            PlainFit pf = PlainLogisticIrls(x_rm, y, mask, pc.rows(), pp, kIrlsRidge,
-                                            kIrlsIterations);
-            std::cout << "\n  " << (spec.random_intercept
-                                        ? "plaintext IRLS (no random effect -- context only):"
-                                        : "plaintext IRLS oracle (same estimator):")
-                      << "\n  " << std::left << std::setw(34) << "Term" << std::setw(14)
-                      << "MPC" << std::setw(14) << "Plaintext" << std::setw(12) << "Diff"
-                      << std::endl;
-            double worst = 0.0;
-            for (size_t k = 0; k < r.terms.size() && k < pf.estimate.size(); ++k) {
-                const double d = std::abs(r.estimate[k] - pf.estimate[k]);
-                if (!spec.random_intercept) worst = std::max(worst, d);
-                std::cout << "  " << std::left << std::setw(34) << r.terms[k] << std::fixed
-                          << std::setprecision(5) << std::setw(14) << r.estimate[k]
-                          << std::setw(14) << pf.estimate[k] << std::setw(12) << d
-                          << std::defaultfloat << std::endl;
-            }
-            if (!spec.random_intercept)
-                std::cout << "  max |MPC - plaintext| = " << std::scientific << worst
-                          << std::defaultfloat
-                          << (worst < 5e-3 ? "   OK" : "   *** CHECK ***") << std::endl;
+    // Print one fit, and score it against the plaintext oracle. For the
+    // fixed-effects models the oracle is the same estimator in double precision,
+    // so the two should agree to the fixed-point floor. For the mixed models it
+    // is NOT the same estimand -- it ignores the random intercept -- so it is
+    // reported as context, with the generating parameters as the real reference.
+    // The oracle needs both halves, so it only exists in the synthetic path.
+    auto report_fit = [&](const FitResult& r, const ModelSpec& spec) {
+        if (pID != banner_party) return;
+        PrintFit(r, spec);
+        if (!have_oracle) return;
+        const PlainCohort& pc = PickPlain(any_plain, umass_plain, nonumass_plain, spec.scope);
+        std::vector<double> x_rm, y, mask;
+        size_t pp = 0;
+        PlainDesign(pc, spec, x_rm, y, mask, pp);
+        PlainFit pf =
+            PlainLogisticIrls(x_rm, y, mask, pc.rows(), pp, kIrlsRidge, kIrlsIterations);
+        std::cout << "\n  " << (spec.random_intercept
+                                    ? "plaintext IRLS (no random effect -- context only):"
+                                    : "plaintext IRLS oracle (same estimator):")
+                  << "\n  " << std::left << std::setw(34) << "Term" << std::setw(14) << "MPC"
+                  << std::setw(14) << "Plaintext" << std::setw(12) << "Diff" << std::endl;
+        double worst = 0.0;
+        for (size_t k = 0; k < r.terms.size() && k < pf.estimate.size(); ++k) {
+            const double d = std::abs(r.estimate[k] - pf.estimate[k]);
+            if (!spec.random_intercept) worst = std::max(worst, d);
+            std::cout << "  " << std::left << std::setw(34) << r.terms[k] << std::fixed
+                      << std::setprecision(5) << std::setw(14) << r.estimate[k]
+                      << std::setw(14) << pf.estimate[k] << std::setw(12) << d
+                      << std::defaultfloat << std::endl;
         }
+        if (!spec.random_intercept)
+            std::cout << "  max |MPC - plaintext| = " << std::scientific << worst
+                      << std::defaultfloat << (worst < 5e-3 ? "   OK" : "   *** CHECK ***")
+                      << std::endl;
+    };
+
+    // Wall clock per fit and for the whole stage, for the speedup measurement
+    // (semantic experiment 0003). Elapsed time is not derived from any share.
+    using FitClock = std::chrono::steady_clock;
+    auto fit_seconds = [](FitClock::time_point since) {
+        return std::chrono::duration<double>(FitClock::now() - since).count();
+    };
+    auto log_fit_time = [&](size_t i, size_t k, double seconds) {
+        if (pID != banner_party) return;
+        std::ostringstream line;
+        line << "[FIT] " << specs[i].step << ' ' << ScopeName(specs[i].scope) << "  engine "
+             << k << "  time=" << std::fixed << std::setprecision(3) << seconds << "s\n";
+        std::cout << line.str() << std::flush;
+    };
+    const FitClock::time_point models_start = FitClock::now();
+
+    std::vector<FitResult> fits(specs.size());
+    if (num_engines == 1) {
+        // The original sequential loop: each fit is printed as soon as it ends.
+        for (size_t i = 0; i < specs.size(); ++i) {
+            const FitClock::time_point t0 = FitClock::now();
+            fits[i] = FitOne(PickCohort(any, umass, nonumass, specs[i].scope), specs[i],
+                             reveal_to, pID);
+            log_fit_time(i, 0, fit_seconds(t0));
+            report_fit(fits[i], specs[i]);
+        }
+    } else {
+        // Extra engines, created one at a time on this thread -- see rule 1 above
+        // ScheduleFits. Each creation is collective: every party runs it here, in
+        // the same order.
+        std::vector<Engine*> engines{&engine};
+        for (int k = 1; k < num_engines; ++k) engines.push_back(&cdough_init(argc, argv));
+
+        // Engine 0 keeps the cohorts it built; every other engine gets a copy.
+        // Local copies only: no communication, so no ordering constraint.
+        std::vector<CohortSet> cohorts;
+        cohorts.reserve(engines.size() - 1);
+        for (size_t k = 1; k < engines.size(); ++k)
+            cohorts.push_back(CohortSet{CloneCohortOnto(any, *engines[k]),
+                                        CloneCohortOnto(umass, *engines[k]),
+                                        CloneCohortOnto(nonumass, *engines[k])});
+
+        const std::vector<std::vector<size_t>> plan = ScheduleFits(specs, engines.size());
+        if (pID == banner_party) {
+            std::cout << "fitting on " << engines.size() << " engines in parallel" << std::endl;
+            for (size_t k = 0; k < plan.size(); ++k) {
+                std::cout << "  engine " << k << ":";
+                for (size_t i : plan[k])
+                    std::cout << ' ' << specs[i].step << '/' << ScopeName(specs[i].scope);
+                std::cout << std::endl;
+            }
+        }
+
+        // Each thread writes only fits[i] for the i it was assigned, so the
+        // slots never overlap and the vector itself is never resized.
+        std::vector<std::thread> workers;
+        workers.reserve(engines.size());
+        for (size_t k = 0; k < engines.size(); ++k) {
+            workers.emplace_back([&, k]() {
+                const SecureCohort& c_any = (k == 0) ? any : cohorts[k - 1].any;
+                const SecureCohort& c_umass = (k == 0) ? umass : cohorts[k - 1].umass;
+                const SecureCohort& c_nonumass = (k == 0) ? nonumass : cohorts[k - 1].nonumass;
+                for (size_t i : plan[k]) {
+                    const FitClock::time_point t0 = FitClock::now();
+                    fits[i] = FitOne(PickCohort(c_any, c_umass, c_nonumass, specs[i].scope),
+                                     specs[i], reveal_to, pID);
+                    log_fit_time(i, k, fit_seconds(t0));
+                }
+            });
+        }
+        for (std::thread& t : workers) t.join();
+
+        // Everything is reported after the join, in spec order, so the tables
+        // and the summary below read exactly as a sequential run's do.
+        for (size_t i = 0; i < specs.size(); ++i) report_fit(fits[i], specs[i]);
     }
+    if (pID == banner_party)
+        std::cout << "\n[FIT] models stage  engines " << num_engines << "  time=" << std::fixed
+                  << std::setprecision(3) << fit_seconds(models_start) << "s"
+                  << std::defaultfloat << std::endl;
 
     // --------------------------------------------------------------- summary
     if (pID == banner_party) {

@@ -130,8 +130,9 @@ if (( RANK == 0 )); then
 else
     echo -n "Inbound ports required: "
     for ((j = 0; j < RANK; j++)); do
-        # Mirrors startmpc.h: base + host_count*threads*j + threads*rank.
-        # Reported per-thread-block; --hosts fixes host_count, threads comes from -t.
+        # Mirrors startmpc.h: base + host_count*lanes*j + lanes*rank, where
+        # lanes = threads * engines (-t times -neng; -neng > 1 needs -t 1).
+        # --hosts fixes host_count; check-manifest.sh prints the exact ranges.
         echo -n "(from rank ${j}) "
     done
     echo "- see docker/check-manifest.sh for exact ranges"
