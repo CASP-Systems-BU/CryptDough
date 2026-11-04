@@ -119,11 +119,17 @@ class SharedColumn : public EncodedColumn {
 
         if (encoding == Encoding::AShared) {
             auto v = static_cast<ASharedVector<Share, EVector, Engine>*>(contents.get());
-            auto copy = std::make_unique<ASharedVector<Share, EVector, Engine>>(*v);
+            // Allocate fresh storage and copy elements. The copy constructor would
+            // share the underlying data buffer, making this a shallow copy.
+            auto copy = std::make_unique<ASharedVector<Share, EVector, Engine>>(v->size(), v->engine);
+            *copy = *v;
             s = std::make_unique<SharedColumn>(std::move(copy));
         } else {
             auto v = static_cast<BSharedVector<Share, EVector, Engine>*>(contents.get());
-            auto copy = std::make_unique<BSharedVector<Share, EVector, Engine>>(*v);
+            // Allocate fresh storage and copy elements. The copy constructor would
+            // share the underlying data buffer, making this a shallow copy.
+            auto copy = std::make_unique<BSharedVector<Share, EVector, Engine>>(v->size(), v->engine);
+            *copy = *v;
             s = std::make_unique<SharedColumn>(std::move(copy));
         }
 
